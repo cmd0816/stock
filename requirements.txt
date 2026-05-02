@@ -1,0 +1,2 @@
+# Core dependency for browser-based fallback mode
+playwright==1.59.0
