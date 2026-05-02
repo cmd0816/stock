@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv
+venv/
+
+# Environment variables
+.env
+
+.DS_Store
+
+*.sqlite3
+*.log
+*copy.*
