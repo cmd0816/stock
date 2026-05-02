@@ -1,4 +1,4 @@
-# Eastmoney Stock to SQLite
+# Eastmoney Stock to Database
 
 Small toolkit to:
 
