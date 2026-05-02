@@ -436,6 +436,41 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
       color: #111827;
       background: #f9fafb;
     }}
+    .hover-row {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid var(--line);
+      background: #f9fafb;
+    }}
+    .hover-row .hover-info {{
+      border-bottom: 0;
+    }}
+    .chart-controls {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding-right: 10px;
+    }}
+    .chart-controls button {{
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #fff;
+      color: #0f172a;
+      font-size: 12px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }}
+    .chart-controls button:hover {{
+      background: #f1f5f9;
+    }}
+    .zoom-label {{
+      font-size: 12px;
+      color: #475569;
+      min-width: 80px;
+      text-align: right;
+    }}
     .tooltip {{
       position: absolute;
       pointer-events: none;
@@ -503,7 +538,15 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
           Auto-refresh: 30s | Generated: {html.escape(now)} | Rows: {len(rows)} | Selected: {selected_name}
         </div>
         <div class="card">
-          <div id="hoverInfo" class="hover-info">Move pointer over chart to inspect daily values.</div>
+          <div class="hover-row">
+            <div id="hoverInfo" class="hover-info">Move pointer over chart to inspect daily values.</div>
+            <div class="chart-controls">
+              <button id="zoomInBtn" type="button">Zoom In</button>
+              <button id="zoomOutBtn" type="button">Zoom Out</button>
+              <button id="zoomResetBtn" type="button">Reset</button>
+              <span id="zoomLabel" class="zoom-label">-</span>
+            </div>
+          </div>
           <div class="chart-wrap">
             <div class="chart-grid">
               <canvas id="klineChart"></canvas>
@@ -535,7 +578,11 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
       const chipCanvas = document.getElementById('chipChart');
       const tooltip = document.getElementById('chartTooltip');
       const hoverInfo = document.getElementById('hoverInfo');
-      if (!canvas || !chipCanvas || rows.length === 0) {{
+      const zoomInBtn = document.getElementById('zoomInBtn');
+      const zoomOutBtn = document.getElementById('zoomOutBtn');
+      const zoomResetBtn = document.getElementById('zoomResetBtn');
+      const zoomLabel = document.getElementById('zoomLabel');
+      if (!canvas || !chipCanvas || !zoomInBtn || !zoomOutBtn || !zoomResetBtn || rows.length === 0) {{
         if (hoverInfo) hoverInfo.textContent = 'No daily rows found.';
         return;
       }}
@@ -589,12 +636,50 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
 
       const maSeries = {{}};
       maPeriods.forEach((p) => maSeries[p] = computeMA(p));
-      let crossIndex = null;
+      let crossIndexAbs = null;
+      let visibleCount = Math.min(120, points.length);
+      let endIndex = points.length - 1;
+      const MIN_VISIBLE = Math.min(20, points.length);
 
       const fmt = (v, n = 2) => Number.isFinite(v) ? v.toLocaleString(undefined, {{ minimumFractionDigits: n, maximumFractionDigits: n }}) : '-';
       const fmtInt = (v) => Number.isFinite(v) ? Math.round(v).toLocaleString() : '-';
+      const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
+
+      const getStartIndex = () => Math.max(0, endIndex - visibleCount + 1);
+      const getVisiblePoints = () => {{
+        const start = getStartIndex();
+        return points.slice(start, endIndex + 1).map((p, i) => ({{ ...p, __absIdx: start + i }}));
+      }};
+
+      const setZoomLabel = () => {{
+        if (!zoomLabel) return;
+        const start = getStartIndex();
+        zoomLabel.textContent = `${{visibleCount}}d (${{start + 1}}-${{endIndex + 1}})`;
+      }};
+
+      const applyZoom = (nextCount, anchorAbsIdx = null) => {{
+        const oldCount = visibleCount;
+        const prevStart = getStartIndex();
+        visibleCount = clamp(nextCount, MIN_VISIBLE, points.length);
+        if (anchorAbsIdx === null) {{
+          endIndex = clamp(endIndex, visibleCount - 1, points.length - 1);
+          setZoomLabel();
+          render();
+          return;
+        }}
+        const anchor = clamp(anchorAbsIdx, 0, points.length - 1);
+        const ratio = oldCount <= 1 ? 1 : (anchor - prevStart) / (oldCount - 1);
+        let newStart = Math.round(anchor - ratio * (visibleCount - 1));
+        newStart = clamp(newStart, 0, Math.max(0, points.length - visibleCount));
+        endIndex = newStart + visibleCount - 1;
+        setZoomLabel();
+        render();
+      }};
 
       const render = () => {{
+        const visible = getVisiblePoints();
+        if (visible.length === 0) return;
+        const startAbs = visible[0].__absIdx;
         const width = canvas.clientWidth || 900;
         canvas.width = Math.floor(width * dpr);
         canvas.height = Math.floor(chartH * dpr);
@@ -611,10 +696,11 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         if (plotW <= 20 || plotH <= 20) return;
 
         const allValues = [];
-        for (let i = 0; i < points.length; i++) {{
-          allValues.push(points[i].low, points[i].high);
+        for (let i = 0; i < visible.length; i++) {{
+          const pAbs = visible[i].__absIdx;
+          allValues.push(visible[i].low, visible[i].high);
           for (const p of maPeriods) {{
-            const mv = maSeries[p][i];
+            const mv = maSeries[p][pAbs];
             if (mv !== null) allValues.push(mv);
           }}
         }}
@@ -625,7 +711,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         minV -= margin;
         maxV += margin;
 
-        const xStep = plotW / Math.max(1, points.length - 1);
+        const xStep = plotW / Math.max(1, visible.length - 1);
         const candleW = Math.max(3, Math.min(9, xStep * 0.65));
         const yOf = (v) => pad.top + (maxV - v) * plotH / (maxV - minV);
 
@@ -641,8 +727,8 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         }}
 
         // Candles
-        for (let i = 0; i < points.length; i++) {{
-          const p = points[i];
+        for (let i = 0; i < visible.length; i++) {{
+          const p = visible[i];
           const x = pad.left + i * xStep;
           const yo = yOf(p.open);
           const yc = yOf(p.close);
@@ -669,8 +755,9 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
           ctx.lineWidth = 1.4;
           ctx.beginPath();
           let started = false;
-          for (let i = 0; i < ser.length; i++) {{
-            const v = ser[i];
+          for (let i = 0; i < visible.length; i++) {{
+            const absIdx = visible[i].__absIdx;
+            const v = ser[absIdx];
             if (v === null) continue;
             const x = pad.left + i * xStep;
             const y = yOf(v);
@@ -689,15 +776,18 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         ctx.font = '12px sans-serif';
         ctx.fillText(fmt(maxV), 6, pad.top + 10);
         ctx.fillText(fmt(minV), 6, pad.top + plotH);
-        ctx.fillText(points[0].trade_date || '', pad.left, chartH - 8);
-        const endTxt = points[points.length - 1].trade_date || '';
+        ctx.fillText(visible[0].trade_date || '', pad.left, chartH - 8);
+        const endTxt = visible[visible.length - 1].trade_date || '';
         const tw = ctx.measureText(endTxt).width;
         ctx.fillText(endTxt, Math.max(pad.left, width - pad.right - tw), chartH - 8);
 
         // Chip diagram (estimated volume-by-price distribution from OHLC range and volume)
+        // Anchor chip window to crosshair day if present; otherwise use current visible end.
         const bins = 52;
         const chip = new Array(bins).fill(0);
-        const recent = points.slice(Math.max(0, points.length - 250));
+        const chipEndAbs = (crossIndexAbs !== null) ? crossIndexAbs : endIndex;
+        const recentStart = Math.max(0, chipEndAbs - 249);
+        const recent = points.slice(recentStart, chipEndAbs + 1);
         const step = (maxV - minV) / bins;
         for (const p of recent) {{
           if (!Number.isFinite(p.volume) || p.volume <= 0) continue;
@@ -718,13 +808,13 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         const chipPadL = 6;
         const chipPadR = 48;
         const chipPlotW = chipW - chipPadL - chipPadR;
-        const lastClose = points[points.length - 1].close;
+        const chipAnchorClose = points[chipEndAbs].close;
         for (let b = 0; b < bins; b++) {{
           const centerV = minV + (b + 0.5) * step;
           const y0 = pad.top + (plotH * b / bins);
           const y1 = pad.top + (plotH * (b + 1) / bins);
           const bw = chipPlotW * (chip[b] / maxChip);
-          const color = centerV >= lastClose ? 'rgba(220,38,38,0.45)' : 'rgba(22,163,74,0.45)';
+          const color = centerV >= chipAnchorClose ? 'rgba(220,38,38,0.45)' : 'rgba(22,163,74,0.45)';
           chipCtx.fillStyle = color;
           chipCtx.fillRect(chipPadL, y0, bw, Math.max(1, y1 - y0 - 1));
         }}
@@ -733,13 +823,16 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         chipCtx.fillStyle = '#64748b';
         chipCtx.font = '12px sans-serif';
         chipCtx.fillText('Chip', chipPadL, pad.top - 6);
+        const chipAnchorDate = points[chipEndAbs].trade_date || '';
+        chipCtx.fillText(`as of ${{chipAnchorDate}}`, chipPadL + 38, pad.top - 6);
         chipCtx.fillText(fmt(maxV), chipPadL + chipPlotW + 4, pad.top + 9);
         chipCtx.fillText(fmt(minV), chipPadL + chipPlotW + 4, pad.top + plotH);
 
         // Crosshair
-        if (crossIndex !== null && crossIndex >= 0 && crossIndex < points.length) {{
-          const p = points[crossIndex];
-          const x = pad.left + crossIndex * xStep;
+        if (crossIndexAbs !== null && crossIndexAbs >= startAbs && crossIndexAbs <= endIndex) {{
+          const localIdx = crossIndexAbs - startAbs;
+          const p = points[crossIndexAbs];
+          const x = pad.left + localIdx * xStep;
           const y = yOf(p.close);
           ctx.strokeStyle = '#64748b';
           ctx.setLineDash([4, 4]);
@@ -790,12 +883,14 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         const x = clientX - rect.left;
         const plotW = rect.width - pad.left - pad.right;
         if (x < pad.left || x > rect.width - pad.right) return null;
-        const xStep = plotW / Math.max(1, points.length - 1);
-        return Math.max(0, Math.min(points.length - 1, Math.round((x - pad.left) / xStep)));
+        const visible = getVisiblePoints();
+        const xStep = plotW / Math.max(1, visible.length - 1);
+        const localIdx = Math.max(0, Math.min(visible.length - 1, Math.round((x - pad.left) / xStep)));
+        return visible[localIdx].__absIdx;
       }};
 
       canvas.addEventListener('mousemove', (ev) => {{
-        crossIndex = pickIndex(ev.clientX);
+        crossIndexAbs = pickIndex(ev.clientX);
         const rect = canvas.getBoundingClientRect();
         tooltip.style.left = `${{Math.min(rect.width - 220, Math.max(8, ev.clientX - rect.left + 12))}}px`;
         tooltip.style.top = `${{Math.max(8, ev.clientY - rect.top - 12)}}px`;
@@ -803,11 +898,32 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
       }});
 
       canvas.addEventListener('mouseleave', () => {{
-        crossIndex = null;
+        crossIndexAbs = null;
+        render();
+      }});
+
+      canvas.addEventListener('wheel', (ev) => {{
+        ev.preventDefault();
+        const anchor = pickIndex(ev.clientX);
+        if (ev.deltaY < 0) {{
+          applyZoom(visibleCount - 20, anchor);
+        }} else {{
+          applyZoom(visibleCount + 20, anchor);
+        }}
+      }}, {{ passive: false }});
+
+      zoomInBtn.addEventListener('click', () => applyZoom(visibleCount - 20, crossIndexAbs));
+      zoomOutBtn.addEventListener('click', () => applyZoom(visibleCount + 20, crossIndexAbs));
+      zoomResetBtn.addEventListener('click', () => {{
+        visibleCount = Math.min(120, points.length);
+        endIndex = points.length - 1;
+        crossIndexAbs = null;
+        setZoomLabel();
         render();
       }});
 
       window.addEventListener('resize', render);
+      setZoomLabel();
       render();
     }})();
   </script>

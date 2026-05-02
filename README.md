@@ -9,6 +9,7 @@ Small toolkit to:
 ## Files
 
 - `eastmoney_to_sqlite.py`: importer
+- `xuangu_to_sqlite.py`: condition-screening export (`xlsx`) importer
 - `view_quotes.py`: local dashboard server
 - `stocks.db`: SQLite database (created/updated by importer)
 
@@ -70,6 +71,47 @@ Notes:
 - `--browser-wait-login`: pause script so you can log in manually, then press Enter
 - `--browser-user-data-dir`: optional profile reuse path
 - `--browser-profile-directory`: Chromium profile name (e.g. `Default`)
+
+### 4) Xuangu Page -> Download XLSX -> Import SQLite
+
+Automates:
+
+1. open `https://xuangu.eastmoney.com/`
+2. input condition
+3. run screening
+4. download `xlsx`
+5. import rows into SQLite tables: `xuangu_batches`, `xuangu_results`
+
+Example:
+
+```bash
+/Users/cmd/workspace/stock/.venv/bin/python xuangu_to_sqlite.py \
+  --url "https://xuangu.eastmoney.com/" \
+  --db stocks.db \
+  --download-dir downloads \
+  --browser-engine chromium \
+  --browser-headed \
+  --manual-download \
+  --wait-login
+```
+
+Default condition source:
+
+- The script reads condition text from `screening.txt` by default.
+- You can still override with `--condition "..."`.
+- You can also specify another file with `--condition-file path/to/file.txt`.
+
+Example `screening.txt`:
+
+```text
+总市值<200亿;净利润同比增长率>20%
+```
+
+Tips:
+
+- `--manual-download`: if page UI changes, script waits for you to click “下载列表/导出Excel” manually.
+- `--wait-login`: pause for manual login before running screening.
+- for persistent login state, use `--browser-user-data-dir` (+ `--browser-profile-directory` for Chromium).
 
 ## Verify Imported Data
 
