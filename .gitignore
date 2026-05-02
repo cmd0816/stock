@@ -15,3 +15,5 @@ venv/
 *.sqlite3
 *.log
 *copy.*
+
+downloads/
