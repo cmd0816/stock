@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+from .models import CandidateStock, Kline, ReviewResult, ScoredStock
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def connect(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS weekly_screen_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            screen_date TEXT NOT NULL,
+            xuangu_batch_id TEXT,
+            strategy_config_json TEXT NOT NULL,
+            screening_text TEXT,
+            candidate_count INTEGER NOT NULL,
+            selected_count INTEGER NOT NULL,
+            created_at_utc TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_screen_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            rank_no INTEGER NOT NULL,
+            total_score REAL NOT NULL,
+            trend_score REAL NOT NULL,
+            volume_turnover_score REAL NOT NULL,
+            breakout_score REAL NOT NULL,
+            fundamentals_score REAL NOT NULL,
+            risk_score REAL NOT NULL,
+            selected INTEGER NOT NULL,
+            selected_reason TEXT,
+            row_json TEXT NOT NULL,
+            score_json TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES weekly_screen_runs(run_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_selected_stocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            screen_date TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            rank_no INTEGER NOT NULL,
+            total_score REAL NOT NULL,
+            selected_reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'selected',
+            created_at_utc TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES weekly_screen_runs(run_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_review_runs (
+            review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reviewed_run_id INTEGER NOT NULL,
+            review_date TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            UNIQUE(reviewed_run_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_review_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id INTEGER NOT NULL,
+            selected_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            base_trade_date TEXT,
+            review_start_date TEXT,
+            review_end_date TEXT,
+            highest_gain_pct REAL,
+            close_gain_pct REAL,
+            max_drawdown_pct REAL,
+            stop_loss_triggered INTEGER NOT NULL,
+            meets_expectation INTEGER NOT NULL,
+            notes TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            FOREIGN KEY (review_id) REFERENCES weekly_review_runs(review_id),
+            FOREIGN KEY (selected_id) REFERENCES weekly_selected_stocks(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_weekly_candidates_run ON weekly_screen_candidates(run_id);
+        CREATE INDEX IF NOT EXISTS idx_weekly_selected_run ON weekly_selected_stocks(run_id);
+        CREATE INDEX IF NOT EXISTS idx_weekly_review_run ON weekly_review_results(review_id);
+        """
+    )
+    conn.commit()
+
+
+def latest_xuangu_batch_id(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute(
+        "SELECT batch_id FROM xuangu_batches ORDER BY imported_at_utc DESC LIMIT 1"
+    ).fetchone()
+    return str(row["batch_id"]) if row else None
+
+
+def load_xuangu_candidates(conn: sqlite3.Connection, batch_id: Optional[str] = None) -> List[CandidateStock]:
+    if batch_id is None:
+        batch_id = latest_xuangu_batch_id(conn)
+    if not batch_id:
+        return []
+    rows = conn.execute(
+        """
+        SELECT batch_id, stock_code, stock_name, row_json
+        FROM xuangu_results
+        WHERE batch_id = ? AND stock_code IS NOT NULL
+        """,
+        (batch_id,),
+    ).fetchall()
+    candidates: List[CandidateStock] = []
+    seen = set()
+    for row in rows:
+        code = str(row["stock_code"])
+        if code in seen:
+            continue
+        seen.add(code)
+        try:
+            row_json = json.loads(row["row_json"])
+        except Exception:
+            row_json = {}
+        candidates.append(CandidateStock(code=code, name=row["stock_name"], batch_id=row["batch_id"], row_json=row_json))
+    return candidates
+
+
+def load_klines(conn: sqlite3.Connection, code: str, limit: int = 260) -> List[Kline]:
+    rows = conn.execute(
+        """
+        SELECT trade_date, open, close, high, low, volume, turnover_rate, change_percent
+        FROM eastmoney_stock_daily_klines
+        WHERE code = ?
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        (code, limit),
+    ).fetchall()
+    return [
+        Kline(
+            trade_date=row["trade_date"],
+            open=row["open"],
+            close=row["close"],
+            high=row["high"],
+            low=row["low"],
+            volume=row["volume"],
+            turnover_rate=row["turnover_rate"],
+            change_percent=row["change_percent"],
+        )
+        for row in reversed(rows)
+    ]
+
+
+def create_screen_run(
+    conn: sqlite3.Connection,
+    screen_date: str,
+    xuangu_batch_id: Optional[str],
+    config: Dict[str, Any],
+    screening_text: str,
+    candidate_count: int,
+    selected_count: int,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO weekly_screen_runs (
+            screen_date, xuangu_batch_id, strategy_config_json, screening_text,
+            candidate_count, selected_count, created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            screen_date,
+            xuangu_batch_id,
+            json.dumps(config, ensure_ascii=False, default=str),
+            screening_text,
+            candidate_count,
+            selected_count,
+            utc_now(),
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def save_screen_results(conn: sqlite3.Connection, run_id: int, scored: List[ScoredStock], top_n: int) -> None:
+    for rank, item in enumerate(scored, start=1):
+        score = item.score
+        selected = 1 if rank <= top_n else 0
+        conn.execute(
+            """
+            INSERT INTO weekly_screen_candidates (
+                run_id, code, name, rank_no, total_score, trend_score,
+                volume_turnover_score, breakout_score, fundamentals_score, risk_score,
+                selected, selected_reason, row_json, score_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                item.candidate.code,
+                item.candidate.name,
+                rank,
+                score.total,
+                score.trend,
+                score.volume_turnover,
+                score.breakout,
+                score.fundamentals,
+                score.risk,
+                selected,
+                item.selected_reason,
+                json.dumps(item.candidate.row_json, ensure_ascii=False, default=str),
+                json.dumps({"reasons": score.reasons}, ensure_ascii=False),
+            ),
+        )
+        if selected:
+            conn.execute(
+                """
+                INSERT INTO weekly_selected_stocks (
+                    run_id, screen_date, code, name, rank_no, total_score,
+                    selected_reason, created_at_utc
+                )
+                SELECT ?, screen_date, ?, ?, ?, ?, ?, ?
+                FROM weekly_screen_runs WHERE run_id = ?
+                """,
+                (
+                    run_id,
+                    item.candidate.code,
+                    item.candidate.name,
+                    rank,
+                    score.total,
+                    item.selected_reason,
+                    utc_now(),
+                    run_id,
+                ),
+            )
+    conn.commit()
+
+
+def latest_selected_run_without_review(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute(
+        """
+        SELECT r.run_id
+        FROM weekly_screen_runs r
+        WHERE EXISTS (SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id)
+          AND NOT EXISTS (SELECT 1 FROM weekly_review_runs rr WHERE rr.reviewed_run_id = r.run_id)
+        ORDER BY r.screen_date DESC, r.run_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return int(row["run_id"]) if row else None
+
+
+def selected_stocks_for_run(conn: sqlite3.Connection, run_id: int) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM weekly_selected_stocks
+        WHERE run_id = ?
+        ORDER BY rank_no
+        """,
+        (run_id,),
+    ).fetchall()
+
+
+def create_review_run(conn: sqlite3.Connection, reviewed_run_id: int, review_date: str, config: Dict[str, Any]) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO weekly_review_runs (reviewed_run_id, review_date, config_json, created_at_utc)
+        VALUES (?, ?, ?, ?)
+        """,
+        (reviewed_run_id, review_date, json.dumps(config, ensure_ascii=False, default=str), utc_now()),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def save_review_results(conn: sqlite3.Connection, review_id: int, selected_rows: Iterable[sqlite3.Row], results: List[ReviewResult]) -> None:
+    by_code = {r.code: r for r in results}
+    for selected in selected_rows:
+        result = by_code[selected["code"]]
+        conn.execute(
+            """
+            INSERT INTO weekly_review_results (
+                review_id, selected_id, code, name, base_trade_date, review_start_date,
+                review_end_date, highest_gain_pct, close_gain_pct, max_drawdown_pct,
+                stop_loss_triggered, meets_expectation, notes, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_id,
+                selected["id"],
+                result.code,
+                result.name,
+                result.base_trade_date,
+                result.review_start_date,
+                result.review_end_date,
+                result.highest_gain_pct,
+                result.close_gain_pct,
+                result.max_drawdown_pct,
+                int(result.stop_loss_triggered),
+                int(result.meets_expectation),
+                result.notes,
+                utc_now(),
+            ),
+        )
+    conn.commit()

@@ -1,3 +1,4 @@
 # Core dependency for browser-based fallback mode
 playwright==1.59.0
 openpyxl==3.1.5
+PyYAML==6.0.2
