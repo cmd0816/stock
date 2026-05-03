@@ -80,6 +80,110 @@ def fetch_stock_list(db_path: Path) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def fetch_dashboard_checks(db_path: Path) -> Dict[str, Any]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        out: Dict[str, Any] = {}
+
+        if table_exists(conn, "eastmoney_stock_daily_klines"):
+            out["kline_coverage"] = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT
+                        code,
+                        COALESCE(MAX(name), '') AS name,
+                        COUNT(*) AS day_count,
+                        MIN(trade_date) AS first_date,
+                        MAX(trade_date) AS last_date
+                    FROM eastmoney_stock_daily_klines
+                    GROUP BY code
+                    ORDER BY code
+                    """
+                ).fetchall()
+            ]
+        else:
+            out["kline_coverage"] = []
+
+        if table_exists(conn, "xuangu_batches"):
+            out["xuangu_batches"] = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT batch_id, imported_at_utc, row_count, xlsx_path
+                    FROM xuangu_batches
+                    ORDER BY imported_at_utc DESC
+                    LIMIT 10
+                    """
+                ).fetchall()
+            ]
+        else:
+            out["xuangu_batches"] = []
+
+        if table_exists(conn, "xuangu_results") and table_exists(conn, "xuangu_batches"):
+            out["latest_xuangu_results"] = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT stock_code, stock_name
+                    FROM xuangu_results
+                    WHERE batch_id = (
+                        SELECT batch_id FROM xuangu_batches
+                        ORDER BY imported_at_utc DESC
+                        LIMIT 1
+                    )
+                    AND stock_code IS NOT NULL
+                    ORDER BY stock_code
+                    LIMIT 80
+                    """
+                ).fetchall()
+            ]
+        else:
+            out["latest_xuangu_results"] = []
+
+        if table_exists(conn, "weekly_selected_stocks"):
+            out["weekly_selected"] = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT screen_date, code, name, rank_no, total_score, selected_reason
+                    FROM weekly_selected_stocks
+                    ORDER BY id DESC
+                    LIMIT 20
+                    """
+                ).fetchall()
+            ]
+        else:
+            out["weekly_selected"] = []
+
+        if table_exists(conn, "weekly_review_results"):
+            out["weekly_reviews"] = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT
+                        code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
+                        stop_loss_triggered, meets_expectation, notes
+                    FROM weekly_review_results
+                    ORDER BY id DESC
+                    LIMIT 20
+                    """
+                ).fetchall()
+            ]
+        else:
+            out["weekly_reviews"] = []
+
+    return out
+
+
 def build_kline_svg(rows_desc: List[Dict[str, Any]]) -> str:
     data = list(reversed(rows_desc[-120:]))
     points = [r for r in data if all(r.get(k) is not None for k in ("open", "close", "high", "low"))]
@@ -249,7 +353,11 @@ def build_html(rows: List[Dict[str, Any]]) -> str:
   <div class="wrap">
     <div class="head">
       <h2>Eastmoney Quote Snapshots</h2>
-      <a href="/api/quotes">JSON API</a>
+      <div>
+        <a href="/daily">Daily Kline</a>
+        <a href="/checks">Data Checks</a>
+        <a href="/api/quotes">JSON API</a>
+      </div>
     </div>
     <div class="meta">Auto-refresh: 20s | Generated: {html.escape(now)} | Rows: {len(rows)}</div>
     <div class="card">
@@ -265,6 +373,203 @@ def build_html(rows: List[Dict[str, Any]]) -> str:
           {''.join(row_html) if row_html else '<tr><td colspan="13">No rows yet.</td></tr>'}
         </tbody>
       </table>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def render_simple_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str]], empty: str) -> str:
+    if not rows:
+        return f"<div class='empty'>{html.escape(empty)}</div>"
+    head = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+    body = []
+    for row in rows:
+        cells = []
+        for key, _ in columns:
+            value = row.get(key)
+            if isinstance(value, float):
+                text = f"{value:.2f}"
+            elif value is None:
+                text = "-"
+            else:
+                text = str(value)
+            cells.append(f"<td>{html.escape(text)}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return f"""
+      <div class="table-wrap">
+        <table>
+          <thead><tr>{head}</tr></thead>
+          <tbody>{''.join(body)}</tbody>
+        </table>
+      </div>
+    """
+
+
+def build_checks_html(checks: Dict[str, Any]) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kline = render_simple_table(
+        checks.get("kline_coverage", []),
+        [
+            ("code", "代码"),
+            ("name", "名称"),
+            ("day_count", "K线天数"),
+            ("first_date", "开始日期"),
+            ("last_date", "结束日期"),
+        ],
+        "还没有 K 线数据。",
+    )
+    batches = render_simple_table(
+        checks.get("xuangu_batches", []),
+        [
+            ("batch_id", "批次"),
+            ("imported_at_utc", "导入时间 UTC"),
+            ("row_count", "行数"),
+            ("xlsx_path", "文件"),
+        ],
+        "还没有条件选股批次。",
+    )
+    latest_results = render_simple_table(
+        checks.get("latest_xuangu_results", []),
+        [("stock_code", "代码"), ("stock_name", "名称")],
+        "最近一次选股批次没有结果。",
+    )
+    weekly_selected = render_simple_table(
+        checks.get("weekly_selected", []),
+        [
+            ("screen_date", "选股日期"),
+            ("code", "代码"),
+            ("name", "名称"),
+            ("rank_no", "排名"),
+            ("total_score", "总分"),
+            ("selected_reason", "入选原因"),
+        ],
+        "还没有周末入选记录。",
+    )
+    weekly_reviews = render_simple_table(
+        checks.get("weekly_reviews", []),
+        [
+            ("code", "代码"),
+            ("name", "名称"),
+            ("highest_gain_pct", "最高涨幅%"),
+            ("close_gain_pct", "收盘涨幅%"),
+            ("max_drawdown_pct", "最大回撤%"),
+            ("stop_loss_triggered", "止损"),
+            ("meets_expectation", "符合预期"),
+            ("notes", "复盘备注"),
+        ],
+        "还没有复盘记录。",
+    )
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="30" />
+  <title>Data Checks</title>
+  <style>
+    :root {{
+      --bg: #f3f4f6;
+      --fg: #111827;
+      --card: #ffffff;
+      --line: #e5e7eb;
+      --muted: #64748b;
+    }}
+    body {{
+      margin: 0;
+      background: linear-gradient(180deg, #f8fafc, var(--bg));
+      color: var(--fg);
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }}
+    .wrap {{
+      max-width: 1360px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }}
+    .head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }}
+    .head a {{
+      margin-left: 10px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 14px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: 0 8px 20px rgba(15,23,42,0.05);
+      overflow: hidden;
+    }}
+    .card h3 {{
+      margin: 0;
+      padding: 12px 14px;
+      font-size: 15px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+    }}
+    .table-wrap {{
+      overflow: auto;
+    }}
+    table {{
+      width: 100%;
+      min-width: 720px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 9px 11px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }}
+    th {{
+      white-space: nowrap;
+      background: #ffffff;
+      color: #334155;
+      font-weight: 700;
+    }}
+    td {{
+      color: #111827;
+    }}
+    .empty {{
+      padding: 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <h2>数据检查</h2>
+      <div>
+        <a href="/">Snapshot</a>
+        <a href="/daily">Daily Kline</a>
+        <a href="/api/checks">JSON API</a>
+      </div>
+    </div>
+    <div class="meta">Auto-refresh: 30s | Generated: {html.escape(now)}</div>
+    <div class="grid">
+      <section class="card"><h3>K 线覆盖</h3>{kline}</section>
+      <section class="card"><h3>最近条件选股批次</h3>{batches}</section>
+      <section class="card"><h3>最近一次选股结果</h3>{latest_results}</section>
+      <section class="card"><h3>周末入选股票</h3>{weekly_selected}</section>
+      <section class="card"><h3>最近复盘结果</h3>{weekly_reviews}</section>
     </div>
   </div>
 </body>
@@ -530,6 +835,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
           <h2>Eastmoney Daily Kline{html.escape(title_suffix)}</h2>
           <div>
             <a href="/">Snapshot Page</a>
+            <a href="/checks">Data Checks</a>
             <a href="/api/daily{('?code=' + html.escape(code)) if code else ''}">JSON API</a>
             <a href="/api/stocks">Stock List API</a>
           </div>
@@ -968,9 +1274,29 @@ def make_handler(db_path: Path, limit: int):
                 self.wfile.write(payload)
                 return
 
+            if parsed.path == "/api/checks":
+                checks = fetch_dashboard_checks(db_path)
+                payload = json.dumps(checks, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
             if parsed.path == "/":
                 rows = fetch_rows(db_path, limit)
                 body = build_html(rows).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if parsed.path == "/checks":
+                checks = fetch_dashboard_checks(db_path)
+                body = build_checks_html(checks).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

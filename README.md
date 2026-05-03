@@ -222,40 +222,18 @@ python3 weekly_stock_main.py review --run-id 1
 
 ## 检查数据
 
-查看某只股票的一年 K 线是否导入：
+启动 dashboard 后打开：
 
-```bash
-sqlite3 stocks.db \
-"SELECT COUNT(*), MIN(trade_date), MAX(trade_date) FROM eastmoney_stock_daily_klines WHERE code='301071';"
-```
+- `http://127.0.0.1:8000/checks`
+- `http://127.0.0.1:8000/api/checks`
 
-查看最近一次条件选股导入：
+页面里已经包含这些检查项：
 
-```bash
-sqlite3 stocks.db \
-"SELECT batch_id, imported_at_utc, row_count, xlsx_path FROM xuangu_batches ORDER BY imported_at_utc DESC LIMIT 5;"
-```
-
-查看最近一次选股结果：
-
-```bash
-sqlite3 stocks.db \
-"SELECT stock_code, stock_name FROM xuangu_results WHERE batch_id=(SELECT batch_id FROM xuangu_batches ORDER BY imported_at_utc DESC LIMIT 1) LIMIT 20;"
-```
-
-查看最近一次周末入选股票：
-
-```bash
-sqlite3 stocks.db \
-"SELECT screen_date, code, name, rank_no, total_score, selected_reason FROM weekly_selected_stocks ORDER BY id DESC LIMIT 10;"
-```
-
-查看最近一次复盘：
-
-```bash
-sqlite3 stocks.db \
-"SELECT code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered, meets_expectation, notes FROM weekly_review_results ORDER BY id DESC LIMIT 10;"
-```
+- K 线覆盖：代码、名称、K 线天数、开始日期、结束日期。
+- 最近条件选股批次：批次、导入时间、行数、Excel 文件。
+- 最近一次选股结果：股票代码和名称。
+- 周末入选股票：选股日期、排名、总分、入选原因。
+- 最近复盘结果：最高涨幅、收盘涨幅、最大回撤、止损和是否符合预期。
 
 ## 测试
 
