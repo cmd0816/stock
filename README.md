@@ -86,12 +86,15 @@ python3 eastmoney_to_sqlite.py \
 默认行为：
 
 - 使用 Firefox。
-- 自动读取 Firefox 默认 profile，复用你已经登录的东方财富状态。
+- 自动读取 Firefox 默认用户配置，复用你已经登录的东方财富状态。
 - 打开 `https://xuangu.eastmoney.com/`。
 - 将 `screening.txt` 的内容输入条件选股框。
 - 点击 `去选股` 或 `更新选股结果`。
 - 点击下载弹窗里的橙色 `下载`。
+- 下载文件保存为 `downloads/xuangu_YYYYMMDD.xlsx`，例如 `downloads/xuangu_20260503.xlsx`。
 - 把下载的 `.xlsx` 导入 `stocks.db` 的选股表。
+- 导入批次号使用当天日期，格式为 `YYYYMMDD`，例如 `20260502`。
+- 同一天重新选股导入时，可以在选股页面勾选覆盖旧批次后重新导入。
 
 如果需要先手动登录，再继续运行：
 
@@ -99,17 +102,36 @@ python3 eastmoney_to_sqlite.py \
 WAIT_LOGIN=1 ./run_xuangu.sh
 ```
 
-脚本会停在登录提示处，登录完成后回到终端按 Enter 继续。
+脚本会停在登录提示处，登录完成后回到终端按回车继续。
+
+如果已经下载好了 `.xlsx`，不想重新打开浏览器，可以直接导入已有文件：
+
+```bash
+.venv/bin/python xuangu_to_sqlite.py \
+  --import-xlsx "downloads/你的选股结果.xlsx" \
+  --db stocks.db \
+  --condition-file screening.txt \
+  --batch-id 20260503 \
+  --replace-existing
+```
+
+也可以打开 dashboard：
+
+```bash
+./run_server.sh
+```
+
+进入 `http://127.0.0.1:8000/screening`，在“导入条件选股 XLSX”里点击“选择 XLSX 文件”后导入。
 
 ## 周末选股和复盘系统
 
-第一版不使用 ML，只做规则打分和排序。流程是：
+第一版不使用机器学习，只做规则打分和排序。流程是：
 
 - 周末先运行东方财富条件选股，得到候选池。
 - 从最新候选池读取股票。
-- 结合已有 K 线和选股 Excel 字段计算 score。
-- 按分数选出 Top 3 到 4。
-- 保存候选分数、入选股票和 `selected_reason`。
+- 结合已有 K 线和选股 Excel 字段计算分数。
+- 按分数选出前 3 到 4 只。
+- 保存候选分数、入选股票和入选原因。
 - 下个周末运行复盘任务，计算上一期入选股票的一周表现。
 
 项目结构：
@@ -216,23 +238,22 @@ python3 weekly_stock_main.py review --run-id 1
 
 - `weekly_screen_runs`：每次周末选股运行。
 - `weekly_screen_candidates`：候选股票打分明细。
-- `weekly_selected_stocks`：最终入选 Top 3 到 4。
+- `weekly_selected_stocks`：最终入选前 3 到 4 只股票。
 - `weekly_review_runs`：每次复盘运行。
 - `weekly_review_results`：每只入选股票的复盘结果。
 
-## 检查数据
+## 选股页面
 
-启动 dashboard 后打开：
+启动数据看板后打开：
 
-- `http://127.0.0.1:8000/checks`
-- `http://127.0.0.1:8000/api/checks`
+- `http://127.0.0.1:8000/screening`
+- `http://127.0.0.1:8000/api/screening`
 
-页面里已经包含这些检查项：
+页面只显示这 4 项：
 
-- K 线覆盖：代码、名称、K 线天数、开始日期、结束日期。
-- 最近条件选股批次：批次、导入时间、行数、Excel 文件。
-- 最近一次选股结果：股票代码和名称。
-- 周末入选股票：选股日期、排名、总分、入选原因。
+- 导入条件选股 XLSX：把已下载的东方财富选股 Excel 导入数据库，可覆盖同日批次。
+- 最近条件选股批次：批次、导入时间、行数、Excel 文件、查看股票、删除。
+- 周末入选股票：按选中的选股批次显示完整 Excel 字段。
 - 最近复盘结果：最高涨幅、收盘涨幅、最大回撤、止损和是否符合预期。
 
 ## 测试
@@ -254,5 +275,11 @@ WAIT_LOGIN=1 ./run_xuangu.sh
 ```
 
 如果 `screening.txt` 内容和页面里的条件不一致，脚本会停止，不会继续下载错误结果。优先检查 `screening.txt` 里的中文分号、空格和条件文本是否符合东方财富页面识别方式。
+
+默认会按分号拆分选股条件，检查页面是否覆盖这些条件项。东方财富页面可能会规范化空格和标点，所以默认不要求整串逐字一致。如果需要严格逐字校验，可以运行：
+
+```bash
+./run_xuangu.sh --strict-condition-match
+```
 
 如果下载按钮已经打开弹窗但没有下载，脚本会继续等待。也可以在弹窗里手动点击橙色 `下载`，脚本会捕获下载事件并继续导入。

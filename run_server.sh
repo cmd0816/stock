@@ -17,7 +17,7 @@ if [[ ! -f "$DB_PATH" ]]; then
 fi
 
 echo "Starting dashboard at http://127.0.0.1:8000/daily"
-echo "Data checks at http://127.0.0.1:8000/checks"
+echo "Stock screening page at http://127.0.0.1:8000/screening"
 exec "$PY" "$SCRIPT_DIR/view_quotes.py" \
   --db "$DB_PATH" \
   --host "127.0.0.1" \

@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 import argparse
+from email import policy
+from email.parser import BytesParser
 import html
 import json
+import re
 import sqlite3
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+
+from xuangu_to_sqlite import import_xlsx_to_sqlite
+
+
+UploadedFiles = Dict[str, Dict[str, Any]]
 
 
 def fetch_rows(db_path: Path, limit: int) -> List[Dict[str, Any]]:
@@ -88,7 +96,77 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def fetch_dashboard_checks(db_path: Path) -> Dict[str, Any]:
+def delete_xuangu_batch(db_path: Path, batch_id: str) -> int:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        deleted_results = conn.execute(
+            "DELETE FROM xuangu_results WHERE batch_id = ?",
+            (batch_id,),
+        ).rowcount
+        deleted_batches = conn.execute(
+            "DELETE FROM xuangu_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).rowcount
+        conn.commit()
+    return int((deleted_results or 0) + (deleted_batches or 0))
+
+
+def read_condition_text(base_dir: Path, form_value: str = "") -> str:
+    condition_text = form_value.strip()
+    if condition_text:
+        return condition_text
+    condition_file = base_dir / "screening.txt"
+    if condition_file.exists():
+        return condition_file.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def parse_post_body(content_type: str, body: bytes) -> tuple[Dict[str, List[str]], UploadedFiles]:
+    if content_type.lower().startswith("multipart/form-data"):
+        msg = BytesParser(policy=policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+        )
+        form: Dict[str, List[str]] = {}
+        files: UploadedFiles = {}
+        for part in msg.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            filename = part.get_filename()
+            payload = part.get_payload(decode=True) or b""
+            if filename:
+                if payload:
+                    files[name] = {
+                        "filename": filename,
+                        "content": payload,
+                    }
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            value = payload.decode(charset, errors="replace")
+            form.setdefault(name, []).append(value)
+        return form, files
+
+    text = body.decode("utf-8", errors="ignore")
+    return parse_qs(text), {}
+
+
+def form_value(form: Dict[str, List[str]], name: str, default: str = "") -> str:
+    return (form.get(name, [default])[0] or default).strip()
+
+
+def save_uploaded_xlsx(base_dir: Path, upload: Dict[str, Any], batch_id: str) -> Path:
+    content = upload.get("content") or b""
+    if not content:
+        raise ValueError("选择的 XLSX 文件为空。")
+    download_dir = base_dir / "downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    save_name = f"uploaded_xuangu_{batch_id}.xlsx"
+    path = download_dir / save_name
+    path.write_bytes(content)
+    return path
+
+
+def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         out: Dict[str, Any] = {}
@@ -129,24 +207,32 @@ def fetch_dashboard_checks(db_path: Path) -> Dict[str, Any]:
             out["xuangu_batches"] = []
 
         if table_exists(conn, "xuangu_results") and table_exists(conn, "xuangu_batches"):
+            selected_batch_id = batch_id
+            if not selected_batch_id:
+                row = conn.execute(
+                    """
+                    SELECT batch_id FROM xuangu_batches
+                    ORDER BY imported_at_utc DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                selected_batch_id = str(row["batch_id"]) if row else ""
+            out["selected_xuangu_batch_id"] = selected_batch_id
             out["latest_xuangu_results"] = [
                 dict(r)
                 for r in conn.execute(
                     """
-                    SELECT stock_code, stock_name
+                    SELECT row_no, stock_code, stock_name, row_json
                     FROM xuangu_results
-                    WHERE batch_id = (
-                        SELECT batch_id FROM xuangu_batches
-                        ORDER BY imported_at_utc DESC
-                        LIMIT 1
-                    )
-                    AND stock_code IS NOT NULL
-                    ORDER BY stock_code
-                    LIMIT 80
-                    """
+                    WHERE batch_id = ?
+                    ORDER BY row_no
+                    LIMIT 1000
+                    """,
+                    (selected_batch_id,),
                 ).fetchall()
             ]
         else:
+            out["selected_xuangu_batch_id"] = ""
             out["latest_xuangu_results"] = []
 
         if table_exists(conn, "weekly_selected_stocks"):
@@ -292,7 +378,7 @@ def build_html(rows: List[Dict[str, Any]]) -> str:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta http-equiv="refresh" content="20" />
-  <title>Eastmoney Quotes</title>
+  <title>东方财富行情快照</title>
   <style>
     :root {{
       --bg: #f3f4f6;
@@ -352,25 +438,25 @@ def build_html(rows: List[Dict[str, Any]]) -> str:
 <body>
   <div class="wrap">
     <div class="head">
-      <h2>Eastmoney Quote Snapshots</h2>
+      <h2>东方财富行情快照</h2>
       <div>
-        <a href="/daily">Daily Kline</a>
-        <a href="/checks">Data Checks</a>
-        <a href="/api/quotes">JSON API</a>
+        <a href="/daily">日 K 线</a>
+        <a href="/screening">选股页面</a>
+        <a href="/api/quotes">JSON 接口</a>
       </div>
     </div>
-    <div class="meta">Auto-refresh: 20s | Generated: {html.escape(now)} | Rows: {len(rows)}</div>
+    <div class="meta">自动刷新：20 秒 | 生成时间：{html.escape(now)} | 行数：{len(rows)}</div>
     <div class="card">
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>Code</th><th>Name</th><th>SecID</th><th>Price</th><th>Open</th>
-            <th>High</th><th>Low</th><th>Prev Close</th><th>Change %</th><th>Volume</th>
-            <th>Turnover</th><th>Fetched UTC</th>
+            <th>ID</th><th>代码</th><th>名称</th><th>证券ID</th><th>现价</th><th>开盘</th>
+            <th>最高</th><th>最低</th><th>昨收</th><th>涨跌幅</th><th>成交量</th>
+            <th>成交额</th><th>抓取时间 UTC</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(row_html) if row_html else '<tr><td colspan="13">No rows yet.</td></tr>'}
+          {''.join(row_html) if row_html else '<tr><td colspan="13">暂无数据。</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -406,46 +492,160 @@ def render_simple_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str
     """
 
 
-def build_checks_html(checks: Dict[str, Any]) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    kline = render_simple_table(
-        checks.get("kline_coverage", []),
-        [
-            ("code", "代码"),
-            ("name", "名称"),
-            ("day_count", "K线天数"),
-            ("first_date", "开始日期"),
-            ("last_date", "结束日期"),
-        ],
-        "还没有 K 线数据。",
-    )
-    batches = render_simple_table(
-        checks.get("xuangu_batches", []),
-        [
-            ("batch_id", "批次"),
-            ("imported_at_utc", "导入时间 UTC"),
-            ("row_count", "行数"),
-            ("xlsx_path", "文件"),
-        ],
-        "还没有条件选股批次。",
-    )
-    latest_results = render_simple_table(
-        checks.get("latest_xuangu_results", []),
-        [("stock_code", "代码"), ("stock_name", "名称")],
-        "最近一次选股批次没有结果。",
-    )
-    weekly_selected = render_simple_table(
-        checks.get("weekly_selected", []),
-        [
-            ("screen_date", "选股日期"),
-            ("code", "代码"),
-            ("name", "名称"),
-            ("rank_no", "排名"),
-            ("total_score", "总分"),
-            ("selected_reason", "入选原因"),
-        ],
-        "还没有周末入选记录。",
-    )
+def re_like_number(value: str) -> bool:
+    text = value.strip().replace(",", "")
+    if not text:
+        return False
+    return re.fullmatch(r"-?\d+(?:\.\d+)?%?", text) is not None
+
+
+def render_xuangu_batch_table(rows: List[Dict[str, Any]], selected_batch_id: str) -> str:
+    if not rows:
+        return "<div class='empty'>还没有条件选股批次。</div>"
+    body = []
+    for row in rows:
+        batch_id = str(row.get("batch_id") or "")
+        view_url = f"/screening?batch_id={quote(batch_id)}"
+        view_label = "当前批次" if batch_id == selected_batch_id else "查看股票"
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(batch_id)}</td>"
+            f"<td>{html.escape(str(row.get('imported_at_utc') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('row_count') or 0))}</td>"
+            f"<td>{html.escape(str(row.get('xlsx_path') or '-'))}</td>"
+            "<td class='actions'>"
+            f"<a href='{view_url}'>{view_label}</a>"
+            f"<form method='post' action='/actions/delete_xuangu_batch' onsubmit=\"return confirm('确认删除批次 {html.escape(batch_id)} 及其导入股票吗？');\">"
+            f"<input type='hidden' name='batch_id' value='{html.escape(batch_id)}' />"
+            "<button type='submit'>删除</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
+    return f"""
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>批次</th><th>导入时间 UTC</th><th>行数</th><th>文件</th><th>操作</th></tr>
+          </thead>
+          <tbody>{''.join(body)}</tbody>
+        </table>
+      </div>
+    """
+
+
+def render_xuangu_import_form(message: str = "", error: str = "") -> str:
+    msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message else ""
+    err_html = f"<div class='notice error'>{html.escape(error)}</div>" if error else ""
+    return f"""
+      <div class="import-box">
+        {msg_html}
+        {err_html}
+        <form method="post" action="/actions/import_xuangu_xlsx" enctype="multipart/form-data">
+          <div class="form-grid">
+            <label>
+              <span>选择 XLSX 文件</span>
+              <input class="file-input" type="file" name="xlsx_file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
+            </label>
+            <label>
+              <span>批次号</span>
+              <input name="batch_id" placeholder="留空使用今天 YYYYMMDD" />
+            </label>
+            <label>
+              <span>来源 URL</span>
+              <input name="source_url" value="https://xuangu.eastmoney.com/" />
+            </label>
+          </div>
+          <label class="textarea-label">
+            <span>选股条件</span>
+            <textarea name="condition_text" rows="3" placeholder="留空时自动读取 screening.txt"></textarea>
+          </label>
+          <div class="form-actions">
+            <label class="checkline">
+              <input type="checkbox" name="replace_existing" value="1" checked />
+              <span>如果同批次已存在，先删除旧导入再重新导入</span>
+            </label>
+            <button type="submit">导入 XLSX</button>
+          </div>
+        </form>
+      </div>
+    """
+
+
+def render_xuangu_result_table(rows: List[Dict[str, Any]], selected_batch_id: str) -> str:
+    if not rows:
+        return f"<div class='empty'>批次 {html.escape(selected_batch_id or '-')} 没有导入行。</div>"
+
+    parsed_rows: List[Dict[str, Any]] = []
+    headers: List[str] = []
+    recognized = 0
+    for row in rows:
+        raw_text = str(row.get("row_json") or "{}")
+        try:
+            raw = json.loads(raw_text)
+        except Exception:
+            raw = {"原始数据": raw_text}
+        if row.get("stock_code"):
+            recognized += 1
+        if not isinstance(raw, dict):
+            raw = {"原始数据": raw}
+        for key in raw.keys():
+            key_text = str(key)
+            if key_text not in headers:
+                headers.append(key_text)
+        parsed_rows.append(raw)
+
+    warning = ""
+    if recognized == 0:
+        warning = (
+            "<div class='notice'>这个批次有导入行，但没有识别到股票代码。"
+            "通常是旧批次在修复前导入，或者东方财富导出的字段结构变了。"
+            "请用上面的导入功能勾选覆盖后重新导入 XLSX。</div>"
+        )
+
+    if not headers:
+        return warning + f"<div class='empty'>批次 {html.escape(selected_batch_id or '-')} 没有可显示字段。</div>"
+
+    def cell_class(header: str, value: Any) -> str:
+        if header in {"代码", "股票代码", "证券代码", "名称", "股票名称", "证券简称", "股票简称", "上市板块"}:
+            return "txt"
+        if isinstance(value, (int, float)):
+            return "num"
+        if isinstance(value, str) and re_like_number(value):
+            return "num"
+        return "txt"
+
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = []
+    for row in parsed_rows:
+        cells = []
+        for header in headers:
+            value = row.get(header)
+            text = "-" if value is None or value == "" else str(value)
+            cls = cell_class(header, value)
+            cells.append(f"<td class='{cls}'>{html.escape(text)}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+
+    table_min_width = max(980, len(headers) * 138)
+    table = f"""
+      <div class="xlsx-summary">
+        显示 {len(parsed_rows)} 行，识别到股票代码 {recognized} 行。
+      </div>
+      <div class="table-wrap xlsx-wrap">
+        <table class="xlsx-table" style="min-width:{table_min_width}px">
+          <thead><tr>{head}</tr></thead>
+          <tbody>{''.join(body)}</tbody>
+        </table>
+      </div>
+    """
+    return warning + table
+
+
+def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = "") -> str:
+    selected_batch_id = str(checks.get("selected_xuangu_batch_id") or "")
+    batches = render_xuangu_batch_table(checks.get("xuangu_batches", []), selected_batch_id)
+    import_form = render_xuangu_import_form(message, error)
+    latest_results = render_xuangu_result_table(checks.get("latest_xuangu_results", []), selected_batch_id)
     weekly_reviews = render_simple_table(
         checks.get("weekly_reviews", []),
         [
@@ -466,8 +666,7 @@ def build_checks_html(checks: Dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="30" />
-  <title>Data Checks</title>
+  <title>选股页面</title>
   <style>
     :root {{
       --bg: #f3f4f6;
@@ -546,29 +745,195 @@ def build_checks_html(checks: Dict[str, Any]) -> str:
     td {{
       color: #111827;
     }}
+    .xlsx-summary {{
+      padding: 9px 12px;
+      color: #475569;
+      font-size: 13px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }}
+    .xlsx-wrap {{
+      max-height: 560px;
+      border-top: 0;
+    }}
+    .xlsx-table {{
+      width: max-content;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 12px;
+      background: #fff;
+    }}
+    .xlsx-table th,
+    .xlsx-table td {{
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 5px 8px;
+      white-space: nowrap;
+      line-height: 1.25;
+    }}
+    .xlsx-table th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: #111827;
+      background: #f8fafc;
+      font-weight: 800;
+      text-align: center;
+    }}
+    .xlsx-table td.num {{
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }}
+    .xlsx-table td.txt {{
+      text-align: left;
+    }}
+    .xlsx-table tbody tr:nth-child(even) {{
+      background: #fafafa;
+    }}
+    .xlsx-table tbody tr:hover {{
+      background: #fff7ed;
+    }}
+    .actions {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+    }}
+    .actions form {{
+      margin: 0;
+    }}
+    .actions button {{
+      border: 1px solid #fecaca;
+      background: #fff5f5;
+      color: #b91c1c;
+      border-radius: 6px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }}
+    .actions button:hover {{
+      background: #fee2e2;
+    }}
+    .import-box {{
+      padding: 14px;
+    }}
+    .form-grid {{
+      display: grid;
+      grid-template-columns: 1.4fr 1fr 1.4fr;
+      gap: 12px;
+      margin-bottom: 12px;
+    }}
+    label span {{
+      display: block;
+      color: #475569;
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }}
+    input, textarea {{
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      color: #111827;
+      background: #fff;
+      font: inherit;
+      font-size: 13px;
+      padding: 8px 10px;
+    }}
+    .file-input {{
+      padding: 6px 8px;
+      background: #f8fafc;
+    }}
+    textarea {{
+      resize: vertical;
+    }}
+    .textarea-label {{
+      display: block;
+      margin-bottom: 10px;
+    }}
+    .form-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .checkline {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #475569;
+      font-size: 13px;
+    }}
+    .checkline input {{
+      width: auto;
+    }}
+    .checkline span {{
+      display: inline;
+      margin: 0;
+      font-size: 13px;
+      font-weight: 500;
+    }}
+    .form-actions button {{
+      border: 1px solid #fb923c;
+      background: #f97316;
+      color: white;
+      border-radius: 8px;
+      padding: 8px 14px;
+      cursor: pointer;
+      font-weight: 700;
+    }}
+    .form-actions button:hover {{
+      background: #ea580c;
+    }}
     .empty {{
       padding: 16px;
       color: var(--muted);
       font-size: 13px;
+    }}
+    .notice {{
+      margin: 12px;
+      padding: 10px 12px;
+      border: 1px solid #fde68a;
+      background: #fffbeb;
+      color: #92400e;
+      border-radius: 8px;
+      font-size: 13px;
+    }}
+    .import-box .notice {{
+      margin: 0 0 12px;
+    }}
+    .notice.ok {{
+      border-color: #bbf7d0;
+      background: #f0fdf4;
+      color: #166534;
+    }}
+    .notice.error {{
+      border-color: #fecaca;
+      background: #fef2f2;
+      color: #991b1b;
+    }}
+    @media (max-width: 900px) {{
+      .form-grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="head">
-      <h2>数据检查</h2>
+      <h2>选股页面</h2>
       <div>
-        <a href="/">Snapshot</a>
-        <a href="/daily">Daily Kline</a>
-        <a href="/api/checks">JSON API</a>
+        <a href="/">行情快照</a>
+        <a href="/daily">日 K 线</a>
+        <a href="/api/screening">JSON 接口</a>
       </div>
     </div>
-    <div class="meta">Auto-refresh: 30s | Generated: {html.escape(now)}</div>
     <div class="grid">
-      <section class="card"><h3>K 线覆盖</h3>{kline}</section>
+      <section class="card"><h3>导入条件选股 XLSX</h3>{import_form}</section>
       <section class="card"><h3>最近条件选股批次</h3>{batches}</section>
-      <section class="card"><h3>最近一次选股结果</h3>{latest_results}</section>
-      <section class="card"><h3>周末入选股票</h3>{weekly_selected}</section>
+      <section class="card"><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{latest_results}</section>
       <section class="card"><h3>最近复盘结果</h3>{weekly_reviews}</section>
     </div>
   </div>
@@ -604,7 +969,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta http-equiv="refresh" content="30" />
-  <title>Eastmoney Daily Kline</title>
+  <title>东方财富日 K 线</title>
   <style>
     :root {{
       --bg: #f3f4f6;
@@ -825,31 +1190,31 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
   <div class="wrap">
     <div class="layout">
       <aside class="side">
-        <h3>Stock List</h3>
+        <h3>股票列表</h3>
         <div class="stocks">
           {''.join(stock_links) if stock_links else "<div style='padding:12px;color:#6b7280'>No stocks found.</div>"}
         </div>
       </aside>
       <main class="main">
         <div class="head">
-          <h2>Eastmoney Daily Kline{html.escape(title_suffix)}</h2>
+          <h2>东方财富日 K 线{html.escape(title_suffix)}</h2>
           <div>
-            <a href="/">Snapshot Page</a>
-            <a href="/checks">Data Checks</a>
-            <a href="/api/daily{('?code=' + html.escape(code)) if code else ''}">JSON API</a>
-            <a href="/api/stocks">Stock List API</a>
+            <a href="/">行情快照</a>
+            <a href="/screening">选股页面</a>
+            <a href="/api/daily{('?code=' + html.escape(code)) if code else ''}">JSON 接口</a>
+            <a href="/api/stocks">股票列表接口</a>
           </div>
         </div>
         <div class="meta">
-          Auto-refresh: 30s | Generated: {html.escape(now)} | Rows: {len(rows)} | Selected: {selected_name}
+          自动刷新：30 秒 | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}
         </div>
         <div class="card">
           <div class="hover-row">
-            <div id="hoverInfo" class="hover-info">Move pointer over chart to inspect daily values.</div>
+            <div id="hoverInfo" class="hover-info">移动鼠标到图表上查看当日明细。</div>
             <div class="chart-controls">
-              <button id="zoomInBtn" type="button">Zoom In</button>
-              <button id="zoomOutBtn" type="button">Zoom Out</button>
-              <button id="zoomResetBtn" type="button">Reset</button>
+              <button id="zoomInBtn" type="button">放大</button>
+              <button id="zoomOutBtn" type="button">缩小</button>
+              <button id="zoomResetBtn" type="button">重置</button>
               <span id="zoomLabel" class="zoom-label">-</span>
             </div>
           </div>
@@ -861,8 +1226,8 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
             <div id="chartTooltip" class="tooltip"></div>
           </div>
           <div class="legend">
-            <span><b style="color:#dc2626">Candle Up</b></span>
-            <span><b style="color:#16a34a">Candle Down</b></span>
+            <span><b style="color:#dc2626">阳线</b></span>
+            <span><b style="color:#16a34a">阴线</b></span>
             <span><b style="color:#f59e0b">MA5</b></span>
             <span><b style="color:#3b82f6">MA10</b></span>
             <span><b style="color:#ef4444">MA20</b></span>
@@ -870,7 +1235,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
             <span><b style="color:#8b5cf6">MA60</b></span>
             <span><b style="color:#0f766e">MA120</b></span>
             <span><b style="color:#374151">MA250</b></span>
-            <span><b style="color:#0369a1">Chip Diagram</b> (estimated volume by price)</span>
+            <span><b style="color:#0369a1">筹码图</b>（按价格估算成交量分布）</span>
           </div>
         </div>
       </main>
@@ -889,7 +1254,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
       const zoomResetBtn = document.getElementById('zoomResetBtn');
       const zoomLabel = document.getElementById('zoomLabel');
       if (!canvas || !chipCanvas || !zoomInBtn || !zoomOutBtn || !zoomResetBtn || rows.length === 0) {{
-        if (hoverInfo) hoverInfo.textContent = 'No daily rows found.';
+        if (hoverInfo) hoverInfo.textContent = '暂无日 K 数据。';
         return;
       }}
 
@@ -925,7 +1290,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         .filter((r) => ![r.open, r.close, r.high, r.low].some((v) => Number.isNaN(v)));
 
       if (points.length === 0) {{
-        hoverInfo.textContent = 'No valid K-line points found.';
+        hoverInfo.textContent = '暂无有效 K 线数据。';
         return;
       }}
 
@@ -1128,9 +1493,9 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         chipCtx.strokeRect(chipPadL, pad.top, chipPlotW, plotH);
         chipCtx.fillStyle = '#64748b';
         chipCtx.font = '12px sans-serif';
-        chipCtx.fillText('Chip', chipPadL, pad.top - 6);
+        chipCtx.fillText('筹码', chipPadL, pad.top - 6);
         const chipAnchorDate = points[chipEndAbs].trade_date || '';
-        chipCtx.fillText(`as of ${{chipAnchorDate}}`, chipPadL + 38, pad.top - 6);
+        chipCtx.fillText(`截至 ${{chipAnchorDate}}`, chipPadL + 38, pad.top - 6);
         chipCtx.fillText(fmt(maxV), chipPadL + chipPlotW + 4, pad.top + 9);
         chipCtx.fillText(fmt(minV), chipPadL + chipPlotW + 4, pad.top + plotH);
 
@@ -1163,23 +1528,23 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
 
           const cp = Number.isFinite(p.change_percent) ? `${{fmt(p.change_percent)}}%` : '-';
           hoverInfo.innerHTML =
-            `Date: <b>${{p.trade_date}}</b> | O: <b>${{fmt(p.open)}}</b> H: <b>${{fmt(p.high)}}</b> L: <b>${{fmt(p.low)}}</b> C: <b>${{fmt(p.close)}}</b> ` +
-            `| Chg: <b>${{fmt(p.change_amount)}} (${{cp}})</b> | Vol: <b>${{fmtInt(p.volume)}}</b> | Turnover: <b>${{fmt(p.turnover, 0)}}</b>`;
+            `日期：<b>${{p.trade_date}}</b> | 开：<b>${{fmt(p.open)}}</b> 高：<b>${{fmt(p.high)}}</b> 低：<b>${{fmt(p.low)}}</b> 收：<b>${{fmt(p.close)}}</b> ` +
+            `| 涨跌：<b>${{fmt(p.change_amount)}} (${{cp}})</b> | 成交量：<b>${{fmtInt(p.volume)}}</b> | 成交额：<b>${{fmt(p.turnover, 0)}}</b>`;
 
           const tips = [
-            `Date: ${{p.trade_date}}`,
-            `Open: ${{fmt(p.open)}}`,
-            `High: ${{fmt(p.high)}}`,
-            `Low: ${{fmt(p.low)}}`,
-            `Close: ${{fmt(p.close)}}`,
-            `Change: ${{fmt(p.change_amount)}} (${{cp}})`,
-            `Turnover Rate: ${{fmt(p.turnover_rate)}}%`,
-            `Volume: ${{fmtInt(p.volume)}}`,
+            `日期：${{p.trade_date}}`,
+            `开盘：${{fmt(p.open)}}`,
+            `最高：${{fmt(p.high)}}`,
+            `最低：${{fmt(p.low)}}`,
+            `收盘：${{fmt(p.close)}}`,
+            `涨跌：${{fmt(p.change_amount)}} (${{cp}})`,
+            `换手率：${{fmt(p.turnover_rate)}}%`,
+            `成交量：${{fmtInt(p.volume)}}`,
           ];
           tooltip.innerHTML = tips.join('<br>');
           tooltip.style.display = 'block';
         }} else {{
-          hoverInfo.textContent = 'Move pointer over chart to inspect daily values.';
+          hoverInfo.textContent = '移动鼠标到图表上查看当日明细。';
           tooltip.style.display = 'none';
         }}
       }};
@@ -1239,10 +1604,72 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
 
 def make_handler(db_path: Path, limit: int):
     class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(content_length)
+            form, files = parse_post_body(self.headers.get("Content-Type", ""), body)
+
+            if parsed.path == "/actions/delete_xuangu_batch":
+                batch_id = form_value(form, "batch_id")
+                if batch_id:
+                    delete_xuangu_batch(db_path, batch_id)
+                self.send_response(303)
+                self.send_header("Location", "/screening")
+                self.end_headers()
+                return
+
+            if parsed.path == "/actions/import_xuangu_xlsx":
+                try:
+                    base_dir = db_path.parent
+                    upload = files.get("xlsx_file")
+                    if not upload:
+                        raise ValueError("请选择 XLSX 文件。")
+                    batch_id_arg = form_value(form, "batch_id") or datetime.now().strftime("%Y%m%d")
+                    xlsx_path = save_uploaded_xlsx(base_dir, upload, batch_id_arg)
+                    if not xlsx_path.exists():
+                        raise FileNotFoundError(f"找不到 XLSX 文件：{xlsx_path}")
+                    if xlsx_path.suffix.lower() != ".xlsx":
+                        raise ValueError(f"文件不是 .xlsx：{xlsx_path}")
+
+                    condition_text = read_condition_text(
+                        base_dir,
+                        form_value(form, "condition_text"),
+                    )
+                    source_url = (
+                        form_value(form, "source_url") or "https://xuangu.eastmoney.com/"
+                    ).strip()
+                    replace_existing = form_value(form, "replace_existing") == "1"
+                    batch_id, sheet_count, row_count = import_xlsx_to_sqlite(
+                        db_path=db_path,
+                        xlsx_path=xlsx_path,
+                        source_url=source_url,
+                        condition_text=condition_text,
+                        batch_id=batch_id_arg,
+                        replace_existing=replace_existing,
+                    )
+                    msg = quote(f"导入成功：批次 {batch_id}，sheet {sheet_count}，股票行 {row_count}")
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?batch_id={quote(batch_id)}&msg={msg}")
+                    self.end_headers()
+                    return
+                except Exception as exc:
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?err={quote(str(exc))}")
+                    self.end_headers()
+                    return
+
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+
         def do_GET(self):
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
             code = (query.get("code", [""])[0] or "").strip()
+            selected_batch_id = (query.get("batch_id", [""])[0] or "").strip()
+            message = (query.get("msg", [""])[0] or "").strip()
+            error = (query.get("err", [""])[0] or "").strip()
 
             if parsed.path == "/api/quotes":
                 rows = fetch_rows(db_path, limit)
@@ -1274,8 +1701,8 @@ def make_handler(db_path: Path, limit: int):
                 self.wfile.write(payload)
                 return
 
-            if parsed.path == "/api/checks":
-                checks = fetch_dashboard_checks(db_path)
+            if parsed.path in {"/api/checks", "/api/screening"}:
+                checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
                 payload = json.dumps(checks, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1294,9 +1721,9 @@ def make_handler(db_path: Path, limit: int):
                 self.wfile.write(body)
                 return
 
-            if parsed.path == "/checks":
-                checks = fetch_dashboard_checks(db_path)
-                body = build_checks_html(checks).encode("utf-8")
+            if parsed.path in {"/checks", "/screening"}:
+                checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
+                body = build_checks_html(checks, message=message, error=error).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -1339,8 +1766,8 @@ def main() -> None:
         raise FileNotFoundError(f"DB not found: {db_path}")
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(db_path, args.limit))
-    print(f"Open http://{args.host}:{args.port}/")
-    print(f"Using DB: {db_path}")
+    print(f"打开 http://{args.host}:{args.port}/")
+    print(f"使用数据库：{db_path}")
     server.serve_forever()
 
 

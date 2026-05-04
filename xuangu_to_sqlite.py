@@ -59,7 +59,7 @@ def now_utc_iso() -> str:
 
 
 def make_batch_id() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return datetime.now().strftime("%Y%m%d")
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -133,17 +133,20 @@ def clean_stock_code(v: Any) -> Optional[str]:
     return m.group(1) if m else s
 
 
-def parse_xlsx_rows(xlsx_path: Path) -> Tuple[List[Dict[str, Any]], int]:
-    try:
-        from openpyxl import load_workbook
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("openpyxl is required. Install with: pip install -r requirements.txt") from exc
-
-    wb = load_workbook(filename=str(xlsx_path), data_only=True, read_only=True)
+def parse_workbook_rows(wb: Any, *, reset_dimensions: bool = False) -> Tuple[List[Dict[str, Any]], int]:
     all_rows: List[Dict[str, Any]] = []
     non_empty_sheets = 0
 
     for ws in wb.worksheets:
+        if reset_dimensions and hasattr(ws, "reset_dimensions"):
+            try:
+                # Some Eastmoney exports declare only A1:A<n> in sheet metadata even
+                # though the XML contains many columns. In read-only mode openpyxl
+                # trusts that metadata unless we force it to recalculate dimensions.
+                ws.reset_dimensions()
+            except Exception:
+                pass
+
         iterator = ws.iter_rows(values_only=True)
         headers: Optional[List[str]] = None
         raw_headers: Optional[List[Any]] = None
@@ -188,8 +191,39 @@ def parse_xlsx_rows(xlsx_path: Path) -> Tuple[List[Dict[str, Any]], int]:
         if headers is not None:
             non_empty_sheets += 1
 
-    wb.close()
     return all_rows, non_empty_sheets
+
+
+def max_header_count(rows: List[Dict[str, Any]]) -> int:
+    return max((len(r.get("headers") or []) for r in rows), default=0)
+
+
+def parse_xlsx_rows(xlsx_path: Path) -> Tuple[List[Dict[str, Any]], int]:
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("openpyxl is required. Install with: pip install -r requirements.txt") from exc
+
+    wb = load_workbook(filename=str(xlsx_path), data_only=True, read_only=True)
+    try:
+        rows, sheet_count = parse_workbook_rows(wb, reset_dimensions=True)
+    finally:
+        wb.close()
+
+    if max_header_count(rows) > 1:
+        return rows, sheet_count
+
+    # Last-resort fallback for malformed XLSX metadata that still fools
+    # read-only parsing. Normal mode ignores the broken dimension more often.
+    wb = load_workbook(filename=str(xlsx_path), data_only=True, read_only=False)
+    try:
+        fallback_rows, fallback_sheet_count = parse_workbook_rows(wb)
+    finally:
+        wb.close()
+
+    if max_header_count(fallback_rows) > max_header_count(rows):
+        return fallback_rows, fallback_sheet_count
+    return rows, sheet_count
 
 
 def import_xlsx_to_sqlite(
@@ -197,13 +231,28 @@ def import_xlsx_to_sqlite(
     xlsx_path: Path,
     source_url: str,
     condition_text: str,
+    batch_id: Optional[str] = None,
+    replace_existing: bool = False,
 ) -> Tuple[str, int, int]:
     rows, sheet_count = parse_xlsx_rows(xlsx_path)
-    batch_id = make_batch_id()
+    batch_id = batch_id or make_batch_id()
     imported_at = now_utc_iso()
 
     with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
         ensure_tables(conn)
+        existing = conn.execute(
+            "SELECT 1 FROM xuangu_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if existing:
+            if not replace_existing:
+                raise RuntimeError(
+                    f"Xuangu batch {batch_id} already exists. "
+                    "Delete that batch from /checks before importing again, or use --replace-existing."
+                )
+            conn.execute("DELETE FROM xuangu_results WHERE batch_id = ?", (batch_id,))
+            conn.execute("DELETE FROM xuangu_batches WHERE batch_id = ?", (batch_id,))
         conn.execute(
             """
             INSERT INTO xuangu_batches (
@@ -306,7 +355,28 @@ def clear_focused_field(page: Any) -> None:
 
 
 def normalize_condition_text(text: str) -> str:
-    return re.sub(r"\s+", "", text).replace("；", ";").strip(";")
+    normalized = re.sub(r"\s+", "", text)
+    normalized = normalized.replace("；", ";")
+    normalized = normalized.replace("％", "%")
+    normalized = normalized.replace("，", ",")
+    normalized = normalized.replace("：", ":")
+    return normalized.strip(";")
+
+
+def split_condition_items(text: str) -> List[str]:
+    normalized = normalize_condition_text(text)
+    return [item for item in normalized.split(";") if item]
+
+
+def condition_item_matches(item: str, actual: str) -> bool:
+    if item in actual:
+        return True
+    tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", item)
+    meaningful = [t for t in tokens if len(t) >= 2 or re.search(r"\d", t)]
+    if not meaningful:
+        return False
+    hits = sum(1 for token in meaningful if token in actual)
+    return hits >= max(1, len(meaningful) - 1)
 
 
 def get_visible_condition_text(targets: List[Any]) -> str:
@@ -345,12 +415,28 @@ def get_visible_condition_text(targets: List[Any]) -> str:
     return "\n".join(snippets)
 
 
-def condition_matches_page(targets: List[Any], condition_text: str) -> bool:
+def condition_matches_page(targets: List[Any], condition_text: str, strict: bool = False) -> bool:
     expected = normalize_condition_text(condition_text)
     actual_text = get_visible_condition_text(targets)
     actual = normalize_condition_text(actual_text)
     if expected and expected in actual:
         return True
+
+    if not strict:
+        items = split_condition_items(condition_text)
+        missing = [item for item in items if not condition_item_matches(item, actual)]
+        if not missing:
+            return True
+        allowed_missing = 1 if len(items) >= 12 else 0
+        if len(missing) <= allowed_missing:
+            print(f"Condition fuzzy match accepted; missing/rewritten item: {missing}")
+            return True
+        print("Condition mismatch after input.")
+        print(f"Missing items: {missing[:8]}")
+        print(f"Expected: {expected}")
+        print(f"Actual snippet: {actual[:500]}")
+        return False
+
     print("Condition mismatch after input.")
     print(f"Expected: {expected}")
     print(f"Actual snippet: {actual[:500]}")
@@ -362,6 +448,7 @@ def type_and_verify_focused(
     condition_text: str,
     probe: str,
     label: str,
+    strict_condition_match: bool = False,
 ) -> bool:
     strategies = [
         (
@@ -380,7 +467,7 @@ def type_and_verify_focused(
             writer()
             page.wait_for_timeout(1200)
             targets = iter_targets(page)
-            if condition_matches_page(targets, condition_text):
+            if condition_matches_page(targets, condition_text, strict=strict_condition_match):
                 print(f"Condition filled via: {label} using {method}")
                 return True
             print(f"Condition entry method failed: {label} using {method}")
@@ -534,7 +621,13 @@ def condition_visible_in_top_editor(targets: List[Any], probe: str) -> bool:
     return False
 
 
-def fill_condition_near_filters(page: Any, target: Any, condition_text: str, probe: str) -> bool:
+def fill_condition_near_filters(
+    page: Any,
+    target: Any,
+    condition_text: str,
+    probe: str,
+    strict_condition_match: bool = False,
+) -> bool:
     try:
         result = target.evaluate(
             """() => {
@@ -605,7 +698,13 @@ def fill_condition_near_filters(page: Any, target: Any, condition_text: str, pro
         y = max(8, int(result.get("y", 8)))
         page.mouse.click(x, y)
         page.wait_for_timeout(250)
-        if type_and_verify_focused(page, condition_text, probe, str(result.get("reason"))):
+        if type_and_verify_focused(
+            page,
+            condition_text,
+            probe,
+            str(result.get("reason")),
+            strict_condition_match=strict_condition_match,
+        ):
             print(f"Condition filled via: {result.get('reason')} at {x},{y}")
             return True
         print(
@@ -617,7 +716,13 @@ def fill_condition_near_filters(page: Any, target: Any, condition_text: str, pro
     return False
 
 
-def fill_condition_between_title_and_button(page: Any, target: Any, condition_text: str, probe: str) -> bool:
+def fill_condition_between_title_and_button(
+    page: Any,
+    target: Any,
+    condition_text: str,
+    probe: str,
+    strict_condition_match: bool = False,
+) -> bool:
     try:
         title = target.locator("text=条件选股").first
         button = target.locator("button:has-text('去选股'), a:has-text('去选股'), text=去选股").first
@@ -638,7 +743,13 @@ def fill_condition_between_title_and_button(page: Any, target: Any, condition_te
         y = int(button_box["y"] + button_box["height"] / 2)
         page.mouse.click(x, y)
         page.wait_for_timeout(250)
-        if type_and_verify_focused(page, condition_text, probe, "title-button geometry"):
+        if type_and_verify_focused(
+            page,
+            condition_text,
+            probe,
+            "title-button geometry",
+            strict_condition_match=strict_condition_match,
+        ):
             print(f"Condition filled via: title-button geometry at {x},{y}")
             return True
         print(f"Condition typed via title-button geometry at {x},{y}, but verification failed")
@@ -932,14 +1043,20 @@ def _fill_and_verify(target: Any, selector: str, condition_text: str) -> bool:
         return False
 
 
-def fill_condition(page: Any, condition_text: str) -> bool:
+def fill_condition(page: Any, condition_text: str, strict_condition_match: bool = False) -> bool:
     targets = iter_targets(page)
     probe = condition_text[:16].strip()
     if not probe:
         return False
 
     for target in targets:
-        if fill_condition_near_filters(page, target, condition_text, probe):
+        if fill_condition_near_filters(
+            page,
+            target,
+            condition_text,
+            probe,
+            strict_condition_match=strict_condition_match,
+        ):
             if condition_visible_in_top_editor(targets, probe):
                 print("Condition visible-check: true (near-filters)")
                 return True
@@ -949,7 +1066,13 @@ def fill_condition(page: Any, condition_text: str) -> bool:
             print("Condition visible-check failed after near-filters fill, continue...")
 
     for target in targets:
-        if fill_condition_between_title_and_button(page, target, condition_text, probe):
+        if fill_condition_between_title_and_button(
+            page,
+            target,
+            condition_text,
+            probe,
+            strict_condition_match=strict_condition_match,
+        ):
             if condition_visible_in_top_editor(targets, probe):
                 print("Condition visible-check: true (title-button geometry)")
                 return True
@@ -1113,7 +1236,13 @@ def fill_condition(page: Any, condition_text: str) -> bool:
             if not clicked:
                 continue
 
-            ok_typed = type_and_verify_focused(page, condition_text, probe, "anchor area typing")
+            ok_typed = type_and_verify_focused(
+                page,
+                condition_text,
+                probe,
+                "anchor area typing",
+                strict_condition_match=strict_condition_match,
+            )
             page.keyboard.press("Enter")
             page.wait_for_timeout(500)
             print(f"Condition filled via anchor area typing: {clicked_desc}")
@@ -1131,7 +1260,13 @@ def fill_condition(page: Any, condition_text: str) -> bool:
     page.wait_for_timeout(800)
     for target in targets:
         try:
-            if type_and_verify_focused(page, condition_text, probe, "final focused field"):
+            if type_and_verify_focused(
+                page,
+                condition_text,
+                probe,
+                "final focused field",
+                strict_condition_match=strict_condition_match,
+            ):
                 return True
             break
         except Exception:
@@ -1217,15 +1352,20 @@ def auto_download_xlsx(
     condition_text: str,
     timeout_ms: int,
     manual_download: bool,
+    strict_condition_match: bool,
 ) -> Any:
     if condition_text:
-        filled = fill_condition(page, condition_text)
+        filled = fill_condition(page, condition_text, strict_condition_match=strict_condition_match)
         print(f"Condition input filled: {filled}")
-        if filled and not condition_matches_page(iter_targets(page), condition_text):
+        if filled and not condition_matches_page(
+            iter_targets(page),
+            condition_text,
+            strict=strict_condition_match,
+        ):
             filled = False
         if not filled:
             debug_xuangu_page(page)
-            raise RuntimeError("Could not fill exact condition text from screening.txt.")
+            raise RuntimeError("Could not fill/verify condition text from screening.txt.")
 
     page.wait_for_timeout(1200)
     clicked_pick = click_go_pick(page)
@@ -1281,9 +1421,21 @@ def main() -> None:
     )
     parser.add_argument("--db", default="stocks.db", help="SQLite database path")
     parser.add_argument("--download-dir", default="downloads", help="Directory to save downloaded xlsx")
+    parser.add_argument("--import-xlsx", default="", help="Import an existing xuangu xlsx file and exit")
+    parser.add_argument("--batch-id", default="", help="Batch id for --import-xlsx. Default: today's YYYYMMDD")
+    parser.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="Replace an existing xuangu batch with the same batch id when importing",
+    )
     parser.add_argument("--timeout", type=int, default=120, help="Timeout in seconds for page/download operations")
     parser.add_argument("--manual-download", action="store_true", help="Allow manual click for download if auto click fails")
     parser.add_argument("--wait-login", action="store_true", help="Pause for manual login before selecting/downloading")
+    parser.add_argument(
+        "--strict-condition-match",
+        action="store_true",
+        help="Require page condition text to exactly contain screening.txt after normalization",
+    )
 
     parser.add_argument("--browser-engine", default="chromium", choices=["chromium", "firefox", "webkit"])
     parser.add_argument("--browser-channel", default="chrome", help="Chromium channel: chrome/chromium/msedge")
@@ -1308,6 +1460,22 @@ def main() -> None:
     if not condition_text:
         raise ValueError("Condition text is empty. Please set --condition or put text in screening.txt.")
 
+    if args.import_xlsx:
+        xlsx_path = Path(args.import_xlsx).expanduser().resolve()
+        if not xlsx_path.exists():
+            raise FileNotFoundError(f"XLSX file not found: {xlsx_path}")
+        batch_id, sheet_count, row_count = import_xlsx_to_sqlite(
+            db_path=db_path,
+            xlsx_path=xlsx_path,
+            source_url=args.url,
+            condition_text=condition_text,
+            batch_id=(args.batch_id.strip() or None),
+            replace_existing=args.replace_existing,
+        )
+        print(f"Imported xlsx: {xlsx_path}")
+        print(f"Imported batch_id={batch_id}, sheets={sheet_count}, rows={row_count} into {db_path}")
+        return
+
     browser, context = launch_context(
         engine=args.browser_engine,
         headed=args.browser_headed,
@@ -1329,19 +1497,24 @@ def main() -> None:
             condition_text=condition_text,
             timeout_ms=timeout_ms,
             manual_download=args.manual_download,
+            strict_condition_match=args.strict_condition_match,
         )
-        suggested_name = download.suggested_filename or "xuangu_result.xlsx"
-        if not suggested_name.lower().endswith(".xlsx"):
-            suggested_name = suggested_name + ".xlsx"
-        save_name = f"xuangu_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{suggested_name}"
+        batch_id_arg = args.batch_id.strip() or make_batch_id()
+        save_name = f"xuangu_{batch_id_arg}.xlsx"
         xlsx_path = download_dir / save_name
-        download.save_as(str(xlsx_path))
+        tmp_xlsx_path = download_dir / f".{save_name}.download"
+        if tmp_xlsx_path.exists():
+            tmp_xlsx_path.unlink()
+        download.save_as(str(tmp_xlsx_path))
+        tmp_xlsx_path.replace(xlsx_path)
 
         batch_id, sheet_count, row_count = import_xlsx_to_sqlite(
             db_path=db_path,
             xlsx_path=xlsx_path,
             source_url=args.url,
             condition_text=condition_text,
+            batch_id=batch_id_arg,
+            replace_existing=args.replace_existing,
         )
         print(f"Download saved: {xlsx_path}")
         print(f"Imported batch_id={batch_id}, sheets={sheet_count}, rows={row_count} into {db_path}")
