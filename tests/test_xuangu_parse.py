@@ -9,6 +9,9 @@ from openpyxl import Workbook
 from xuangu_to_sqlite import (
     clean_stock_code,
     detect_code_name_keys,
+    fetch_xuangu_batch_stocks,
+    get_xuangu_batch_status,
+    infer_market_from_stock_code,
     import_xlsx_to_sqlite,
     parse_xlsx_rows,
 )
@@ -86,6 +89,47 @@ class XuanguParseTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(count, 2)
             self.assertEqual(recognized, 2)
+
+    def test_fetch_xuangu_batch_stocks_dedupes_and_infers_market(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xlsx_path = root / "xuangu.xlsx"
+            db_path = root / "stocks.db"
+            make_bad_dimension_xlsx(xlsx_path)
+            import_xlsx_to_sqlite(
+                db_path=db_path,
+                xlsx_path=xlsx_path,
+                source_url="test",
+                condition_text="cond",
+                batch_id="20260503",
+            )
+
+            stocks = fetch_xuangu_batch_stocks(db_path, "20260503")
+
+            self.assertEqual([s["code"] for s in stocks], ["000967", "600110"])
+            self.assertEqual([s["market"] for s in stocks], [0, 1])
+            self.assertEqual(infer_market_from_stock_code("688343"), 1)
+            self.assertEqual(infer_market_from_stock_code("301071"), 0)
+
+    def test_get_xuangu_batch_status_counts_imported_stocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xlsx_path = root / "xuangu.xlsx"
+            db_path = root / "stocks.db"
+            make_bad_dimension_xlsx(xlsx_path)
+            import_xlsx_to_sqlite(
+                db_path=db_path,
+                xlsx_path=xlsx_path,
+                source_url="test",
+                condition_text="cond",
+                batch_id="20260503",
+            )
+
+            status = get_xuangu_batch_status(db_path, "20260503")
+            missing = get_xuangu_batch_status(db_path, "20260504")
+
+            self.assertEqual(status, {"exists": 1, "row_count": 2, "stock_count": 2})
+            self.assertEqual(missing, {"exists": 0, "row_count": 0, "stock_count": 0})
 
 
 if __name__ == "__main__":

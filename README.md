@@ -86,6 +86,7 @@ python3 eastmoney_to_sqlite.py \
 默认行为：
 
 - 使用 Firefox。
+- 默认隐藏浏览器窗口运行。
 - 自动读取 Firefox 默认用户配置，复用你已经登录的东方财富状态。
 - 打开 `https://xuangu.eastmoney.com/`。
 - 将 `screening.txt` 的内容输入条件选股框。
@@ -93,7 +94,10 @@ python3 eastmoney_to_sqlite.py \
 - 点击下载弹窗里的橙色 `下载`。
 - 下载文件保存为 `downloads/xuangu_YYYYMMDD.xlsx`，例如 `downloads/xuangu_20260503.xlsx`。
 - 把下载的 `.xlsx` 导入 `stocks.db` 的选股表。
+- 导入完成后，会按本次选股列表自动下载一年以内的日 K 数据并保存到数据库。
+- 如果一年日 K 下载中途失败，直接重新运行脚本即可，已有足够 K 线的股票会自动跳过，只补缺失的。
 - 导入批次号使用当天日期，格式为 `YYYYMMDD`，例如 `20260502`。
+- 如果当天批次已经导入并识别出股票代码，脚本会跳过选股下载和 Excel 导入，直接继续下载一年日 K。
 - 同一天重新选股导入时，可以在选股页面勾选覆盖旧批次后重新导入。
 
 如果需要先手动登录，再继续运行：
@@ -103,6 +107,30 @@ WAIT_LOGIN=1 ./run_xuangu.sh
 ```
 
 脚本会停在登录提示处，登录完成后回到终端按回车继续。
+
+如果想观察自动化过程，可以显示浏览器窗口：
+
+```bash
+BROWSER_HEADED=1 ./run_xuangu.sh
+```
+
+如果只想测试选股下载和 Excel 导入，暂时跳过一年日 K 下载：
+
+```bash
+./run_xuangu.sh --skip-history-1y
+```
+
+如果只想先下载前几只股票的一年日 K：
+
+```bash
+./run_xuangu.sh --history-limit 5
+```
+
+一年日 K 默认每只股票间隔 `1.5` 秒，减少东方财富接口重置连接。如果遇到大量 `socket hang up`，可以放慢：
+
+```bash
+./run_xuangu.sh --history-delay 3
+```
 
 如果已经下载好了 `.xlsx`，不想重新打开浏览器，可以直接导入已有文件：
 
@@ -273,6 +301,8 @@ python3 -m unittest discover -s tests -v
 ```bash
 WAIT_LOGIN=1 ./run_xuangu.sh
 ```
+
+这个模式会显示浏览器窗口，方便手动登录。
 
 如果 `screening.txt` 内容和页面里的条件不一致，脚本会停止，不会继续下载错误结果。优先检查 `screening.txt` 里的中文分号、空格和条件文本是否符合东方财富页面识别方式。
 

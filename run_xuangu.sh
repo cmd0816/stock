@@ -35,25 +35,20 @@ fi
 echo "Using condition file: $SCREENING_FILE"
 echo "Starting xuangu automation..."
 
+ARGS=(
+  "$SCRIPT_DIR/xuangu_to_sqlite.py"
+  --url "https://xuangu.eastmoney.com/"
+  --condition-file "$SCREENING_FILE"
+  --db "$SCRIPT_DIR/stocks.db"
+  --download-dir "$SCRIPT_DIR/downloads"
+  --browser-engine firefox
+  --manual-download
+)
+
 if [[ "${WAIT_LOGIN:-0}" == "1" ]]; then
-  exec "$VENV_PY" "$SCRIPT_DIR/xuangu_to_sqlite.py" \
-    --url "https://xuangu.eastmoney.com/" \
-    --condition-file "$SCREENING_FILE" \
-    --db "$SCRIPT_DIR/stocks.db" \
-    --download-dir "$SCRIPT_DIR/downloads" \
-    --browser-engine firefox \
-    --browser-headed \
-    --manual-download \
-    --wait-login \
-    "$@"
+  ARGS+=(--browser-headed --wait-login)
+elif [[ "${BROWSER_HEADED:-0}" == "1" ]]; then
+  ARGS+=(--browser-headed)
 fi
 
-exec "$VENV_PY" "$SCRIPT_DIR/xuangu_to_sqlite.py" \
-  --url "https://xuangu.eastmoney.com/" \
-  --condition-file "$SCREENING_FILE" \
-  --db "$SCRIPT_DIR/stocks.db" \
-  --download-dir "$SCRIPT_DIR/downloads" \
-  --browser-engine firefox \
-  --browser-headed \
-  --manual-download \
-  "$@"
+exec "$VENV_PY" "${ARGS[@]}" "$@"

@@ -6,14 +6,26 @@ import os
 import re
 import sqlite3
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+
+from eastmoney_to_sqlite import build_history_query_params, save_history_klines
 
 CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+FIREFOX_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) "
+    "Gecko/20100101 Firefox/128.0"
+)
+
+
+def get_user_agent_for_engine(engine: str) -> str:
+    return FIREFOX_UA if (engine or "").lower() == "firefox" else CHROME_UA
 
 
 def detect_firefox_default_profile_dir() -> Optional[Path]:
@@ -307,6 +319,261 @@ def import_xlsx_to_sqlite(
     return batch_id, sheet_count, len(rows)
 
 
+def get_xuangu_batch_status(db_path: Path, batch_id: str) -> Dict[str, int]:
+    if not db_path.exists():
+        return {"exists": 0, "row_count": 0, "stock_count": 0}
+    with sqlite3.connect(db_path) as conn:
+        ensure_tables(conn)
+        batch = conn.execute(
+            "SELECT row_count FROM xuangu_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if not batch:
+            return {"exists": 0, "row_count": 0, "stock_count": 0}
+        stock_count = conn.execute(
+            """
+            SELECT COUNT(DISTINCT stock_code)
+            FROM xuangu_results
+            WHERE batch_id = ? AND stock_code IS NOT NULL AND stock_code <> ''
+            """,
+            (batch_id,),
+        ).fetchone()[0]
+    return {"exists": 1, "row_count": int(batch[0] or 0), "stock_count": int(stock_count or 0)}
+
+
+def infer_market_from_stock_code(code: str) -> int:
+    code = str(code or "").strip()
+    return 1 if code.startswith("6") else 0
+
+
+def stock_quote_url(market: int, code: str) -> str:
+    prefix = "sh" if market == 1 else "sz"
+    return f"https://quote.eastmoney.com/concept/{prefix}{code}.html"
+
+
+def fetch_xuangu_batch_stocks(db_path: Path, batch_id: str) -> List[Dict[str, Any]]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT stock_code, stock_name
+            FROM xuangu_results
+            WHERE batch_id = ? AND stock_code IS NOT NULL AND stock_code <> ''
+            ORDER BY row_no
+            """,
+            (batch_id,),
+        ).fetchall()
+
+    seen = set()
+    stocks = []
+    for row in rows:
+        code = clean_stock_code(row["stock_code"])
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        market = infer_market_from_stock_code(code)
+        stocks.append(
+            {
+                "market": market,
+                "code": code,
+                "name": row["stock_name"] or "",
+                "source_url": stock_quote_url(market, code),
+            }
+        )
+    return stocks
+
+
+def get_existing_kline_counts(db_path: Path) -> Dict[str, int]:
+    if not db_path.exists():
+        return {}
+    with sqlite3.connect(db_path) as conn:
+        ensure_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT code, COUNT(*) AS day_count
+            FROM eastmoney_stock_daily_klines
+            GROUP BY code
+            """
+        ).fetchall()
+    return {str(code): int(day_count or 0) for code, day_count in rows}
+
+
+def fetch_stock_history_1y_in_context(
+    context: Any,
+    market: int,
+    code: str,
+    source_url: str,
+    user_agent: str,
+    page: Optional[Any] = None,
+    retries: int = 3,
+) -> Dict[str, Any]:
+    api_url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = build_history_query_params(market, code)
+    full_url = f"{api_url}?{urlencode(params, safe=',')}"
+    own_page = page is None
+    page = page or get_or_create_page(context)
+    try:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max(1, retries) + 1):
+            texts: List[Tuple[str, str]] = []
+            errors: List[str] = []
+
+            try:
+                api_resp = context.request.get(
+                    full_url,
+                    headers={
+                        "Accept": "application/json,text/plain,*/*",
+                        "Referer": source_url,
+                        "User-Agent": user_agent,
+                    },
+                    timeout=45000,
+                )
+                texts.append(("request", api_resp.text()))
+            except Exception as exc:
+                errors.append(f"request failed: {exc}")
+
+            try:
+                page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(500 + attempt * 250)
+                text = page.evaluate(
+                    """async (url) => {
+                        const resp = await fetch(url, {
+                            method: "GET",
+                            headers: { "accept": "application/json,text/plain,*/*" },
+                            credentials: "include",
+                        });
+                        return await resp.text();
+                    }""",
+                    full_url,
+                )
+                texts.append(("page-fetch", text))
+            except Exception as exc:
+                errors.append(f"page-fetch failed: {exc}")
+
+            try:
+                response = page.goto(full_url, wait_until="commit", timeout=45000)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                text = response.text() if response is not None else page.locator("body").inner_text(timeout=5000)
+                texts.append(("page-goto", text))
+            except Exception as exc:
+                errors.append(f"page-goto failed: {exc}")
+
+            for method, text in texts:
+                try:
+                    payload = json.loads(text or "{}")
+                    data = payload.get("data", {})
+                    if data and data.get("klines"):
+                        if method != "request":
+                            print(f"History {market}.{code} succeeded via {method}")
+                        return payload
+                    rc = payload.get("rc")
+                    rt = payload.get("rt")
+                    message = payload.get("message") or payload.get("msg") or ""
+                    last_error = RuntimeError(
+                        f"empty klines payload via {method}; rc={rc} rt={rt} message={message}"
+                    )
+                except Exception as exc:
+                    snippet = str(text or "")[:180].replace("\n", " ")
+                    last_error = RuntimeError(f"invalid payload via {method}: {exc}; body={snippet}")
+
+            if errors and last_error is None:
+                last_error = RuntimeError(" | ".join(errors))
+
+            if attempt < max(1, retries):
+                wait_s = 2.0 * attempt
+                print(f"Retry history {market}.{code} attempt {attempt + 1}/{retries} after: {last_error}")
+                time.sleep(wait_s)
+
+        raise RuntimeError(str(last_error or "history request failed"))
+    finally:
+        if own_page:
+            page.close()
+
+
+def download_history_1y_for_batch(
+    db_path: Path,
+    batch_id: str,
+    context: Any,
+    user_agent: str,
+    limit: int = 0,
+    delay_seconds: float = 1.5,
+    min_existing_days: int = 200,
+) -> Tuple[int, int]:
+    stocks = fetch_xuangu_batch_stocks(db_path, batch_id)
+    if limit > 0:
+        stocks = stocks[:limit]
+    if not stocks:
+        print(f"No stock codes found in xuangu batch {batch_id}; skip 1-year history download.")
+        return 0, 0
+
+    existing_counts = get_existing_kline_counts(db_path)
+    skipped_count = 0
+    pending = []
+    for stock in stocks:
+        if existing_counts.get(str(stock["code"]), 0) >= min_existing_days:
+            skipped_count += 1
+            continue
+        pending.append(stock)
+    stocks = pending
+    if not stocks:
+        print(
+            f"All selected stocks in batch {batch_id} already have at least "
+            f"{min_existing_days} K-line rows; skip history download."
+        )
+        return 0, 0
+
+    print(
+        f"Downloading 1-year daily K-line data for {len(stocks)} stocks in batch {batch_id} "
+        f"(skipped {skipped_count} already covered stocks)..."
+    )
+    ok_count = 0
+    total_rows = 0
+    failures = []
+    consecutive_failures = 0
+    history_page = get_or_create_page(context)
+    for idx, stock in enumerate(stocks, start=1):
+        market = int(stock["market"])
+        code = str(stock["code"])
+        name = str(stock.get("name") or "")
+        source_url = str(stock["source_url"])
+        try:
+            payload = fetch_stock_history_1y_in_context(
+                context,
+                market,
+                code,
+                source_url,
+                user_agent=user_agent,
+                page=history_page,
+            )
+            row_count = save_history_klines(db_path, source_url, market, code, payload)
+            ok_count += 1
+            total_rows += row_count
+            consecutive_failures = 0
+            print(f"[{idx}/{len(stocks)}] saved {row_count} rows for {market}.{code} {name}")
+        except Exception as exc:
+            consecutive_failures += 1
+            failures.append(f"{code}: {exc}")
+            print(f"[{idx}/{len(stocks)}] failed {market}.{code} {name}: {exc}")
+            if consecutive_failures > 0 and consecutive_failures % 5 == 0 and idx < len(stocks):
+                cool_down = min(180, 30 * (consecutive_failures // 5))
+                print(f"History downloads failed {consecutive_failures} times in a row; cooling down {cool_down}s...")
+                time.sleep(cool_down)
+        if delay_seconds > 0 and idx < len(stocks):
+            time.sleep(delay_seconds)
+
+    if failures:
+        print(f"History download completed with {len(failures)} failures: {' | '.join(failures[:10])}")
+    print(f"History download summary: stocks_ok={ok_count}, rows_saved={total_rows}")
+    return ok_count, total_rows
+
+
 def iter_targets(page: Any) -> List[Any]:
     targets: List[Any] = [page]
     try:
@@ -392,7 +659,7 @@ def get_visible_condition_text(targets: List[Any]) -> str:
                         && s.display !== "none"
                         && s.visibility !== "hidden"
                         && s.opacity !== "0"
-                        && r.width > 500
+                        && r.width > 280
                         && r.height > 24
                         && r.y < 420;
                     };
@@ -440,6 +707,99 @@ def condition_matches_page(targets: List[Any], condition_text: str, strict: bool
     print("Condition mismatch after input.")
     print(f"Expected: {expected}")
     print(f"Actual snippet: {actual[:500]}")
+    return False
+
+
+def fill_top_condition_editor_direct(targets: List[Any], condition_text: str) -> bool:
+    for target in targets:
+        try:
+            result = target.evaluate(
+                """(value) => {
+                    const visible = (el) => {
+                      const r = el.getBoundingClientRect();
+                      const s = window.getComputedStyle(el);
+                      return !!s
+                        && s.display !== "none"
+                        && s.visibility !== "hidden"
+                        && s.opacity !== "0"
+                        && r.width > 280
+                        && r.height > 24
+                        && r.y < 240;
+                    };
+                    const textOf = (el) => [
+                      el.id || "",
+                      el.getAttribute("name") || "",
+                      el.getAttribute("placeholder") || "",
+                      el.getAttribute("aria-label") || "",
+                      el.className ? String(el.className) : "",
+                    ].join(" ");
+                    const candidates = Array.from(document.querySelectorAll(
+                      '#searchInput, [name="searchInput"], .searchInput, textarea, input, [contenteditable="true"], [role="textbox"]'
+                    )).filter((el) => {
+                      if (!visible(el)) return false;
+                      const t = textOf(el);
+                      const editable = el.tagName === "INPUT"
+                        || el.tagName === "TEXTAREA"
+                        || el.isContentEditable
+                        || (el.getAttribute("role") || "") === "textbox";
+                      if (!editable) return false;
+                      const r = el.getBoundingClientRect();
+                      const looksLikeCondition = /searchInput|选股|条件|请输入/.test(t);
+                      return looksLikeCondition || (r.width > 480 && r.height > 32);
+                    }).sort((a, b) => {
+                      const ra = a.getBoundingClientRect();
+                      const rb = b.getBoundingClientRect();
+                      const score = (el, r) => {
+                        const t = textOf(el);
+                        return (t.includes("searchInput") ? 10000 : 0)
+                          + (/选股|条件|请输入/.test(t) ? 5000 : 0)
+                          + r.width * r.height
+                          - r.top;
+                      };
+                      return score(b, rb) - score(a, ra);
+                    });
+                    if (!candidates.length) return { ok: false, reason: "top-editor-not-found" };
+
+                    const el = candidates[0];
+                    el.focus();
+                    if ("value" in el) {
+                      const proto = Object.getPrototypeOf(el);
+                      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+                      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+                    } else {
+                      el.textContent = value;
+                      el.innerText = value;
+                    }
+                    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+                    el.dispatchEvent(new Event("change", { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
+                    const now = ("value" in el ? (el.value || "") : (el.innerText || el.textContent || "")).trim();
+                    const r = el.getBoundingClientRect();
+                    return {
+                      ok: now === value || now.includes(value.slice(0, 16)),
+                      reason: "direct-top-editor",
+                      tag: el.tagName,
+                      id: el.id || "",
+                      cls: String(el.className || "").slice(0, 80),
+                      w: Math.round(r.width),
+                      h: Math.round(r.height),
+                      y: Math.round(r.top),
+                      now: now.slice(0, 80),
+                    };
+                }""",
+                condition_text,
+            )
+            if result and result.get("ok"):
+                print(
+                    "Condition filled via: "
+                    f"{result.get('reason')} tag={result.get('tag')} "
+                    f"id={result.get('id')} {result.get('w')}x{result.get('h')} y={result.get('y')}"
+                )
+                return True
+            if result:
+                print(f"Direct condition fill skipped: {result.get('reason')}")
+        except Exception as exc:
+            print(f"Direct condition fill error: {exc}")
     return False
 
 
@@ -601,7 +961,7 @@ def condition_visible_in_top_editor(targets: List[Any], probe: str) -> bool:
                         && style.display !== "none"
                         && style.visibility !== "hidden"
                         && style.opacity !== "0"
-                        && rect.width > 700
+                        && rect.width > 280
                         && rect.height > 30
                         && rect.y < 360;
                     };
@@ -659,7 +1019,7 @@ def fill_condition_near_filters(
                   const r = el.getBoundingClientRect();
                   const editable = (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable || (el.getAttribute("role") || "") === "textbox");
                   if (!editable) return false;
-                  return r.width > 700 && r.height > 28 && r.top < ay && r.top > ay - 260;
+                  return r.width > 280 && r.height > 28 && r.top < ay && r.top > ay - 260;
                 }).sort((a, b) => {
                   const ra = a.getBoundingClientRect();
                   const rb = b.getBoundingClientRect();
@@ -989,6 +1349,7 @@ def click_download_confirm_button(page: Any) -> bool:
 def _fill_and_verify(target: Any, selector: str, condition_text: str) -> bool:
     loc = target.locator(selector).first
     try:
+        actual = ""
         if loc.count() <= 0 or not loc.is_visible():
             return False
 
@@ -1016,7 +1377,7 @@ def _fill_and_verify(target: Any, selector: str, condition_text: str) -> bool:
                 actual = loc.input_value(timeout=1500)
             except Exception:
                 actual = ""
-        return actual.strip() == condition_text.strip()
+            return actual.strip() == condition_text.strip()
 
         loc.click(timeout=2000)
         try:
@@ -1048,6 +1409,12 @@ def fill_condition(page: Any, condition_text: str, strict_condition_match: bool 
     probe = condition_text[:16].strip()
     if not probe:
         return False
+
+    if fill_top_condition_editor_direct(targets, condition_text):
+        if condition_matches_page(targets, condition_text, strict=strict_condition_match):
+            print("Condition visible-check: true (direct-top-editor)")
+            return True
+        print("Condition visible-check failed after direct top-editor fill, continue...")
 
     for target in targets:
         if fill_condition_near_filters(
@@ -1155,7 +1522,7 @@ def fill_condition(page: Any, condition_text: str, strict_condition_match: bool 
                       && style.display !== "none"
                       && style.visibility !== "hidden"
                       && style.opacity !== "0"
-                      && rect.width > 700
+                      && rect.width > 280
                       && rect.height > 30
                       && rect.y < 360;
                     if (!visible) return { ok: false, reason: "hidden" };
@@ -1300,6 +1667,7 @@ def launch_context(
         "firefox": p.firefox,
         "webkit": p.webkit,
     }.get(engine, p.chromium)
+    effective_user_agent = get_user_agent_for_engine(engine)
 
     if engine == "firefox" and not user_data_dir:
         detected = detect_firefox_default_profile_dir()
@@ -1318,7 +1686,7 @@ def launch_context(
             "user_data_dir": str(Path(user_data_dir).expanduser()),
             "headless": not headed,
             "accept_downloads": True,
-            "user_agent": CHROME_UA,
+            "user_agent": effective_user_agent,
             "args": args,
         }
         if engine == "chromium" and browser_channel:
@@ -1331,7 +1699,7 @@ def launch_context(
     if engine == "chromium" and browser_channel:
         kwargs2["channel"] = browser_channel
     browser = browser_type.launch(**kwargs2)
-    context = browser.new_context(accept_downloads=True, user_agent=CHROME_UA)
+    context = browser.new_context(accept_downloads=True, user_agent=effective_user_agent)
     context._pw_ref = p  # type: ignore[attr-defined]
     return browser, context
 
@@ -1345,6 +1713,16 @@ def close_context(browser: Optional[Any], context: Any) -> None:
         pw = getattr(context, "_pw_ref", None)
         if pw:
             pw.stop()
+
+
+def get_or_create_page(context: Any) -> Any:
+    try:
+        pages = list(context.pages)
+        if pages:
+            return pages[0]
+    except Exception:
+        pass
+    return context.new_page()
 
 
 def auto_download_xlsx(
@@ -1428,6 +1806,29 @@ def main() -> None:
         action="store_true",
         help="Replace an existing xuangu batch with the same batch id when importing",
     )
+    parser.add_argument(
+        "--skip-history-1y",
+        action="store_true",
+        help="Do not download 1-year daily K-line history after xuangu import.",
+    )
+    parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=0,
+        help="Only download 1-year history for the first N selected stocks. Default: 0 means all.",
+    )
+    parser.add_argument(
+        "--history-delay",
+        type=float,
+        default=1.5,
+        help="Delay seconds between per-stock history requests. Default: 1.5.",
+    )
+    parser.add_argument(
+        "--history-min-existing-days",
+        type=int,
+        default=200,
+        help="Skip a stock history download if it already has at least this many daily K-line rows. Default: 200.",
+    )
     parser.add_argument("--timeout", type=int, default=120, help="Timeout in seconds for page/download operations")
     parser.add_argument("--manual-download", action="store_true", help="Allow manual click for download if auto click fails")
     parser.add_argument("--wait-login", action="store_true", help="Pause for manual login before selecting/downloading")
@@ -1460,16 +1861,26 @@ def main() -> None:
     if not condition_text:
         raise ValueError("Condition text is empty. Please set --condition or put text in screening.txt.")
 
+    batch_id_arg = args.batch_id.strip() or make_batch_id()
+    effective_user_agent = get_user_agent_for_engine(args.browser_engine)
+
     if args.import_xlsx:
         xlsx_path = Path(args.import_xlsx).expanduser().resolve()
         if not xlsx_path.exists():
             raise FileNotFoundError(f"XLSX file not found: {xlsx_path}")
+        existing_status = get_xuangu_batch_status(db_path, batch_id_arg)
+        if existing_status["stock_count"] > 0 and not args.replace_existing:
+            print(
+                f"Xuangu batch {batch_id_arg} already imported "
+                f"({existing_status['stock_count']} stocks); skip XLSX import."
+            )
+            return
         batch_id, sheet_count, row_count = import_xlsx_to_sqlite(
             db_path=db_path,
             xlsx_path=xlsx_path,
             source_url=args.url,
             condition_text=condition_text,
-            batch_id=(args.batch_id.strip() or None),
+            batch_id=batch_id_arg,
             replace_existing=args.replace_existing,
         )
         print(f"Imported xlsx: {xlsx_path}")
@@ -1484,7 +1895,37 @@ def main() -> None:
         profile_directory=args.browser_profile_directory,
     )
     try:
-        page = context.new_page()
+        existing_status = get_xuangu_batch_status(db_path, batch_id_arg)
+        if existing_status["stock_count"] > 0 and not args.replace_existing:
+            print(
+                f"Xuangu batch {batch_id_arg} already imported "
+                f"({existing_status['stock_count']} stocks); skip xuangu download/import."
+            )
+            if args.wait_login and args.browser_headed:
+                page = get_or_create_page(context)
+                page.goto(args.url, wait_until="domcontentloaded", timeout=timeout_ms)
+                print("请在浏览器中完成登录，然后回到终端按 Enter 继续...")
+                input()
+            if args.skip_history_1y:
+                print("Skipped 1-year daily K-line history download.")
+            else:
+                download_history_1y_for_batch(
+                    db_path=db_path,
+                    batch_id=batch_id_arg,
+                    context=context,
+                    user_agent=effective_user_agent,
+                    limit=max(0, args.history_limit),
+                    delay_seconds=max(0.0, args.history_delay),
+                    min_existing_days=max(0, args.history_min_existing_days),
+                )
+            return
+        if existing_status["exists"] and not args.replace_existing:
+            raise RuntimeError(
+                f"Xuangu batch {batch_id_arg} exists but has no recognized stock codes; "
+                "rerun with --replace-existing to re-import cleanly."
+            )
+
+        page = get_or_create_page(context)
         page.goto(args.url, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_timeout(1500)
 
@@ -1499,7 +1940,6 @@ def main() -> None:
             manual_download=args.manual_download,
             strict_condition_match=args.strict_condition_match,
         )
-        batch_id_arg = args.batch_id.strip() or make_batch_id()
         save_name = f"xuangu_{batch_id_arg}.xlsx"
         xlsx_path = download_dir / save_name
         tmp_xlsx_path = download_dir / f".{save_name}.download"
@@ -1518,6 +1958,18 @@ def main() -> None:
         )
         print(f"Download saved: {xlsx_path}")
         print(f"Imported batch_id={batch_id}, sheets={sheet_count}, rows={row_count} into {db_path}")
+        if args.skip_history_1y:
+            print("Skipped 1-year daily K-line history download.")
+        else:
+            download_history_1y_for_batch(
+                db_path=db_path,
+                batch_id=batch_id,
+                context=context,
+                user_agent=effective_user_agent,
+                limit=max(0, args.history_limit),
+                delay_seconds=max(0.0, args.history_delay),
+                min_existing_days=max(0, args.history_min_existing_days),
+            )
     finally:
         close_context(browser, context)
 
