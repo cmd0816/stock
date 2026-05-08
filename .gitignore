@@ -20,4 +20,4 @@ downloads/
 
 screening.txt
 stocks.db
-stocks.db
+*.db
