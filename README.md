@@ -151,9 +151,11 @@ BROWSER_HEADED=1 ./run_xuangu.sh
 
 进入 `http://127.0.0.1:8000/screening`，在“导入条件选股 XLSX”里点击“选择 XLSX 文件”后导入。
 
-## 周末选股和复盘系统
+## 周末选股、预测和复盘系统
 
-第一版不使用机器学习，只做规则打分和排序。流程是：
+默认先使用规则打分和排序。ML 预测是可选的第二层，用来对已经选出的 Top 股票做本地概率重排。
+
+规则流程是：
 
 - 周末先运行东方财富条件选股，得到候选池。
 - 从最新候选池读取股票。
@@ -170,6 +172,7 @@ weekly_stock/
   models.py      # Python 数据模型
   db.py          # SQLite 表结构和读写
   scoring.py     # 可解释规则打分
+  ml.py          # 本地 ML 特征、训练和预测
   jobs.py        # stock_screen_job 和 weekly_review_job
   cli.py         # 命令行入口
 config/
@@ -226,6 +229,63 @@ python3 weekly_stock_main.py review --run-id 1
 - 是否触发止损
 - 是否符合预期
 
+### 本地 ML 预测
+
+第一版 ML 不联网、不调用外部 API，也不替代规则分数。它会：
+
+- 使用已下载的一年日 K 数据生成历史训练样本。
+- 每个样本用过去 60 个交易日计算特征。
+- 用未来 5 个交易日表现生成标签。
+- 训练一个 `LogisticRegression` baseline 模型。
+- 训练一个 `LightGBM` 主模型。
+- 对当前 Top 股票输出 `probability_up` 和 `predicted_score`。
+- 保存到数据库，`/top` 左侧会显示类似 `ML 38%`。
+
+运行最新 Top 列表的 ML 预测：
+
+```bash
+python3 weekly_stock_main.py predict
+```
+
+指定某次 Top 运行：
+
+```bash
+python3 weekly_stock_main.py predict --run-id 6
+```
+
+也可以在网页里操作：
+
+```text
+http://127.0.0.1:8000/screening
+```
+
+点击“生成 ML 预测”，再打开：
+
+```text
+http://127.0.0.1:8000/top
+```
+
+ML 配置在 `config/weekly_strategy.yaml` 的 `ml` 部分：
+
+- `model_name`：主模型，默认 `lightgbm`。
+- `baseline_model_name`：baseline，默认 `logistic_regression`。
+- `lookback_trading_days`：用多少个历史交易日计算特征。
+- `horizon_trading_days`：预测未来几个交易日。
+- `positive_high_gain_pct`：未来最高涨幅达到多少算正样本。
+- `positive_close_gain_pct`：未来收盘涨幅最低要求。
+- `negative_drawdown_pct`：未来最大回撤超过多少不算好样本。
+- `rule_score_weight`：最终预测分数中保留多少规则分权重。
+- `min_train_samples`：最少训练样本数，样本不足会停止。
+
+如果只是想在没有额外 ML 依赖时验证流程，可以临时把模型改为：
+
+```yaml
+ml:
+  model_name: centroid_v1
+```
+
+注意：ML 概率不是确定性结论，只用于辅助排序。先观察几周，让它和规则 Top 的复盘结果对比，再决定是否提高权重。
+
 ## 查看数据网页
 
 启动看盘服务：
@@ -269,6 +329,8 @@ python3 weekly_stock_main.py review --run-id 1
 - `weekly_selected_stocks`：最终入选前 3 到 4 只股票。
 - `weekly_review_runs`：每次复盘运行。
 - `weekly_review_results`：每只入选股票的复盘结果。
+- `weekly_ml_model_runs`：每次 ML 训练运行。
+- `weekly_ml_predictions`：每只 Top 股票的 ML 预测概率和解释。
 
 ## 选股页面
 
@@ -282,6 +344,7 @@ python3 weekly_stock_main.py review --run-id 1
 - 导入条件选股 XLSX：把已下载的东方财富选股 Excel 导入数据库，可覆盖同日批次。
 - 最近条件选股批次：批次、导入时间、行数、Excel 文件、查看股票、删除。
 - 周末入选股票：在页面输入选股日期和 Top N，点击生成下周 Top 股票；同一选股日期和批次会覆盖旧结果，只保留最后一次；也可以展开查看本批次候选股票列表。
+- ML 预测：点击“生成 ML 预测”，会基于已下载日 K 对当前 Top 列表生成概率，结果显示在 Top 日线图左侧。
 - 最近复盘结果：最高涨幅、收盘涨幅、最大回撤、止损和是否符合预期。
 
 ## 测试

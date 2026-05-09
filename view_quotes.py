@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from xuangu_to_sqlite import import_xlsx_to_sqlite
 from weekly_stock.config import load_config
 from weekly_stock import db as weekly_db
-from weekly_stock.jobs import stock_screen_job
+from weekly_stock.jobs import ml_predict_job, stock_screen_job
 
 
 UploadedFiles = Dict[str, Dict[str, Any]]
@@ -273,6 +273,81 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
     return out
 
 
+def fetch_top_selected_stocks(db_path: Path, run_id: int | None = None) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        empty_run: Dict[str, Any] = {}
+        if not table_exists(conn, "weekly_screen_runs") or not table_exists(conn, "weekly_selected_stocks"):
+            return empty_run, []
+
+        run_row = None
+        if run_id is not None:
+            run_row = conn.execute(
+                """
+                SELECT run_id, screen_date, xuangu_batch_id, selected_count, created_at_utc
+                FROM weekly_screen_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+        if run_row is None:
+            run_row = conn.execute(
+                """
+                SELECT
+                    r.run_id,
+                    r.screen_date,
+                    r.xuangu_batch_id,
+                    r.selected_count,
+                    r.created_at_utc
+                FROM weekly_screen_runs r
+                WHERE EXISTS (
+                    SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id
+                )
+                ORDER BY r.screen_date DESC, r.run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+        if run_row is None:
+            return empty_run, []
+
+        if table_exists(conn, "weekly_ml_predictions"):
+            rows = conn.execute(
+                """
+                SELECT
+                    s.id, s.run_id, s.screen_date, s.code, s.name, s.rank_no,
+                    s.total_score, s.selected_reason, s.status, s.created_at_utc,
+                    p.probability_up AS ml_probability_up,
+                    p.predicted_score AS ml_predicted_score,
+                    p.reason AS ml_reason
+                FROM weekly_selected_stocks s
+                LEFT JOIN weekly_ml_predictions p
+                    ON p.source_run_id = s.run_id AND p.code = s.code
+                WHERE s.run_id = ?
+                ORDER BY
+                    CASE WHEN p.predicted_score IS NULL THEN 1 ELSE 0 END,
+                    p.predicted_score DESC,
+                    s.rank_no,
+                    s.id
+                """,
+                (int(run_row["run_id"]),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT
+                    id, run_id, screen_date, code, name, rank_no,
+                    total_score, selected_reason, status, created_at_utc
+                FROM weekly_selected_stocks
+                WHERE run_id = ?
+                ORDER BY rank_no, id
+                """,
+                (int(run_row["run_id"]),),
+            ).fetchall()
+    return dict(run_row), [dict(r) for r in rows]
+
+
 def build_kline_svg(rows_desc: List[Dict[str, Any]]) -> str:
     data = list(reversed(rows_desc[-120:]))
     points = [r for r in data if all(r.get(k) is not None for k in ("open", "close", "high", "low"))]
@@ -343,129 +418,6 @@ def build_kline_svg(rows_desc: List[Dict[str, Any]]) -> str:
         + "</svg>"
     )
 
-
-def build_html(rows: List[Dict[str, Any]]) -> str:
-    def fmt(v: Any) -> str:
-        if v is None:
-            return "-"
-        if isinstance(v, float):
-            return f"{v:,.2f}"
-        return str(v)
-
-    row_html = []
-    for r in rows:
-        cp = r.get("change_percent")
-        color = "#b91c1c" if (cp is not None and cp > 0) else "#1d4ed8" if (cp is not None and cp < 0) else "#111827"
-        row_html.append(
-            "<tr>"
-            f"<td>{r['id']}</td>"
-            f"<td>{html.escape(str(r['code']))}</td>"
-            f"<td>{html.escape(str(r['name'] or ''))}</td>"
-            f"<td>{html.escape(str(r['secid']))}</td>"
-            f"<td>{fmt(r['price'])}</td>"
-            f"<td>{fmt(r['open'])}</td>"
-            f"<td>{fmt(r['high'])}</td>"
-            f"<td>{fmt(r['low'])}</td>"
-            f"<td>{fmt(r['prev_close'])}</td>"
-            f"<td style='color:{color}'>{fmt(r['change_percent'])}%</td>"
-            f"<td>{fmt(r['volume'])}</td>"
-            f"<td>{fmt(r['turnover'])}</td>"
-            f"<td>{fmt(r['fetched_at_utc'])}</td>"
-            "</tr>"
-        )
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="20" />
-  <title>东方财富行情快照</title>
-  <style>
-    :root {{
-      --bg: #f3f4f6;
-      --fg: #111827;
-      --card: #ffffff;
-      --line: #e5e7eb;
-    }}
-    body {{
-      margin: 0;
-      background: radial-gradient(circle at 20% 10%, #dbeafe, transparent 30%), var(--bg);
-      color: var(--fg);
-      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-    }}
-    .wrap {{
-      max-width: 1200px;
-      margin: 24px auto;
-      padding: 0 16px;
-    }}
-    .head {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 12px;
-    }}
-    .card {{
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      overflow: auto;
-      box-shadow: 0 8px 20px rgba(0,0,0,0.05);
-    }}
-    table {{
-      border-collapse: collapse;
-      width: 100%;
-      min-width: 980px;
-      font-size: 14px;
-    }}
-    th, td {{
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--line);
-      white-space: nowrap;
-      text-align: left;
-    }}
-    th {{
-      position: sticky;
-      top: 0;
-      background: #f9fafb;
-      z-index: 1;
-    }}
-    .meta {{
-      font-size: 13px;
-      color: #4b5563;
-      margin-bottom: 10px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="head">
-      <h2>东方财富行情快照</h2>
-      <div>
-        <a href="/daily">日 K 线</a>
-        <a href="/screening">选股页面</a>
-        <a href="/api/quotes">JSON 接口</a>
-      </div>
-    </div>
-    <div class="meta">自动刷新：20 秒 | 生成时间：{html.escape(now)} | 行数：{len(rows)}</div>
-    <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th><th>代码</th><th>名称</th><th>证券ID</th><th>现价</th><th>开盘</th>
-            <th>最高</th><th>最低</th><th>昨收</th><th>涨跌幅</th><th>成交量</th>
-            <th>成交额</th><th>抓取时间 UTC</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(row_html) if row_html else '<tr><td colspan="13">暂无数据。</td></tr>'}
-        </tbody>
-      </table>
-    </div>
-  </div>
-</body>
-</html>"""
 
 
 def render_simple_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str]], empty: str) -> str:
@@ -639,6 +591,17 @@ def render_weekly_screen_form(selected_batch_id: str) -> str:
           <div class="form-actions">
             <span class="form-hint">根据当前批次候选股和已下载 K 线打分排序。</span>
             <button type="submit">生成下周 Top 股票</button>
+          </div>
+        </form>
+        <div class="form-actions top-link-actions">
+          <span class="form-hint">集中查看最后一次 Top 股票的日线形态。</span>
+          <a class="button-link" href="/top">打开 Top 日线图</a>
+        </div>
+        <form method="post" action="/actions/run_ml_predict">
+          <div class="form-actions top-link-actions">
+            <span class="form-hint">用已下载 K 线训练本地模型，并给当前 Top 股票生成 ML 概率。</span>
+            <input type="hidden" name="run_id" value="" />
+            <button type="submit">生成 ML 预测</button>
           </div>
         </form>
         <form method="post" action="/actions/clear_weekly_top" onsubmit="return confirm('确认清空 Top 股票列表和关联复盘结果吗？');">
@@ -974,6 +937,22 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     .form-actions button:hover {{
       background: #ea580c;
     }}
+    .top-link-actions {{
+      margin-top: 10px;
+    }}
+    .button-link {{
+      display: inline-block;
+      border: 1px solid #bfdbfe;
+      background: #eff6ff;
+      color: #1d4ed8;
+      border-radius: 8px;
+      padding: 8px 14px;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    .button-link:hover {{
+      background: #dbeafe;
+    }}
     .clear-actions {{
       margin-top: 10px;
       padding-top: 10px;
@@ -1050,8 +1029,8 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     <div class="head">
       <h2>选股页面</h2>
       <div>
-        <a href="/">行情快照</a>
         <a href="/daily">日 K 线</a>
+        <a href="/top">Top 日线图</a>
         <a href="/api/screening">JSON 接口</a>
       </div>
     </div>
@@ -1066,7 +1045,17 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
 </html>"""
 
 
-def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dict[str, Any]]) -> str:
+def build_daily_html(
+    rows: List[Dict[str, Any]],
+    code: str,
+    stock_list: List[Dict[str, Any]],
+    *,
+    page_heading: str = "东方财富日 K 线",
+    sidebar_title: str = "股票列表",
+    list_path: str = "/daily",
+    list_extra_query: str = "",
+    meta_prefix: str = "",
+) -> str:
     chart_rows = list(reversed(rows))
     chart_data_json = json.dumps(chart_rows, ensure_ascii=False).replace("</", "<\\/")
     stock_links = []
@@ -1074,12 +1063,15 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         s_code = str(s.get("code", ""))
         active = "active" if s_code == code else ""
         s_name = html.escape(str(s.get("name", "")))
+        rank_no = s.get("rank_no")
+        code_label = f"#{rank_no} {s_code}" if rank_no else s_code
         cp = s.get("last_change_percent")
-        cp_txt = f"{cp:.2f}%" if isinstance(cp, float) else "-"
-        cp_cls = "up" if isinstance(cp, float) and cp > 0 else "down" if isinstance(cp, float) and cp < 0 else ""
+        cp_txt = str(s.get("side_text") or (f"{cp:.2f}%" if isinstance(cp, (int, float)) else "-"))
+        cp_cls = str(s.get("side_class") or ("up" if isinstance(cp, (int, float)) and cp > 0 else "down" if isinstance(cp, (int, float)) and cp < 0 else ""))
+        href = f"{list_path}?code={quote(s_code)}{list_extra_query}"
         stock_links.append(
-            f"<a class='stk {active}' href='/daily?code={html.escape(s_code)}'>"
-            f"<span class='c'>{html.escape(s_code)}</span>"
+            f"<a class='stk {active}' href='{html.escape(href)}'>"
+            f"<span class='c'>{html.escape(code_label)}</span>"
             f"<span class='n'>{s_name}</span>"
             f"<span class='p {cp_cls}'>{cp_txt}</span>"
             "</a>"
@@ -1100,7 +1092,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta http-equiv="refresh" content="30" />
-  <title>东方财富日 K 线{html.escape(title_suffix)}</title>
+  <title>{html.escape(page_heading)}{html.escape(title_suffix)}</title>
   <style>
     :root {{
       --bg: #f3f4f6;
@@ -1321,23 +1313,23 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
   <div class="wrap">
     <div class="layout">
       <aside class="side">
-        <h3>股票列表</h3>
+        <h3>{html.escape(sidebar_title)}</h3>
         <div class="stocks">
           {''.join(stock_links) if stock_links else "<div style='padding:12px;color:#6b7280'>No stocks found.</div>"}
         </div>
       </aside>
       <main class="main">
         <div class="head">
-          <h2>东方财富日 K 线{html.escape(title_suffix)}</h2>
+          <h2>{html.escape(page_heading)}{html.escape(title_suffix)}</h2>
           <div>
-            <a href="/">行情快照</a>
             <a href="/screening">选股页面</a>
+            <a href="/top">Top 日线图</a>
             <a href="/api/daily{('?code=' + html.escape(code)) if code else ''}">JSON 接口</a>
             <a href="/api/stocks">股票列表接口</a>
           </div>
         </div>
         <div class="meta">
-          自动刷新：30 秒 | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}（{selected_code}）
+          {html.escape(meta_prefix) if meta_prefix else "自动刷新：30 秒"} | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}（{selected_code}）
         </div>
         <div class="card">
           <div class="hover-row">
@@ -1583,7 +1575,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         const tw = ctx.measureText(endTxt).width;
         ctx.fillText(endTxt, Math.max(pad.left, width - pad.right - tw), chartH - 8);
 
-        // Chip diagram (estimated volume-by-price distribution from OHLC range and volume)
+        // Chip diagram (estimated cost distribution from OHLC range and turnover).
         // Anchor chip window to crosshair day if present; otherwise use current visible end.
         const bins = 52;
         const chip = new Array(bins).fill(0);
@@ -1591,11 +1583,11 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         const recentStart = Math.max(0, chipEndAbs - 249);
         const recent = points.slice(recentStart, chipEndAbs + 1);
         const step = (maxV - minV) / bins;
-        for (const p of recent) {{
-          if (!Number.isFinite(p.volume) || p.volume <= 0) continue;
+        const maxDailyVolume = Math.max(...recent.map((p) => Number.isFinite(p.volume) ? p.volume : 0), 1);
+        const addChipAtPriceRange = (p, amount) => {{
           const lo = Math.max(minV, p.low);
           const hi = Math.min(maxV, p.high);
-          if (hi <= lo) continue;
+          if (!(hi > lo) || !(amount > 0)) return;
           const start = Math.max(0, Math.floor((lo - minV) / step));
           const end = Math.min(bins - 1, Math.floor((hi - minV) / step));
           const span = hi - lo;
@@ -1603,10 +1595,24 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
             const bLo = minV + b * step;
             const bHi = bLo + step;
             const overlap = Math.max(0, Math.min(hi, bHi) - Math.max(lo, bLo));
-            if (overlap > 0) chip[b] += p.volume * (overlap / span);
+            if (overlap > 0) chip[b] += amount * (overlap / span);
           }}
+        }};
+        for (const p of recent) {{
+          let turnover = Number.isFinite(p.turnover_rate) && p.turnover_rate > 0
+            ? p.turnover_rate / 100
+            : 0;
+          if (!(turnover > 0) && Number.isFinite(p.volume) && p.volume > 0) {{
+            turnover = 0.02 + 0.10 * (p.volume / maxDailyVolume);
+          }}
+          turnover = clamp(turnover, 0.001, 0.95);
+          const keep = 1 - turnover;
+          for (let b = 0; b < bins; b++) {{
+            chip[b] *= keep;
+          }}
+          addChipAtPriceRange(p, turnover);
         }}
-        const maxChip = Math.max(...chip, 1);
+        const maxChip = Math.max(...chip, 0.000001);
         const chipPadL = 6;
         const chipPadR = 48;
         const chipPlotW = chipW - chipPadL - chipPadR;
@@ -1839,6 +1845,26 @@ def make_handler(db_path: Path, limit: int):
                     self.end_headers()
                     return
 
+            if parsed.path == "/actions/run_ml_predict":
+                try:
+                    base_dir = db_path.parent
+                    config_path = base_dir / "config/weekly_strategy.yaml"
+                    config = load_config(config_path)
+                    config["database"]["path"] = str(db_path)
+                    run_id_text = form_value(form, "run_id")
+                    run_id = int(run_id_text) if run_id_text.isdigit() else None
+                    model_run_id = ml_predict_job(config_path=config_path, config=config, run_id=run_id)
+                    msg = quote(f"已生成 ML 预测：model_run_id={model_run_id}")
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?msg={msg}")
+                    self.end_headers()
+                    return
+                except Exception as exc:
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?err={quote(str(exc))}")
+                    self.end_headers()
+                    return
+
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"Not found")
@@ -1891,9 +1917,30 @@ def make_handler(db_path: Path, limit: int):
                 self.wfile.write(payload)
                 return
 
+            if parsed.path == "/api/top":
+                run_id_text = (query.get("run_id", [""])[0] or "").strip()
+                run_id = int(run_id_text) if run_id_text.isdigit() else None
+                run, selected_rows = fetch_top_selected_stocks(db_path, run_id=run_id)
+                payload = json.dumps(
+                    {"run": run, "selected": selected_rows},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
             if parsed.path == "/":
-                rows = fetch_rows(db_path, limit)
-                body = build_html(rows).encode("utf-8")
+                self.send_response(303)
+                self.send_header("Location", "/screening")
+                self.end_headers()
+                return
+
+            if parsed.path in {"/checks", "/screening"}:
+                checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
+                body = build_checks_html(checks, message=message, error=error).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -1901,9 +1948,51 @@ def make_handler(db_path: Path, limit: int):
                 self.wfile.write(body)
                 return
 
-            if parsed.path in {"/checks", "/screening"}:
-                checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
-                body = build_checks_html(checks, message=message, error=error).encode("utf-8")
+            if parsed.path == "/top":
+                run_id_text = (query.get("run_id", [""])[0] or "").strip()
+                run_id = int(run_id_text) if run_id_text.isdigit() else None
+                run, selected_rows = fetch_top_selected_stocks(db_path, run_id=run_id)
+                top_codes = [str(row.get("code") or "") for row in selected_rows if row.get("code")]
+                selected_code = code if code in top_codes else (top_codes[0] if top_codes else "")
+                top_stock_list = []
+                for row in selected_rows:
+                    stock_code = str(row.get("code") or "")
+                    latest_rows = fetch_daily_rows(db_path, 1, code=stock_code) if stock_code else []
+                    latest = latest_rows[0] if latest_rows else {}
+                    ml_probability = row.get("ml_probability_up")
+                    side_text = ""
+                    side_class = ""
+                    if isinstance(ml_probability, (int, float)):
+                        side_text = f"ML {ml_probability * 100:.0f}%"
+                        side_class = "up" if ml_probability >= 0.5 else "down"
+                    top_stock_list.append(
+                        {
+                            "code": stock_code,
+                            "name": row.get("name") or "",
+                            "rank_no": row.get("rank_no"),
+                            "last_change_percent": latest.get("change_percent"),
+                            "side_text": side_text,
+                            "side_class": side_class,
+                        }
+                    )
+                rows = fetch_daily_rows(db_path, limit, code=selected_code) if selected_code else []
+                effective_run_id = str(run.get("run_id") or "")
+                run_query = f"&run_id={quote(effective_run_id)}" if effective_run_id else ""
+                meta_parts = ["Top 股票列表", "自动刷新：30 秒"]
+                if run:
+                    meta_parts.append(f"Run {run.get('run_id')}")
+                    meta_parts.append(f"选股日期：{run.get('screen_date') or '-'}")
+                    meta_parts.append(f"批次：{run.get('xuangu_batch_id') or '-'}")
+                body = build_daily_html(
+                    rows,
+                    code=selected_code,
+                    stock_list=top_stock_list,
+                    page_heading="Top 股票日 K 线",
+                    sidebar_title="Top 股票列表",
+                    list_path="/top",
+                    list_extra_query=run_query,
+                    meta_prefix=" | ".join(meta_parts),
+                ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

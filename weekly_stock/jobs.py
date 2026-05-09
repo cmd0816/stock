@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from . import db
 from .models import Kline, ReviewResult
+from .ml import build_training_samples, features_at, train_model
 from .scoring import rank_candidates
 
 
@@ -108,6 +109,82 @@ def weekly_review_job(config_path: Path, config: Dict[str, Any], review_date: Op
         ]
         db.save_review_results(conn, review_id, selected, results)
         return review_id
+
+
+def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[int] = None) -> int:
+    root = project_root(config_path)
+    db_path = root / config["database"]["path"]
+    ml_cfg = config.get("ml", {})
+    with db.connect(db_path) as conn:
+        db.ensure_weekly_tables(conn)
+        source_run_id = run_id if run_id is not None else db.latest_selected_run(conn)
+        if source_run_id is None:
+            raise RuntimeError("No weekly selected stocks found. Run stock_screen_job first.")
+
+        selected_rows = db.selected_stocks_for_run(conn, source_run_id)
+        if not selected_rows:
+            raise RuntimeError(f"Run {source_run_id} has no selected stocks.")
+
+        train_codes = db.all_downloaded_codes(conn)
+        if ml_cfg.get("train_on_selected_universe", False):
+            train_codes = db.selected_codes_for_run(conn, source_run_id)
+        klines_by_code = {
+            code: db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
+            for code in train_codes
+        }
+        samples = build_training_samples(klines_by_code, ml_cfg)
+        min_samples = int(ml_cfg.get("min_train_samples", 30))
+        if len(samples) < min_samples:
+            raise RuntimeError(
+                f"Not enough ML training samples: {len(samples)} < {min_samples}. "
+                "Download more K-line history or lower ml.min_train_samples."
+            )
+        model = train_model(samples, ml_cfg)
+        positive_count = sum(1 for sample in samples if sample.label == 1)
+        model_run_id = db.create_ml_model_run(
+            conn=conn,
+            source_run_id=source_run_id,
+            model_name=str(ml_cfg.get("model_name", "centroid_v1")),
+            config=ml_cfg,
+            train_sample_count=len(samples),
+            positive_sample_count=positive_count,
+            model_json=model.to_json(),
+        )
+
+        predictions = []
+        for row in selected_rows:
+            code = str(row["code"])
+            klines = db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
+            if not klines:
+                continue
+            features = features_at(klines, len(klines) - 1)
+            if features is None:
+                continue
+            probability = model.predict_probability(features)
+            baseline_probability = None
+            if hasattr(model, "predict_baseline_probability"):
+                baseline_probability = model.predict_baseline_probability(features)
+            rule_score = float(row["total_score"] or 0)
+            rule_weight = float(ml_cfg.get("rule_score_weight", 0.35))
+            predicted_score = probability * 100 * (1 - rule_weight) + rule_score * rule_weight
+            predictions.append(
+                {
+                    "code": code,
+                    "name": row["name"],
+                    "probability_up": round(probability, 4),
+                    "predicted_score": round(predicted_score, 2),
+                    "features": {
+                        **features,
+                        "baseline_probability_up": round(baseline_probability, 4)
+                        if baseline_probability is not None
+                        else None,
+                    },
+                    "reason": model.explain(features),
+                }
+            )
+        predictions.sort(key=lambda item: (item["predicted_score"], item["probability_up"]), reverse=True)
+        db.save_ml_predictions(conn, model_run_id, source_run_id, predictions)
+        return model_run_id
 
 
 def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[str, Any]) -> ReviewResult:

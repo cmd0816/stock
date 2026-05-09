@@ -6,7 +6,7 @@ from pathlib import Path
 
 from weekly_stock.config import DEFAULT_CONFIG
 from weekly_stock.db import connect, ensure_weekly_tables
-from weekly_stock.jobs import review_selected_stock, stock_screen_job
+from weekly_stock.jobs import ml_predict_job, review_selected_stock, stock_screen_job
 from weekly_stock.models import Kline
 
 
@@ -189,6 +189,49 @@ class WeeklyStockTests(unittest.TestCase):
         self.assertAlmostEqual(result.highest_gain_pct or 0, 12.0)
         self.assertFalse(result.stop_loss_triggered)
         self.assertTrue(result.meets_expectation)
+
+    def test_ml_predict_job_saves_predictions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = write_config(root)
+            (root / "screening.txt").write_text("测试条件", encoding="utf-8")
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                conn.execute(
+                    "INSERT INTO xuangu_batches VALUES ('b1', '2026-05-01T00:00:00Z', 'url', 'cond', 'file', 1, 2)"
+                )
+                insert_candidate(conn, "000001", "强势股份", {"营业收入同比增长率": "20%", "净利润同比增长率": "15%"})
+                insert_candidate(conn, "000002", "普通股份", {"营业收入同比增长率": "5%", "净利润同比增长率": "3%"})
+                for i in range(1, 96):
+                    insert_kline(conn, "000001", i, 10 + i * 0.08, volume=1000 + i * 10)
+                    insert_kline(conn, "000002", i, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
+                conn.commit()
+
+            config = DEFAULT_CONFIG | {
+                "database": {"path": "stocks.db"},
+                "screening": {"top_n": 2, "min_score": 0, "run_xuangu": False},
+                "ml": {
+                    **DEFAULT_CONFIG["ml"],
+                    "model_name": "centroid_v1",
+                    "min_train_samples": 5,
+                    "lookback_trading_days": 60,
+                    "sample_stride": 5,
+                    "history_limit": 120,
+                },
+            }
+            run_id = stock_screen_job(config_path, config, screen_date="2026-05-02", xuangu_batch_id="b1")
+            model_run_id = ml_predict_job(config_path, config, run_id=run_id)
+
+            with connect(root / "stocks.db") as conn:
+                models = conn.execute("SELECT * FROM weekly_ml_model_runs WHERE model_run_id=?", (model_run_id,)).fetchall()
+                predictions = conn.execute(
+                    "SELECT code, probability_up, predicted_score FROM weekly_ml_predictions WHERE source_run_id=?",
+                    (run_id,),
+                ).fetchall()
+            self.assertEqual(len(models), 1)
+            self.assertGreaterEqual(len(predictions), 1)
+            self.assertTrue(all(0 <= row["probability_up"] <= 1 for row in predictions))
 
 
 if __name__ == "__main__":

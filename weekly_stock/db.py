@@ -95,9 +95,38 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (selected_id) REFERENCES weekly_selected_stocks(id)
         );
 
+        CREATE TABLE IF NOT EXISTS weekly_ml_model_runs (
+            model_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_run_id INTEGER NOT NULL,
+            model_name TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            train_sample_count INTEGER NOT NULL,
+            positive_sample_count INTEGER NOT NULL,
+            model_json TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_ml_predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_run_id INTEGER NOT NULL,
+            source_run_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            probability_up REAL NOT NULL,
+            predicted_score REAL NOT NULL,
+            feature_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            UNIQUE(source_run_id, code),
+            FOREIGN KEY (model_run_id) REFERENCES weekly_ml_model_runs(model_run_id),
+            FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_weekly_candidates_run ON weekly_screen_candidates(run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_selected_run ON weekly_selected_stocks(run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_review_run ON weekly_review_results(review_id);
+        CREATE INDEX IF NOT EXISTS idx_weekly_ml_predictions_run ON weekly_ml_predictions(source_run_id);
         """
     )
     conn.commit()
@@ -225,6 +254,22 @@ def delete_screen_runs(conn: sqlite3.Connection, screen_date: str, xuangu_batch_
             review_ids,
         )
 
+    model_rows = conn.execute(
+        f"SELECT model_run_id FROM weekly_ml_model_runs WHERE source_run_id IN ({placeholders})",
+        run_ids,
+    ).fetchall()
+    model_run_ids = [int(row["model_run_id"]) for row in model_rows]
+    if model_run_ids:
+        model_placeholders = ",".join("?" for _ in model_run_ids)
+        conn.execute(
+            f"DELETE FROM weekly_ml_predictions WHERE model_run_id IN ({model_placeholders})",
+            model_run_ids,
+        )
+        conn.execute(
+            f"DELETE FROM weekly_ml_model_runs WHERE model_run_id IN ({model_placeholders})",
+            model_run_ids,
+        )
+
     conn.execute(f"DELETE FROM weekly_selected_stocks WHERE run_id IN ({placeholders})", run_ids)
     conn.execute(f"DELETE FROM weekly_screen_candidates WHERE run_id IN ({placeholders})", run_ids)
     conn.execute(f"DELETE FROM weekly_screen_runs WHERE run_id IN ({placeholders})", run_ids)
@@ -240,6 +285,8 @@ def delete_all_screen_runs(conn: sqlite3.Connection) -> int:
 
     conn.execute("DELETE FROM weekly_review_results")
     conn.execute("DELETE FROM weekly_review_runs")
+    conn.execute("DELETE FROM weekly_ml_predictions")
+    conn.execute("DELETE FROM weekly_ml_model_runs")
     conn.execute("DELETE FROM weekly_selected_stocks")
     conn.execute("DELETE FROM weekly_screen_candidates")
     conn.execute("DELETE FROM weekly_screen_runs")
@@ -322,6 +369,114 @@ def selected_stocks_for_run(conn: sqlite3.Connection, run_id: int) -> List[sqlit
         ORDER BY rank_no
         """,
         (run_id,),
+    ).fetchall()
+
+
+def latest_selected_run(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute(
+        """
+        SELECT r.run_id
+        FROM weekly_screen_runs r
+        WHERE EXISTS (SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id)
+        ORDER BY r.screen_date DESC, r.run_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return int(row["run_id"]) if row else None
+
+
+def selected_codes_for_run(conn: sqlite3.Connection, run_id: int) -> List[str]:
+    rows = conn.execute(
+        """
+        SELECT code FROM weekly_selected_stocks
+        WHERE run_id = ?
+        ORDER BY rank_no
+        """,
+        (run_id,),
+    ).fetchall()
+    return [str(row["code"]) for row in rows]
+
+
+def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT code
+        FROM eastmoney_stock_daily_klines
+        ORDER BY code
+        """
+    ).fetchall()
+    return [str(row["code"]) for row in rows]
+
+
+def create_ml_model_run(
+    conn: sqlite3.Connection,
+    source_run_id: int,
+    model_name: str,
+    config: Dict[str, Any],
+    train_sample_count: int,
+    positive_sample_count: int,
+    model_json: str,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO weekly_ml_model_runs (
+            source_run_id, model_name, config_json, train_sample_count,
+            positive_sample_count, model_json, created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_run_id,
+            model_name,
+            json.dumps(config, ensure_ascii=False, default=str),
+            train_sample_count,
+            positive_sample_count,
+            model_json,
+            utc_now(),
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def save_ml_predictions(
+    conn: sqlite3.Connection,
+    model_run_id: int,
+    source_run_id: int,
+    predictions: Iterable[Dict[str, Any]],
+) -> None:
+    conn.execute("DELETE FROM weekly_ml_predictions WHERE source_run_id = ?", (source_run_id,))
+    for pred in predictions:
+        conn.execute(
+            """
+            INSERT INTO weekly_ml_predictions (
+                model_run_id, source_run_id, code, name, probability_up,
+                predicted_score, feature_json, reason, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                model_run_id,
+                source_run_id,
+                pred["code"],
+                pred.get("name"),
+                pred["probability_up"],
+                pred["predicted_score"],
+                json.dumps(pred.get("features") or {}, ensure_ascii=False, default=str),
+                pred.get("reason") or "",
+                utc_now(),
+            ),
+        )
+    conn.commit()
+
+
+def ml_predictions_for_run(conn: sqlite3.Connection, source_run_id: int) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT code, name, probability_up, predicted_score, feature_json, reason, created_at_utc
+        FROM weekly_ml_predictions
+        WHERE source_run_id = ?
+        ORDER BY predicted_score DESC, probability_up DESC
+        """,
+        (source_run_id,),
     ).fetchall()
 
 

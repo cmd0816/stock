@@ -29,6 +29,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "expected_high_gain_pct": 0.05,
         "expected_close_gain_pct": 0.02,
     },
+    "ml": {
+        "enabled": False,
+        "model_name": "lightgbm",
+        "baseline_model_name": "logistic_regression",
+        "history_limit": 320,
+        "lookback_trading_days": 60,
+        "horizon_trading_days": 5,
+        "sample_stride": 5,
+        "min_train_samples": 30,
+        "positive_high_gain_pct": 0.05,
+        "positive_close_gain_pct": 0.0,
+        "negative_drawdown_pct": 0.06,
+        "rule_score_weight": 0.35,
+        "train_on_selected_universe": False,
+        "lightgbm_n_estimators": 160,
+        "lightgbm_learning_rate": 0.04,
+        "lightgbm_num_leaves": 15,
+        "lightgbm_max_depth": 4,
+        "lightgbm_min_child_samples": 20,
+        "lightgbm_subsample": 0.85,
+        "lightgbm_colsample_bytree": 0.85,
+    },
 }
 
 
