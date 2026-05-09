@@ -42,6 +42,22 @@ class TrainingSample:
 
 
 @dataclass
+class BacktestMetrics:
+    model_name: str
+    train_count: int
+    test_count: int
+    positive_rate: float
+    accuracy: float
+    precision: float
+    recall: float
+    top_k: int
+    top_k_hit_rate: float
+    top_k_avg_close_gain_pct: float
+    top_k_avg_high_gain_pct: float
+    top_k_avg_max_drawdown_pct: float
+
+
+@dataclass
 class CentroidModel:
     feature_names: List[str]
     means: Dict[str, float]
@@ -329,6 +345,72 @@ def sample_matrix(samples: List[TrainingSample]) -> tuple[List[List[float]], Lis
     x = [[sample.features.get(name, 0.0) for name in FEATURE_NAMES] for sample in samples]
     y = [sample.label for sample in samples]
     return x, y
+
+
+def split_samples_by_time(samples: List[TrainingSample], train_ratio: float = 0.7) -> tuple[List[TrainingSample], List[TrainingSample]]:
+    ordered = sorted(samples, key=lambda sample: (sample.trade_date, sample.code))
+    if len(ordered) < 2:
+        return ordered, []
+    split_idx = max(1, min(len(ordered) - 1, int(len(ordered) * train_ratio)))
+    split_date = ordered[split_idx].trade_date
+    while split_idx > 1 and ordered[split_idx - 1].trade_date == split_date:
+        split_idx -= 1
+    return ordered[:split_idx], ordered[split_idx:]
+
+
+def evaluate_predictions(
+    model_name: str,
+    samples: List[TrainingSample],
+    probabilities: List[float],
+    train_count: int,
+    top_k: int,
+) -> BacktestMetrics:
+    if not samples:
+        return BacktestMetrics(model_name, train_count, 0, 0, 0, 0, 0, top_k, 0, 0, 0, 0)
+    predicted = [1 if p >= 0.5 else 0 for p in probabilities]
+    labels = [s.label for s in samples]
+    tp = sum(1 for y, p in zip(labels, predicted) if y == 1 and p == 1)
+    fp = sum(1 for y, p in zip(labels, predicted) if y == 0 and p == 1)
+    fn = sum(1 for y, p in zip(labels, predicted) if y == 1 and p == 0)
+    correct = sum(1 for y, p in zip(labels, predicted) if y == p)
+    ranked = sorted(zip(probabilities, samples), key=lambda item: item[0], reverse=True)
+    top = [sample for _, sample in ranked[: max(1, top_k)]]
+    return BacktestMetrics(
+        model_name=model_name,
+        train_count=train_count,
+        test_count=len(samples),
+        positive_rate=sum(labels) / len(labels),
+        accuracy=correct / len(samples),
+        precision=tp / (tp + fp) if tp + fp else 0.0,
+        recall=tp / (tp + fn) if tp + fn else 0.0,
+        top_k=top_k,
+        top_k_hit_rate=sum(s.label for s in top) / len(top) if top else 0.0,
+        top_k_avg_close_gain_pct=mean(s.future_close_gain_pct for s in top) if top else 0.0,
+        top_k_avg_high_gain_pct=mean(s.future_high_gain_pct for s in top) if top else 0.0,
+        top_k_avg_max_drawdown_pct=mean(s.future_max_drawdown_pct for s in top) if top else 0.0,
+    )
+
+
+def backtest_models(samples: List[TrainingSample], cfg: Dict[str, Any]) -> List[BacktestMetrics]:
+    train_samples, test_samples = split_samples_by_time(
+        samples,
+        train_ratio=float(cfg.get("backtest_train_ratio", 0.7)),
+    )
+    if not train_samples or not test_samples:
+        raise RuntimeError("Not enough samples for ML backtest.")
+    top_k = int(cfg.get("backtest_top_k", 10))
+    metrics: List[BacktestMetrics] = []
+
+    baseline_name = str(cfg.get("baseline_model_name", "logistic_regression")).lower()
+    if baseline_name == "logistic_regression":
+        baseline = train_logistic_regression_model(train_samples)
+        baseline_probs = [baseline.predict_probability(s.features) for s in test_samples]
+        metrics.append(evaluate_predictions("logistic_regression", test_samples, baseline_probs, len(train_samples), top_k))
+
+    main = train_model(train_samples, cfg)
+    main_probs = [main.predict_probability(s.features) for s in test_samples]
+    metrics.append(evaluate_predictions(str(cfg.get("model_name", "lightgbm")), test_samples, main_probs, len(train_samples), top_k))
+    return metrics
 
 
 def train_logistic_regression_model(samples: List[TrainingSample]) -> SklearnLikeModel:

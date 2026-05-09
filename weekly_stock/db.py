@@ -107,6 +107,22 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
         );
 
+        CREATE TABLE IF NOT EXISTS weekly_ml_training_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_run_id INTEGER NOT NULL,
+            source_run_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            label INTEGER NOT NULL,
+            future_high_gain_pct REAL NOT NULL,
+            future_close_gain_pct REAL NOT NULL,
+            future_max_drawdown_pct REAL NOT NULL,
+            feature_json TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            FOREIGN KEY (model_run_id) REFERENCES weekly_ml_model_runs(model_run_id),
+            FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
+        );
+
         CREATE TABLE IF NOT EXISTS weekly_ml_predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             model_run_id INTEGER NOT NULL,
@@ -126,6 +142,8 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_weekly_candidates_run ON weekly_screen_candidates(run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_selected_run ON weekly_selected_stocks(run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_review_run ON weekly_review_results(review_id);
+        CREATE INDEX IF NOT EXISTS idx_weekly_ml_samples_model ON weekly_ml_training_samples(model_run_id);
+        CREATE INDEX IF NOT EXISTS idx_weekly_ml_samples_code_date ON weekly_ml_training_samples(code, trade_date);
         CREATE INDEX IF NOT EXISTS idx_weekly_ml_predictions_run ON weekly_ml_predictions(source_run_id);
         """
     )
@@ -262,6 +280,10 @@ def delete_screen_runs(conn: sqlite3.Connection, screen_date: str, xuangu_batch_
     if model_run_ids:
         model_placeholders = ",".join("?" for _ in model_run_ids)
         conn.execute(
+            f"DELETE FROM weekly_ml_training_samples WHERE model_run_id IN ({model_placeholders})",
+            model_run_ids,
+        )
+        conn.execute(
             f"DELETE FROM weekly_ml_predictions WHERE model_run_id IN ({model_placeholders})",
             model_run_ids,
         )
@@ -285,6 +307,7 @@ def delete_all_screen_runs(conn: sqlite3.Connection) -> int:
 
     conn.execute("DELETE FROM weekly_review_results")
     conn.execute("DELETE FROM weekly_review_runs")
+    conn.execute("DELETE FROM weekly_ml_training_samples")
     conn.execute("DELETE FROM weekly_ml_predictions")
     conn.execute("DELETE FROM weekly_ml_model_runs")
     conn.execute("DELETE FROM weekly_selected_stocks")
@@ -397,6 +420,32 @@ def selected_codes_for_run(conn: sqlite3.Connection, run_id: int) -> List[str]:
     return [str(row["code"]) for row in rows]
 
 
+def screen_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            r.run_id,
+            r.screen_date,
+            r.xuangu_batch_id,
+            r.candidate_count,
+            r.selected_count,
+            r.created_at_utc,
+            COUNT(DISTINCT p.id) AS ml_prediction_count,
+            MAX(m.model_name) AS latest_model_name,
+            MAX(m.created_at_utc) AS latest_ml_at
+        FROM weekly_screen_runs r
+        LEFT JOIN weekly_ml_predictions p
+            ON p.source_run_id = r.run_id
+        LEFT JOIN weekly_ml_model_runs m
+            ON m.source_run_id = r.run_id
+        GROUP BY r.run_id
+        ORDER BY r.screen_date DESC, r.run_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
 def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute(
         """
@@ -436,6 +485,38 @@ def create_ml_model_run(
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def save_ml_training_samples(
+    conn: sqlite3.Connection,
+    model_run_id: int,
+    source_run_id: int,
+    samples: Iterable[Any],
+) -> None:
+    conn.execute("DELETE FROM weekly_ml_training_samples WHERE model_run_id = ?", (model_run_id,))
+    for sample in samples:
+        conn.execute(
+            """
+            INSERT INTO weekly_ml_training_samples (
+                model_run_id, source_run_id, code, trade_date, label,
+                future_high_gain_pct, future_close_gain_pct, future_max_drawdown_pct,
+                feature_json, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                model_run_id,
+                source_run_id,
+                sample.code,
+                sample.trade_date,
+                int(sample.label),
+                sample.future_high_gain_pct,
+                sample.future_close_gain_pct,
+                sample.future_max_drawdown_pct,
+                json.dumps(sample.features, ensure_ascii=False, default=str),
+                utc_now(),
+            ),
+        )
+    conn.commit()
 
 
 def save_ml_predictions(

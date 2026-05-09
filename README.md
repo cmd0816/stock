@@ -155,6 +155,62 @@ BROWSER_HEADED=1 ./run_xuangu.sh
 
 默认先使用规则打分和排序。ML 预测是可选的第二层，用来对已经选出的 Top 股票做本地概率重排。
 
+### 每周必须做的事
+
+每周末建议固定按这个顺序执行：
+
+1. 复盘上一周入选股票。
+2. 下载/导入本周东方财富条件选股结果。
+3. 根据本周候选池补齐一年日 K 数据。
+4. 生成本周规则 Top 股票。
+5. 运行 ML 时间序列回测，检查模型最近表现。
+6. 训练 `LogisticRegression` baseline 和 `LightGBM` 主模型。
+7. 生成本周 Top 股票的 ML 预测概率。
+8. 打开 `/top` 查看最终列表和日 K 图。
+
+一键执行：
+
+```bash
+./run_weekly.sh
+```
+
+执行完成后打开：
+
+```bash
+./run_server.sh
+```
+
+```text
+http://127.0.0.1:8000/top
+```
+
+常用可选参数：
+
+```bash
+# 如果本周还没有可复盘对象，跳过复盘
+SKIP_REVIEW=1 ./run_weekly.sh
+
+# 如果已经手动导入 XLSX 和 K 线，跳过东方财富下载
+SKIP_XUANGU=1 ./run_weekly.sh
+
+# 如果只想快速生成本周预测，跳过 ML 回测
+SKIP_BACKTEST=1 ./run_weekly.sh
+
+# 指定选股日期
+SCREEN_DATE=2026-05-08 ./run_weekly.sh
+
+# 指定东方财富选股批次
+XUANGU_BATCH_ID=20260508 ./run_weekly.sh
+
+# 显示浏览器窗口，便于登录或观察下载
+BROWSER_HEADED=1 ./run_weekly.sh
+
+# 需要先手动登录东方财富
+WAIT_LOGIN=1 ./run_weekly.sh
+```
+
+如果 `review` 提示没有可复盘对象，脚本会继续后面的本周选股流程；这通常发生在第一次使用，或者上一周数据还不足时。
+
 规则流程是：
 
 - 周末先运行东方财富条件选股，得到候选池。
@@ -221,6 +277,21 @@ python3 weekly_stock_main.py review
 python3 weekly_stock_main.py review --run-id 1
 ```
 
+查看历史 Top 列表的 `run-id`：
+
+```bash
+python3 weekly_stock_main.py runs
+```
+
+输出示例：
+
+```text
+run_id screen_date  batch_id  candidates selected ml_predictions model     created_at
+     9 2026-05-08   20260508         259        8              8   lightgbm 2026-05-09T04:54:54...
+```
+
+这里第一列 `run_id` 就是历史 Top 列表编号。平时每周运行 `./run_weekly.sh` 不需要手动填写它；只有想复盘或重新预测某个历史 Top 列表时才需要。
+
 复盘会计算：
 
 - 下周最高涨幅
@@ -276,6 +347,39 @@ ML 配置在 `config/weekly_strategy.yaml` 的 `ml` 部分：
 - `negative_drawdown_pct`：未来最大回撤超过多少不算好样本。
 - `rule_score_weight`：最终预测分数中保留多少规则分权重。
 - `min_train_samples`：最少训练样本数，样本不足会停止。
+- `backtest_train_ratio`：时间序列回测时前多少比例样本用于训练。
+- `backtest_top_k`：回测时统计概率最高的前多少个样本。
+
+训练样本会保存到：
+
+```text
+weekly_ml_training_samples
+```
+
+每条样本包含：
+
+- `model_run_id`
+- 股票代码
+- 样本交易日
+- 标签 `label`
+- 未来最高涨幅
+- 未来收盘涨幅
+- 未来最大回撤
+- 特征 JSON
+
+运行 ML 时间序列回测：
+
+```bash
+python3 weekly_stock_main.py backtest
+```
+
+它会按时间切分训练集和测试集，输出：
+
+- `LogisticRegression` baseline 指标。
+- `LightGBM` 主模型指标。
+- accuracy、precision、recall。
+- Top K 命中率。
+- Top K 平均未来收益和最大回撤。
 
 如果只是想在没有额外 ML 依赖时验证流程，可以临时把模型改为：
 
@@ -330,6 +434,7 @@ ml:
 - `weekly_review_runs`：每次复盘运行。
 - `weekly_review_results`：每只入选股票的复盘结果。
 - `weekly_ml_model_runs`：每次 ML 训练运行。
+- `weekly_ml_training_samples`：每次 ML 训练生成的历史样本和标签。
 - `weekly_ml_predictions`：每只 Top 股票的 ML 预测概率和解释。
 
 ## 选股页面

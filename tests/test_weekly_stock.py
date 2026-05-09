@@ -6,7 +6,7 @@ from pathlib import Path
 
 from weekly_stock.config import DEFAULT_CONFIG
 from weekly_stock.db import connect, ensure_weekly_tables
-from weekly_stock.jobs import ml_predict_job, review_selected_stock, stock_screen_job
+from weekly_stock.jobs import ml_backtest_job, ml_predict_job, review_selected_stock, stock_screen_job
 from weekly_stock.models import Kline
 
 
@@ -229,9 +229,45 @@ class WeeklyStockTests(unittest.TestCase):
                     "SELECT code, probability_up, predicted_score FROM weekly_ml_predictions WHERE source_run_id=?",
                     (run_id,),
                 ).fetchall()
+                samples = conn.execute(
+                    "SELECT code, label, feature_json FROM weekly_ml_training_samples WHERE model_run_id=?",
+                    (model_run_id,),
+                ).fetchall()
             self.assertEqual(len(models), 1)
             self.assertGreaterEqual(len(predictions), 1)
+            self.assertGreaterEqual(len(samples), 1)
             self.assertTrue(all(0 <= row["probability_up"] <= 1 for row in predictions))
+
+    def test_ml_backtest_job_returns_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = write_config(root)
+            (root / "screening.txt").write_text("测试条件", encoding="utf-8")
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                for i in range(1, 110):
+                    insert_kline(conn, "000001", i, 10 + i * 0.08, volume=1000 + i * 10)
+                    insert_kline(conn, "000002", i, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
+                conn.commit()
+
+            config = DEFAULT_CONFIG | {
+                "database": {"path": "stocks.db"},
+                "ml": {
+                    **DEFAULT_CONFIG["ml"],
+                    "model_name": "centroid_v1",
+                    "baseline_model_name": "none",
+                    "min_train_samples": 5,
+                    "lookback_trading_days": 60,
+                    "sample_stride": 5,
+                    "history_limit": 130,
+                    "backtest_top_k": 3,
+                },
+            }
+            metrics = ml_backtest_job(config_path, config)
+            self.assertEqual(len(metrics), 1)
+            self.assertEqual(metrics[0].model_name, "centroid_v1")
+            self.assertGreater(metrics[0].test_count, 0)
 
 
 if __name__ == "__main__":

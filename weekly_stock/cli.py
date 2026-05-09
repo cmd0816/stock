@@ -6,7 +6,7 @@ from pathlib import Path
 
 from . import db
 from .config import load_config
-from .jobs import ml_predict_job, project_root, stock_screen_job, weekly_review_job
+from .jobs import ml_backtest_job, ml_predict_job, project_root, stock_screen_job, weekly_review_job
 
 
 def print_ml_predictions(config_path: Path, config: dict, model_run_id: int) -> None:
@@ -53,6 +53,50 @@ def print_ml_predictions(config_path: Path, config: dict, model_run_id: int) -> 
         print(f"{rank:>4} {code:<6} {name:<8} {prob:>6.1f}% {baseline_txt} {score:>15.2f} {reason}")
 
 
+def print_screen_runs(config_path: Path, config: dict, limit: int) -> None:
+    root = project_root(config_path)
+    db_path = root / config["database"]["path"]
+    with db.connect(db_path) as conn:
+        db.ensure_weekly_tables(conn)
+        rows = db.screen_runs(conn, limit=limit)
+    if not rows:
+        print("No weekly screen runs found.")
+        return
+    print("run_id screen_date  batch_id  candidates selected ml_predictions model     created_at")
+    for row in rows:
+        print(
+            f"{row['run_id']:>6} "
+            f"{str(row['screen_date'] or '-'):<11} "
+            f"{str(row['xuangu_batch_id'] or '-'):<9} "
+            f"{int(row['candidate_count'] or 0):>10} "
+            f"{int(row['selected_count'] or 0):>8} "
+            f"{int(row['ml_prediction_count'] or 0):>14} "
+            f"{str(row['latest_model_name'] or '-'):>9} "
+            f"{row['created_at_utc']}"
+        )
+
+
+def print_backtest_metrics(metrics: list) -> None:
+    if not metrics:
+        print("No ML backtest metrics generated.")
+        return
+    print("model               train test positive accuracy precision recall top_k_hit avg_close avg_high avg_drawdown")
+    for item in metrics:
+        print(
+            f"{item.model_name:<18} "
+            f"{item.train_count:>5} "
+            f"{item.test_count:>4} "
+            f"{item.positive_rate * 100:>7.1f}% "
+            f"{item.accuracy * 100:>7.1f}% "
+            f"{item.precision * 100:>8.1f}% "
+            f"{item.recall * 100:>5.1f}% "
+            f"{item.top_k_hit_rate * 100:>8.1f}% "
+            f"{item.top_k_avg_close_gain_pct:>8.2f}% "
+            f"{item.top_k_avg_high_gain_pct:>7.2f}% "
+            f"{item.top_k_avg_max_drawdown_pct:>11.2f}%"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weekly stock screening and review jobs.")
     parser.add_argument("--config", default="config/weekly_strategy.yaml", help="YAML strategy config path")
@@ -70,6 +114,11 @@ def main() -> None:
 
     predict = sub.add_parser("predict", help="Run ML prediction/re-ranking for selected stocks")
     predict.add_argument("--run-id", type=int, default=None, help="Predict a specific weekly screen run")
+
+    runs = sub.add_parser("runs", help="List historical weekly screen runs and run_id values")
+    runs.add_argument("--limit", type=int, default=20, help="Max runs to list")
+
+    sub.add_parser("backtest", help="Run time-split ML backtest for baseline and main model")
 
     args = parser.parse_args()
     config_path = Path(args.config)
@@ -93,6 +142,11 @@ def main() -> None:
         model_run_id = ml_predict_job(config_path, config, run_id=args.run_id)
         print(f"ml_predict_job completed: model_run_id={model_run_id}")
         print_ml_predictions(config_path, config, model_run_id)
+    elif args.command == "runs":
+        print_screen_runs(config_path, config, args.limit)
+    elif args.command == "backtest":
+        metrics = ml_backtest_job(config_path, config)
+        print_backtest_metrics(metrics)
 
 
 if __name__ == "__main__":

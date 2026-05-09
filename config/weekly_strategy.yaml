@@ -62,6 +62,8 @@ ml:
   negative_drawdown_pct: 0.06
   rule_score_weight: 0.35
   train_on_selected_universe: false
+  backtest_train_ratio: 0.7
+  backtest_top_k: 10
   lightgbm_n_estimators: 160
   lightgbm_learning_rate: 0.04
   lightgbm_num_leaves: 15

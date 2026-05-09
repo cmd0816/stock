@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from . import db
 from .models import Kline, ReviewResult
-from .ml import build_training_samples, features_at, train_model
+from .ml import backtest_models, build_training_samples, features_at, train_model
 from .scoring import rank_candidates
 
 
@@ -150,6 +150,7 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             positive_sample_count=positive_count,
             model_json=model.to_json(),
         )
+        db.save_ml_training_samples(conn, model_run_id, source_run_id, samples)
 
         predictions = []
         for row in selected_rows:
@@ -185,6 +186,27 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
         predictions.sort(key=lambda item: (item["predicted_score"], item["probability_up"]), reverse=True)
         db.save_ml_predictions(conn, model_run_id, source_run_id, predictions)
         return model_run_id
+
+
+def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
+    root = project_root(config_path)
+    db_path = root / config["database"]["path"]
+    ml_cfg = config.get("ml", {})
+    with db.connect(db_path) as conn:
+        db.ensure_weekly_tables(conn)
+        train_codes = db.all_downloaded_codes(conn)
+        klines_by_code = {
+            code: db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
+            for code in train_codes
+        }
+    samples = build_training_samples(klines_by_code, ml_cfg)
+    min_samples = int(ml_cfg.get("min_train_samples", 30))
+    if len(samples) < min_samples:
+        raise RuntimeError(
+            f"Not enough ML backtest samples: {len(samples)} < {min_samples}. "
+            "Download more K-line history or lower ml.min_train_samples."
+        )
+    return backtest_models(samples, ml_cfg)
 
 
 def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[str, Any]) -> ReviewResult:
