@@ -9,6 +9,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "database": {"path": "stocks.db"},
     "paths": {"screening_file": "screening.txt", "download_dir": "downloads"},
     "screening": {"top_n": 4, "min_score": 60, "run_xuangu": False},
+    "calendar": {
+        "align_to_china_trading_day": True,
+        "prefer_akshare": True,
+    },
     "scoring": {
         "weights": {
             "trend": 30,
@@ -37,6 +41,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "lookback_trading_days": 60,
         "horizon_trading_days": 5,
         "sample_stride": 5,
+        "weekly_last_trading_day_only": True,
         "min_train_samples": 30,
         "positive_high_gain_pct": 0.05,
         "positive_close_gain_pct": 0.0,

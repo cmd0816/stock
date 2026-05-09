@@ -10,6 +10,10 @@ screening:
   min_score: 60
   run_xuangu: false
 
+calendar:
+  align_to_china_trading_day: true
+  prefer_akshare: true
+
 scoring:
   weights:
     trend: 30
@@ -56,6 +60,7 @@ ml:
   lookback_trading_days: 60
   horizon_trading_days: 5
   sample_stride: 5
+  weekly_last_trading_day_only: true
   min_train_samples: 30
   positive_high_gain_pct: 0.05
   positive_close_gain_pct: 0.0

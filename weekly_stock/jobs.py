@@ -10,6 +10,7 @@ from . import db
 from .models import Kline, ReviewResult
 from .ml import backtest_models, build_training_samples, features_at, train_model
 from .scoring import rank_candidates
+from .trading_calendar import align_to_last_trading_day
 
 
 def project_root(config_path: Path) -> Path:
@@ -64,6 +65,13 @@ def stock_screen_job(
         if not candidates:
             raise RuntimeError("No xuangu candidates found. Run xuangu download first.")
         effective_screen_date = screen_date or date.today().isoformat()
+        calendar_cfg = config.get("calendar", {})
+        if calendar_cfg.get("align_to_china_trading_day", True):
+            effective_screen_date = align_to_last_trading_day(
+                effective_screen_date,
+                conn=conn,
+                prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
+            )
         if replace_existing:
             deleted = db.delete_screen_runs(conn, effective_screen_date, xuangu_batch_id)
             if deleted:
@@ -102,7 +110,16 @@ def weekly_review_job(config_path: Path, config: Dict[str, Any], review_date: Op
         if not selected:
             raise RuntimeError(f"Run {reviewed_run_id} has no selected stocks.")
 
-        review_id = db.create_review_run(conn, reviewed_run_id, review_date or date.today().isoformat(), config)
+        effective_review_date = review_date or date.today().isoformat()
+        calendar_cfg = config.get("calendar", {})
+        if calendar_cfg.get("align_to_china_trading_day", True):
+            effective_review_date = align_to_last_trading_day(
+                effective_review_date,
+                conn=conn,
+                prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
+            )
+
+        review_id = db.create_review_run(conn, reviewed_run_id, effective_review_date, config)
         results = [
             review_selected_stock(db.load_klines(conn, row["code"], limit=320), row, config)
             for row in selected

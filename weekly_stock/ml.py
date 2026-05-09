@@ -10,6 +10,7 @@ from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import Kline
+from .trading_calendar import weekly_last_trading_days
 
 
 FEATURE_NAMES = [
@@ -287,8 +288,13 @@ def build_training_samples(
     stride = max(1, int(cfg.get("sample_stride", 5)))
     samples: List[TrainingSample] = []
     for code, klines in klines_by_code.items():
+        allowed_dates = None
+        if cfg.get("weekly_last_trading_day_only", True):
+            allowed_dates = weekly_last_trading_days(k.trade_date for k in klines)
         max_idx = len(klines) - horizon - 1
         for idx in range(lookback, max_idx + 1, stride):
+            if allowed_dates is not None and klines[idx].trade_date not in allowed_dates:
+                continue
             features = features_at(klines, idx)
             label = label_future(klines, idx, horizon, cfg)
             if features is None or label is None:

@@ -383,19 +383,23 @@ def fetch_xuangu_batch_stocks(db_path: Path, batch_id: str) -> List[Dict[str, An
     return stocks
 
 
-def get_existing_kline_counts(db_path: Path) -> Dict[str, int]:
+def get_existing_kline_stats(db_path: Path) -> Dict[str, Tuple[int, str]]:
     if not db_path.exists():
         return {}
     with sqlite3.connect(db_path) as conn:
         ensure_tables(conn)
         rows = conn.execute(
             """
-            SELECT code, COUNT(*) AS day_count
+            SELECT code, COUNT(*) AS day_count, MAX(trade_date) AS latest_trade_date
             FROM eastmoney_stock_daily_klines
             GROUP BY code
             """
         ).fetchall()
-    return {str(code): int(day_count or 0) for code, day_count in rows}
+    return {str(code): (int(day_count or 0), str(latest_trade_date or "")) for code, day_count, latest_trade_date in rows}
+
+
+def get_existing_kline_counts(db_path: Path) -> Dict[str, int]:
+    return {code: day_count for code, (day_count, _) in get_existing_kline_stats(db_path).items()}
 
 
 def fetch_stock_history_1y_in_context(
@@ -406,9 +410,10 @@ def fetch_stock_history_1y_in_context(
     user_agent: str,
     page: Optional[Any] = None,
     retries: int = 3,
+    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     api_url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = build_history_query_params(market, code)
+    params = build_history_query_params(market, code, end_date=end_date)
     full_url = f"{api_url}?{urlencode(params, safe=',')}"
     own_page = page is None
     page = page or get_or_create_page(context)
@@ -505,6 +510,7 @@ def download_history_1y_for_batch(
     limit: int = 0,
     delay_seconds: float = 1.5,
     min_existing_days: int = 200,
+    end_date: Optional[str] = None,
 ) -> Tuple[int, int]:
     stocks = fetch_xuangu_batch_stocks(db_path, batch_id)
     if limit > 0:
@@ -513,19 +519,25 @@ def download_history_1y_for_batch(
         print(f"No stock codes found in xuangu batch {batch_id}; skip 1-year history download.")
         return 0, 0
 
-    existing_counts = get_existing_kline_counts(db_path)
+    existing_stats = get_existing_kline_stats(db_path)
     skipped_count = 0
     pending = []
     for stock in stocks:
-        if existing_counts.get(str(stock["code"]), 0) >= min_existing_days:
+        existing_day_count, latest_trade_date = existing_stats.get(str(stock["code"]), (0, ""))
+        if existing_day_count >= min_existing_days or (end_date and latest_trade_date >= end_date):
             skipped_count += 1
             continue
         pending.append(stock)
     stocks = pending
     if not stocks:
+        coverage_reason = (
+            f"at least {min_existing_days} K-line rows or are already updated to {end_date}"
+            if end_date
+            else f"at least {min_existing_days} K-line rows"
+        )
         print(
-            f"All selected stocks in batch {batch_id} already have at least "
-            f"{min_existing_days} K-line rows; skip history download."
+            f"All selected stocks in batch {batch_id} already have "
+            f"{coverage_reason}; skip history download."
         )
         return 0, 0
 
@@ -551,6 +563,7 @@ def download_history_1y_for_batch(
                 source_url,
                 user_agent=user_agent,
                 page=history_page,
+                end_date=end_date,
             )
             row_count = save_history_klines(db_path, source_url, market, code, payload)
             ok_count += 1
@@ -1829,6 +1842,11 @@ def main() -> None:
         default=200,
         help="Skip a stock history download if it already has at least this many daily K-line rows. Default: 200.",
     )
+    parser.add_argument(
+        "--history-end-date",
+        default=None,
+        help="End date for 1-year daily K-line download, YYYY-MM-DD. Also skips stocks already updated to this date.",
+    )
     parser.add_argument("--timeout", type=int, default=120, help="Timeout in seconds for page/download operations")
     parser.add_argument("--manual-download", action="store_true", help="Allow manual click for download if auto click fails")
     parser.add_argument("--wait-login", action="store_true", help="Pause for manual login before selecting/downloading")
@@ -1917,6 +1935,7 @@ def main() -> None:
                     limit=max(0, args.history_limit),
                     delay_seconds=max(0.0, args.history_delay),
                     min_existing_days=max(0, args.history_min_existing_days),
+                    end_date=args.history_end_date,
                 )
             return
         if existing_status["exists"] and not args.replace_existing:
@@ -1969,6 +1988,7 @@ def main() -> None:
                 limit=max(0, args.history_limit),
                 delay_seconds=max(0.0, args.history_delay),
                 min_existing_days=max(0, args.history_min_existing_days),
+                end_date=args.history_end_date,
             )
     finally:
         close_context(browser, context)

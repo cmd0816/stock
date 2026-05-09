@@ -7,7 +7,9 @@ from pathlib import Path
 from weekly_stock.config import DEFAULT_CONFIG
 from weekly_stock.db import connect, ensure_weekly_tables
 from weekly_stock.jobs import ml_backtest_job, ml_predict_job, review_selected_stock, stock_screen_job
+from weekly_stock.ml import build_training_samples
 from weekly_stock.models import Kline
+from weekly_stock.trading_calendar import align_to_last_trading_day, weekly_last_trading_days
 
 
 def write_config(root: Path) -> Path:
@@ -218,6 +220,7 @@ class WeeklyStockTests(unittest.TestCase):
                     "lookback_trading_days": 60,
                     "sample_stride": 5,
                     "history_limit": 120,
+                    "weekly_last_trading_day_only": False,
                 },
             }
             run_id = stock_screen_job(config_path, config, screen_date="2026-05-02", xuangu_batch_id="b1")
@@ -262,12 +265,50 @@ class WeeklyStockTests(unittest.TestCase):
                     "sample_stride": 5,
                     "history_limit": 130,
                     "backtest_top_k": 3,
+                    "weekly_last_trading_day_only": False,
                 },
             }
             metrics = ml_backtest_job(config_path, config)
             self.assertEqual(len(metrics), 1)
             self.assertEqual(metrics[0].model_name, "centroid_v1")
             self.assertGreater(metrics[0].test_count, 0)
+
+    def test_trading_calendar_aligns_to_latest_trade_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                insert_kline(conn, "000001", 28, 10)
+                insert_kline(conn, "000001", 29, 10)
+                insert_kline(conn, "000001", 30, 10)
+                conn.commit()
+                aligned = align_to_last_trading_day("2026-05-09", conn=conn, prefer_akshare=False)
+            self.assertEqual(aligned, "2026-04-30")
+
+    def test_ml_samples_can_use_weekly_last_trading_days_only(self) -> None:
+        klines = [
+            Kline(f"2026-01-{day:02d}", 10, 10 + day * 0.1, 10 + day * 0.2, 9 + day * 0.1, 1000, 5, 0)
+            for day in range(1, 32)
+        ] + [
+            Kline(f"2026-02-{day:02d}", 13, 13 + day * 0.1, 13 + day * 0.2, 12 + day * 0.1, 1000, 5, 0)
+            for day in range(1, 29)
+        ] + [
+            Kline(f"2026-03-{day:02d}", 16, 16 + day * 0.1, 16 + day * 0.2, 15 + day * 0.1, 1000, 5, 0)
+            for day in range(1, 32)
+        ]
+        allowed = weekly_last_trading_days(k.trade_date for k in klines)
+        samples = build_training_samples(
+            {"000001": klines},
+            {
+                **DEFAULT_CONFIG["ml"],
+                "weekly_last_trading_day_only": True,
+                "lookback_trading_days": 20,
+                "horizon_trading_days": 5,
+                "sample_stride": 1,
+            },
+        )
+        self.assertGreater(len(samples), 0)
+        self.assertTrue(all(sample.trade_date in allowed for sample in samples))
 
 
 if __name__ == "__main__":

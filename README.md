@@ -162,11 +162,12 @@ BROWSER_HEADED=1 ./run_xuangu.sh
 1. 复盘上一周入选股票。
 2. 下载/导入本周东方财富条件选股结果。
 3. 根据本周候选池补齐一年日 K 数据。
-4. 生成本周规则 Top 股票。
-5. 运行 ML 时间序列回测，检查模型最近表现。
-6. 训练 `LogisticRegression` baseline 和 `LightGBM` 主模型。
-7. 生成本周 Top 股票的 ML 预测概率。
-8. 打开 `/top` 查看最终列表和日 K 图。
+4. 把选股日期对齐到中国 A 股本周最后一个交易日。
+5. 生成本周规则 Top 股票。
+6. 运行 ML 时间序列回测，检查模型最近表现。
+7. 训练 `LogisticRegression` baseline 和 `LightGBM` 主模型。
+8. 生成本周 Top 股票的 ML 预测概率。
+9. 打开 `/top` 查看最终列表和日 K 图。
 
 一键执行：
 
@@ -210,6 +211,18 @@ WAIT_LOGIN=1 ./run_weekly.sh
 ```
 
 如果 `review` 提示没有可复盘对象，脚本会继续后面的本周选股流程；这通常发生在第一次使用，或者上一周数据还不足时。
+
+交易日期说明：
+
+- 系统会把 `SCREEN_DATE` 对齐到中国 A 股最近一个交易日。
+- 周末运行时，例如周六 `2026-05-09`，会自动对齐到周五 `2026-05-08`。
+- ML 训练样本默认只取每周最后一个交易日，避免周中数据和周末选股口径不一致。
+- 交易日历优先参考 AKShare 的 `tool_trade_date_hist_sina` 接口；如果本地没有安装 AKShare 或接口不可用，会自动使用数据库中已下载的 A 股 K 线交易日作为 fallback。
+- 如果想使用 AKShare 官方交易日历，可以额外安装：
+
+```bash
+pip install akshare
+```
 
 规则流程是：
 
@@ -342,6 +355,7 @@ ML 配置在 `config/weekly_strategy.yaml` 的 `ml` 部分：
 - `baseline_model_name`：baseline，默认 `logistic_regression`。
 - `lookback_trading_days`：用多少个历史交易日计算特征。
 - `horizon_trading_days`：预测未来几个交易日。
+- `weekly_last_trading_day_only`：是否只用每周最后一个交易日生成训练样本。
 - `positive_high_gain_pct`：未来最高涨幅达到多少算正样本。
 - `positive_close_gain_pct`：未来收盘涨幅最低要求。
 - `negative_drawdown_pct`：未来最大回撤超过多少不算好样本。
@@ -349,6 +363,11 @@ ML 配置在 `config/weekly_strategy.yaml` 的 `ml` 部分：
 - `min_train_samples`：最少训练样本数，样本不足会停止。
 - `backtest_train_ratio`：时间序列回测时前多少比例样本用于训练。
 - `backtest_top_k`：回测时统计概率最高的前多少个样本。
+
+交易日历配置在 `config/weekly_strategy.yaml` 的 `calendar` 部分：
+
+- `align_to_china_trading_day`：是否把选股和复盘日期对齐到中国 A 股交易日。
+- `prefer_akshare`：是否优先尝试 AKShare 交易日历，失败时自动回退到数据库 K 线交易日。
 
 训练样本会保存到：
 

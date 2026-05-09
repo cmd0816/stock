@@ -354,9 +354,10 @@ def fetch_stock_history_1y(market: int, code: str) -> Dict[str, Any]:
     raise RuntimeError("All Eastmoney history endpoints failed: " + " | ".join(errors))
 
 
-def build_history_query_params(market: int, code: str) -> Dict[str, str]:
-    end_date = datetime.now().strftime("%Y%m%d")
-    beg_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+def build_history_query_params(market: int, code: str, end_date: Optional[str] = None) -> Dict[str, str]:
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
+    end_text = end_dt.strftime("%Y%m%d")
+    beg_date = (end_dt - timedelta(days=365)).strftime("%Y%m%d")
     return {
         "secid": f"{market}.{code}",
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
@@ -365,7 +366,7 @@ def build_history_query_params(market: int, code: str) -> Dict[str, str]:
         "klt": "101",  # Daily K-line
         "fqt": "1",    # Forward-adjusted
         "beg": beg_date,
-        "end": end_date,
+        "end": end_text,
         "lmt": "500",
     }
 
