@@ -194,6 +194,59 @@ def create_screen_run(
     return int(cur.lastrowid)
 
 
+def delete_screen_runs(conn: sqlite3.Connection, screen_date: str, xuangu_batch_id: Optional[str]) -> int:
+    rows = conn.execute(
+        """
+        SELECT run_id
+        FROM weekly_screen_runs
+        WHERE screen_date = ?
+          AND COALESCE(xuangu_batch_id, '') = COALESCE(?, '')
+        """,
+        (screen_date, xuangu_batch_id),
+    ).fetchall()
+    run_ids = [int(row["run_id"]) for row in rows]
+    if not run_ids:
+        return 0
+
+    placeholders = ",".join("?" for _ in run_ids)
+    review_rows = conn.execute(
+        f"SELECT review_id FROM weekly_review_runs WHERE reviewed_run_id IN ({placeholders})",
+        run_ids,
+    ).fetchall()
+    review_ids = [int(row["review_id"]) for row in review_rows]
+    if review_ids:
+        review_placeholders = ",".join("?" for _ in review_ids)
+        conn.execute(
+            f"DELETE FROM weekly_review_results WHERE review_id IN ({review_placeholders})",
+            review_ids,
+        )
+        conn.execute(
+            f"DELETE FROM weekly_review_runs WHERE review_id IN ({review_placeholders})",
+            review_ids,
+        )
+
+    conn.execute(f"DELETE FROM weekly_selected_stocks WHERE run_id IN ({placeholders})", run_ids)
+    conn.execute(f"DELETE FROM weekly_screen_candidates WHERE run_id IN ({placeholders})", run_ids)
+    conn.execute(f"DELETE FROM weekly_screen_runs WHERE run_id IN ({placeholders})", run_ids)
+    conn.commit()
+    return len(run_ids)
+
+
+def delete_all_screen_runs(conn: sqlite3.Connection) -> int:
+    rows = conn.execute("SELECT run_id FROM weekly_screen_runs").fetchall()
+    run_ids = [int(row["run_id"]) for row in rows]
+    if not run_ids:
+        return 0
+
+    conn.execute("DELETE FROM weekly_review_results")
+    conn.execute("DELETE FROM weekly_review_runs")
+    conn.execute("DELETE FROM weekly_selected_stocks")
+    conn.execute("DELETE FROM weekly_screen_candidates")
+    conn.execute("DELETE FROM weekly_screen_runs")
+    conn.commit()
+    return len(run_ids)
+
+
 def save_screen_results(conn: sqlite3.Connection, run_id: int, scored: List[ScoredStock], top_n: int) -> None:
     for rank, item in enumerate(scored, start=1):
         score = item.score

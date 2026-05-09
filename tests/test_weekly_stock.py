@@ -138,6 +138,46 @@ class WeeklyStockTests(unittest.TestCase):
                 self.assertEqual(selected[0]["code"], "000001")
                 self.assertIn("风险过滤", selected[0]["selected_reason"])
 
+    def test_stock_screen_job_replace_existing_keeps_latest_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = write_config(root)
+            (root / "screening.txt").write_text("测试条件", encoding="utf-8")
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                conn.execute(
+                    "INSERT INTO xuangu_batches VALUES ('b1', '2026-05-01T00:00:00Z', 'url', 'cond', 'file', 1, 2)"
+                )
+                insert_candidate(conn, "000001", "强势股份", {"营业收入同比增长率": "20%"})
+                insert_candidate(conn, "000002", "普通股份", {"营业收入同比增长率": "5%"})
+                for i in range(1, 36):
+                    insert_kline(conn, "000001", i, 10 + i * 0.2)
+                    insert_kline(conn, "000002", i, 10 + i * 0.05)
+                conn.commit()
+
+            first_run_id = stock_screen_job(
+                config_path,
+                DEFAULT_CONFIG | {"database": {"path": "stocks.db"}},
+                screen_date="2026-05-02",
+                xuangu_batch_id="b1",
+                replace_existing=True,
+            )
+            second_run_id = stock_screen_job(
+                config_path,
+                DEFAULT_CONFIG | {"database": {"path": "stocks.db"}},
+                screen_date="2026-05-02",
+                xuangu_batch_id="b1",
+                replace_existing=True,
+            )
+
+            with connect(root / "stocks.db") as conn:
+                runs = conn.execute("SELECT run_id FROM weekly_screen_runs ORDER BY run_id").fetchall()
+                selected = conn.execute("SELECT DISTINCT run_id FROM weekly_selected_stocks").fetchall()
+            self.assertNotEqual(first_run_id, second_run_id)
+            self.assertEqual([row["run_id"] for row in runs], [second_run_id])
+            self.assertEqual([row["run_id"] for row in selected], [second_run_id])
+
     def test_review_selected_stock_metrics(self) -> None:
         klines = [
             Kline("2026-05-01", 10, 10, 10.2, 9.8, 1000, 5, 0),

@@ -13,6 +13,9 @@ from typing import Any, Dict, List
 from urllib.parse import parse_qs, quote, urlparse
 
 from xuangu_to_sqlite import import_xlsx_to_sqlite
+from weekly_stock.config import load_config
+from weekly_stock import db as weekly_db
+from weekly_stock.jobs import stock_screen_job
 
 
 UploadedFiles = Dict[str, Dict[str, Any]]
@@ -240,7 +243,7 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                 dict(r)
                 for r in conn.execute(
                     """
-                    SELECT screen_date, code, name, rank_no, total_score, selected_reason
+                    SELECT run_id, screen_date, code, name, rank_no, total_score, selected_reason
                     FROM weekly_selected_stocks
                     ORDER BY id DESC
                     LIMIT 20
@@ -492,6 +495,48 @@ def render_simple_table(rows: List[Dict[str, Any]], columns: List[tuple[str, str
     """
 
 
+def render_weekly_selected_table(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "<div class='empty'>还没有生成周末入选股票。</div>"
+    columns = [
+        ("run_id", "运行ID"),
+        ("screen_date", "选股日期"),
+        ("rank_no", "排名"),
+        ("code", "代码"),
+        ("name", "名称"),
+        ("total_score", "总分"),
+        ("selected_reason", "入选原因"),
+    ]
+    head = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+    body = []
+    for row in rows:
+        cells = []
+        code = str(row.get("code") or "")
+        daily_url = f"/daily?code={quote(code)}" if code else "#"
+        for key, _ in columns:
+            value = row.get(key)
+            if isinstance(value, float):
+                text = f"{value:.2f}"
+            elif value is None:
+                text = "-"
+            else:
+                text = str(value)
+            if key in {"code", "name"} and code:
+                cell = f"<a class='daily-link' href='{daily_url}' title='查看日 K 线'>{html.escape(text)}</a>"
+            else:
+                cell = html.escape(text)
+            cells.append(f"<td>{cell}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return f"""
+      <div class="table-wrap">
+        <table>
+          <thead><tr>{head}</tr></thead>
+          <tbody>{''.join(body)}</tbody>
+        </table>
+      </div>
+    """
+
+
 def re_like_number(value: str) -> bool:
     text = value.strip().replace(",", "")
     if not text:
@@ -572,6 +617,40 @@ def render_xuangu_import_form(message: str = "", error: str = "") -> str:
     """
 
 
+def render_weekly_screen_form(selected_batch_id: str) -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    return f"""
+      <div class="import-box compact">
+        <form method="post" action="/actions/run_weekly_screen">
+          <div class="form-grid weekly-form-grid">
+            <label>
+              <span>选股批次</span>
+              <input name="xuangu_batch_id" value="{html.escape(selected_batch_id)}" placeholder="例如 20260508" required />
+            </label>
+            <label>
+              <span>选股日期</span>
+              <input name="screen_date" value="{html.escape(today)}" placeholder="YYYY-MM-DD" />
+            </label>
+            <label>
+              <span>Top N</span>
+              <input name="top_n" type="number" min="1" max="20" value="5" />
+            </label>
+          </div>
+          <div class="form-actions">
+            <span class="form-hint">根据当前批次候选股和已下载 K 线打分排序。</span>
+            <button type="submit">生成下周 Top 股票</button>
+          </div>
+        </form>
+        <form method="post" action="/actions/clear_weekly_top" onsubmit="return confirm('确认清空 Top 股票列表和关联复盘结果吗？');">
+          <div class="form-actions clear-actions">
+            <span class="form-hint">清空当前所有 Top 股票、候选打分和关联复盘结果。</span>
+            <button class="danger-btn" type="submit">清空 Top 列表</button>
+          </div>
+        </form>
+      </div>
+    """
+
+
 def render_xuangu_result_table(rows: List[Dict[str, Any]], selected_batch_id: str) -> str:
     if not rows:
         return f"<div class='empty'>批次 {html.escape(selected_batch_id or '-')} 没有导入行。</div>"
@@ -645,7 +724,9 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     selected_batch_id = str(checks.get("selected_xuangu_batch_id") or "")
     batches = render_xuangu_batch_table(checks.get("xuangu_batches", []), selected_batch_id)
     import_form = render_xuangu_import_form(message, error)
+    weekly_screen_form = render_weekly_screen_form(selected_batch_id)
     latest_results = render_xuangu_result_table(checks.get("latest_xuangu_results", []), selected_batch_id)
+    weekly_selected = render_weekly_selected_table(checks.get("weekly_selected", []))
     weekly_reviews = render_simple_table(
         checks.get("weekly_reviews", []),
         [
@@ -816,11 +897,18 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     .import-box {{
       padding: 14px;
     }}
+    .import-box.compact {{
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }}
     .form-grid {{
       display: grid;
       grid-template-columns: 1.4fr 1fr 1.4fr;
       gap: 12px;
       margin-bottom: 12px;
+    }}
+    .weekly-form-grid {{
+      grid-template-columns: 1fr 1fr 0.55fr;
     }}
     label span {{
       display: block;
@@ -886,6 +974,43 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     .form-actions button:hover {{
       background: #ea580c;
     }}
+    .clear-actions {{
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--line);
+    }}
+    .form-actions button.danger-btn {{
+      border-color: #fecaca;
+      background: #fff5f5;
+      color: #b91c1c;
+    }}
+    .form-actions button.danger-btn:hover {{
+      background: #fee2e2;
+    }}
+    .form-hint {{
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .daily-link {{
+      color: #2563eb;
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .daily-link:hover {{
+      color: #ea580c;
+      text-decoration: underline;
+    }}
+    .candidate-details {{
+      border-top: 1px solid var(--line);
+      background: #fff;
+    }}
+    .candidate-details summary {{
+      cursor: pointer;
+      padding: 10px 14px;
+      color: #334155;
+      font-weight: 700;
+      user-select: none;
+    }}
     .empty {{
       padding: 16px;
       color: var(--muted);
@@ -933,7 +1058,7 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     <div class="grid">
       <section class="card"><h3>导入条件选股 XLSX</h3>{import_form}</section>
       <section class="card"><h3>最近条件选股批次</h3>{batches}</section>
-      <section class="card"><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{latest_results}</section>
+      <section class="card"><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{weekly_screen_form}{weekly_selected}<details class="candidate-details"><summary>查看本批次候选股票列表</summary>{latest_results}</details></section>
       <section class="card"><h3>最近复盘结果</h3>{weekly_reviews}</section>
     </div>
   </div>
@@ -961,15 +1086,21 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         )
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title_suffix = f" ({code})" if code else ""
-    selected_name = html.escape(str(rows[0].get("name", ""))) if rows else ""
+    selected_name_raw = str(rows[0].get("name") or "").strip() if rows else ""
+    if not selected_name_raw and code:
+        selected_stock = next((s for s in stock_list if str(s.get("code") or "") == code), None)
+        selected_name_raw = str((selected_stock or {}).get("name") or "").strip()
+    selected_label = " ".join(part for part in (selected_name_raw, code) if part)
+    title_suffix = f" - {selected_label}" if selected_label else ""
+    selected_name = html.escape(selected_name_raw or "-")
+    selected_code = html.escape(code or "-")
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta http-equiv="refresh" content="30" />
-  <title>东方财富日 K 线</title>
+  <title>东方财富日 K 线{html.escape(title_suffix)}</title>
   <style>
     :root {{
       --bg: #f3f4f6;
@@ -1206,7 +1337,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
           </div>
         </div>
         <div class="meta">
-          自动刷新：30 秒 | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}
+          自动刷新：30 秒 | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}（{selected_code}）
         </div>
         <div class="card">
           <div class="hover-row">
@@ -1235,7 +1366,7 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
             <span><b style="color:#8b5cf6">MA60</b></span>
             <span><b style="color:#0f766e">MA120</b></span>
             <span><b style="color:#374151">MA250</b></span>
-            <span><b style="color:#0369a1">筹码图</b>（按价格估算成交量分布）</span>
+            <span><b style="color:#0369a1">筹码图</b>（红=下方获利/支撑，绿=上方套牢/压力，估算）</span>
           </div>
         </div>
       </main>
@@ -1482,10 +1613,11 @@ def build_daily_html(rows: List[Dict[str, Any]], code: str, stock_list: List[Dic
         const chipAnchorClose = points[chipEndAbs].close;
         for (let b = 0; b < bins; b++) {{
           const centerV = minV + (b + 0.5) * step;
-          const y0 = pad.top + (plotH * b / bins);
-          const y1 = pad.top + (plotH * (b + 1) / bins);
+          // b=0 is the lowest price bin, so draw it at the bottom of the panel.
+          const y0 = pad.top + (plotH * (bins - b - 1) / bins);
+          const y1 = pad.top + (plotH * (bins - b) / bins);
           const bw = chipPlotW * (chip[b] / maxChip);
-          const color = centerV >= chipAnchorClose ? 'rgba(220,38,38,0.45)' : 'rgba(22,163,74,0.45)';
+          const color = centerV >= chipAnchorClose ? 'rgba(22,163,74,0.45)' : 'rgba(220,38,38,0.45)';
           chipCtx.fillStyle = color;
           chipCtx.fillRect(chipPadL, y0, bw, Math.max(1, y1 - y0 - 1));
         }}
@@ -1651,6 +1783,54 @@ def make_handler(db_path: Path, limit: int):
                     msg = quote(f"导入成功：批次 {batch_id}，sheet {sheet_count}，股票行 {row_count}")
                     self.send_response(303)
                     self.send_header("Location", f"/screening?batch_id={quote(batch_id)}&msg={msg}")
+                    self.end_headers()
+                    return
+                except Exception as exc:
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?err={quote(str(exc))}")
+                    self.end_headers()
+                    return
+
+            if parsed.path == "/actions/run_weekly_screen":
+                try:
+                    base_dir = db_path.parent
+                    config_path = base_dir / "config/weekly_strategy.yaml"
+                    config = load_config(config_path)
+                    config["database"]["path"] = str(db_path)
+                    config.setdefault("screening", {})
+                    config["screening"]["run_xuangu"] = False
+                    top_n = int(form_value(form, "top_n", "5") or "5")
+                    config["screening"]["top_n"] = max(1, min(20, top_n))
+                    xuangu_batch_id = form_value(form, "xuangu_batch_id")
+                    if not xuangu_batch_id:
+                        raise ValueError("请先选择或填写选股批次。")
+                    screen_date = form_value(form, "screen_date") or datetime.now().strftime("%Y-%m-%d")
+                    run_id = stock_screen_job(
+                        config_path=config_path,
+                        config=config,
+                        screen_date=screen_date,
+                        xuangu_batch_id=xuangu_batch_id,
+                        replace_existing=True,
+                    )
+                    msg = quote(f"已生成下周 Top {config['screening']['top_n']} 股票：run_id={run_id}")
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?batch_id={quote(xuangu_batch_id)}&msg={msg}")
+                    self.end_headers()
+                    return
+                except Exception as exc:
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?err={quote(str(exc))}")
+                    self.end_headers()
+                    return
+
+            if parsed.path == "/actions/clear_weekly_top":
+                try:
+                    with weekly_db.connect(db_path) as conn:
+                        weekly_db.ensure_weekly_tables(conn)
+                        deleted = weekly_db.delete_all_screen_runs(conn)
+                    msg = quote(f"已清空 Top 列表：删除 {deleted} 次选股运行")
+                    self.send_response(303)
+                    self.send_header("Location", f"/screening?msg={msg}")
                     self.end_headers()
                     return
                 except Exception as exc:

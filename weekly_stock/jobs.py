@@ -40,7 +40,13 @@ def run_xuangu_download(config_path: Path, config: Dict[str, Any]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def stock_screen_job(config_path: Path, config: Dict[str, Any], screen_date: Optional[str] = None, xuangu_batch_id: Optional[str] = None) -> int:
+def stock_screen_job(
+    config_path: Path,
+    config: Dict[str, Any],
+    screen_date: Optional[str] = None,
+    xuangu_batch_id: Optional[str] = None,
+    replace_existing: bool = False,
+) -> int:
     root = project_root(config_path)
     db_path = root / config["database"]["path"]
     screening_path = root / config["paths"]["screening_file"]
@@ -56,6 +62,11 @@ def stock_screen_job(config_path: Path, config: Dict[str, Any], screen_date: Opt
         candidates = db.load_xuangu_candidates(conn, xuangu_batch_id)
         if not candidates:
             raise RuntimeError("No xuangu candidates found. Run xuangu download first.")
+        effective_screen_date = screen_date or date.today().isoformat()
+        if replace_existing:
+            deleted = db.delete_screen_runs(conn, effective_screen_date, xuangu_batch_id)
+            if deleted:
+                print(f"Deleted {deleted} existing weekly screen run(s) for {effective_screen_date}/{xuangu_batch_id}.")
 
         klines_by_code = {c.code: db.load_klines(conn, c.code) for c in candidates}
         ranked = rank_candidates(candidates, klines_by_code, config)
@@ -67,7 +78,7 @@ def stock_screen_job(config_path: Path, config: Dict[str, Any], screen_date: Opt
 
         run_id = db.create_screen_run(
             conn=conn,
-            screen_date=screen_date or date.today().isoformat(),
+            screen_date=effective_screen_date,
             xuangu_batch_id=xuangu_batch_id,
             config=config,
             screening_text=screening_text,

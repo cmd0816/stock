@@ -16,6 +16,7 @@ def main() -> None:
     screen.add_argument("--date", default=None, help="Screen date, YYYY-MM-DD")
     screen.add_argument("--xuangu-batch-id", default=None, help="Use a specific xuangu batch id")
     screen.add_argument("--run-xuangu", action="store_true", help="Run xuangu download before scoring")
+    screen.add_argument("--replace-existing", action="store_true", help="Replace existing screen run for the same date/batch")
 
     review = sub.add_parser("review", help="Run weekly_review_job")
     review.add_argument("--date", default=None, help="Review date, YYYY-MM-DD")
@@ -28,7 +29,13 @@ def main() -> None:
     if args.command == "screen":
         if args.run_xuangu:
             config["screening"]["run_xuangu"] = True
-        run_id = stock_screen_job(config_path, config, screen_date=args.date, xuangu_batch_id=args.xuangu_batch_id)
+        run_id = stock_screen_job(
+            config_path,
+            config,
+            screen_date=args.date,
+            xuangu_batch_id=args.xuangu_batch_id,
+            replace_existing=args.replace_existing,
+        )
         print(f"stock_screen_job completed: run_id={run_id}")
     elif args.command == "review":
         review_id = weekly_review_job(config_path, config, review_date=args.date, run_id=args.run_id)

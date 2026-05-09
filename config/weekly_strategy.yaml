@@ -6,7 +6,7 @@ paths:
   download_dir: downloads
 
 screening:
-  top_n: 4
+  top_n: 5
   min_score: 60
   run_xuangu: false
 
