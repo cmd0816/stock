@@ -170,9 +170,17 @@ def save_uploaded_xlsx(base_dir: Path, upload: Dict[str, Any], batch_id: str) ->
 
 
 def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
+    config_path = db_path.parent / "config/weekly_strategy.yaml"
+    try:
+        cfg = load_config(config_path)
+        screening_top_n = int(cfg.get("screening", {}).get("top_n", 5))
+    except Exception:
+        screening_top_n = 5
+    screening_top_n = max(1, min(20, screening_top_n))
+
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        out: Dict[str, Any] = {}
+        out: Dict[str, Any] = {"screening_top_n": screening_top_n}
 
         if table_exists(conn, "eastmoney_stock_daily_klines"):
             out["kline_coverage"] = [
@@ -499,13 +507,13 @@ def re_like_number(value: str) -> bool:
     return re.fullmatch(r"-?\d+(?:\.\d+)?%?", text) is not None
 
 
-def render_xuangu_batch_table(rows: List[Dict[str, Any]], selected_batch_id: str) -> str:
+def render_xuangu_batch_table(rows: List[Dict[str, Any]], selected_batch_id: str, view_path: str = "/imports") -> str:
     if not rows:
         return "<div class='empty'>还没有条件选股批次。</div>"
     body = []
     for row in rows:
         batch_id = str(row.get("batch_id") or "")
-        view_url = f"/screening?batch_id={quote(batch_id)}"
+        view_url = f"{view_path}?batch_id={quote(batch_id)}"
         view_label = "当前批次" if batch_id == selected_batch_id else "查看股票"
         body.append(
             "<tr>"
@@ -556,10 +564,6 @@ def render_xuangu_import_form(message: str = "", error: str = "") -> str:
               <input name="source_url" value="https://xuangu.eastmoney.com/" />
             </label>
           </div>
-          <label class="textarea-label">
-            <span>选股条件</span>
-            <textarea name="condition_text" rows="3" placeholder="留空时自动读取 screening.txt"></textarea>
-          </label>
           <div class="form-actions">
             <label class="checkline">
               <input type="checkbox" name="replace_existing" value="1" checked />
@@ -572,8 +576,9 @@ def render_xuangu_import_form(message: str = "", error: str = "") -> str:
     """
 
 
-def render_weekly_screen_form(selected_batch_id: str) -> str:
+def render_weekly_screen_form(selected_batch_id: str, default_top_n: int = 5) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
+    top_n = max(1, min(20, int(default_top_n)))
     return f"""
       <div class="import-box compact">
         <form method="post" action="/actions/run_weekly_screen">
@@ -588,7 +593,7 @@ def render_weekly_screen_form(selected_batch_id: str) -> str:
             </label>
             <label>
               <span>Top N</span>
-              <input name="top_n" type="number" min="1" max="20" value="5" />
+              <input name="top_n" type="number" min="1" max="20" value="{top_n}" />
             </label>
           </div>
           <div class="form-actions">
@@ -679,11 +684,18 @@ def render_xuangu_result_table(rows: List[Dict[str, Any]], selected_batch_id: st
     return warning + table
 
 
-def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = "") -> str:
+def build_checks_html(
+    checks: Dict[str, Any],
+    message: str = "",
+    error: str = "",
+    *,
+    include_import_sections: bool = False,
+) -> str:
     selected_batch_id = str(checks.get("selected_xuangu_batch_id") or "")
-    batches = render_xuangu_batch_table(checks.get("xuangu_batches", []), selected_batch_id)
+    default_top_n = int(checks.get("screening_top_n") or 5)
     import_form = render_xuangu_import_form(message, error)
-    weekly_screen_form = render_weekly_screen_form(selected_batch_id)
+    batches = render_xuangu_batch_table(checks.get("xuangu_batches", []), selected_batch_id, view_path="/imports")
+    weekly_screen_form = render_weekly_screen_form(selected_batch_id, default_top_n=default_top_n)
     latest_results = render_xuangu_result_table(checks.get("latest_xuangu_results", []), selected_batch_id)
     weekly_selected = render_weekly_selected_table(checks.get("weekly_selected", []))
     weekly_reviews = render_simple_table(
@@ -701,13 +713,29 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
         ],
         "还没有复盘记录。",
     )
+    msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message and not include_import_sections else ""
+    err_html = f"<div class='notice error'>{html.escape(error)}</div>" if error and not include_import_sections else ""
+    meta = (
+        f"当前导入批次：{html.escape(selected_batch_id or '-')}"
+        if include_import_sections
+        else f"当前仅显示最近条件选股批次：{html.escape(selected_batch_id or '-')}"
+    )
+    page_title = "导入页面" if include_import_sections else "选股页面"
+    page_sections = (
+        f"<section class='card'><h3>导入条件选股 XLSX</h3>{import_form}</section>"
+        f"<section class='card'><h3>最近条件选股批次</h3>{batches}</section>"
+        f"<section class='card'><h3>当前批次股票明细（批次 {html.escape(selected_batch_id or '-')}）</h3>{latest_results}</section>"
+        if include_import_sections
+        else f"<section class='card'><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{weekly_screen_form}{weekly_selected}<details class='candidate-details'><summary>查看本批次候选股票列表</summary>{latest_results}</details></section>"
+             f"<section class='card'><h3>最近复盘结果</h3>{weekly_reviews}</section>"
+    )
 
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>选股页面</title>
+  <title>{page_title}</title>
   <style>
     :root {{
       --bg: #f3f4f6;
@@ -1024,18 +1052,20 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
 <body>
   <div class="wrap">
     <div class="head">
-      <h2>选股页面</h2>
+      <h2>{page_title}</h2>
       <div>
+        <a href="/imports">导入页面</a>
+        <a href="/screening">选股页面</a>
         <a href="/daily">日 K 线</a>
         <a href="/top">Top 日线图</a>
         <a href="/api/screening">JSON 接口</a>
       </div>
     </div>
+    <div class="meta">{meta}</div>
+    {msg_html}
+    {err_html}
     <div class="grid">
-      <section class="card"><h3>导入条件选股 XLSX</h3>{import_form}</section>
-      <section class="card"><h3>最近条件选股批次</h3>{batches}</section>
-      <section class="card"><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{weekly_screen_form}{weekly_selected}<details class="candidate-details"><summary>查看本批次候选股票列表</summary>{latest_results}</details></section>
-      <section class="card"><h3>最近复盘结果</h3>{weekly_reviews}</section>
+      {page_sections}
     </div>
   </div>
 </body>
@@ -1138,7 +1168,7 @@ def build_daily_html(
     }}
     .stk {{
       display: grid;
-      grid-template-columns: 78px 1fr 70px;
+      grid-template-columns: 96px minmax(0, 1fr) 70px;
       gap: 8px;
       padding: 10px 12px;
       text-decoration: none;
@@ -1157,6 +1187,8 @@ def build_daily_html(
     .stk .c {{
       font-weight: 700;
       font-family: "IBM Plex Mono", monospace;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
     }}
     .stk .n {{
       overflow: hidden;
@@ -1750,7 +1782,7 @@ def make_handler(db_path: Path, limit: int):
                 if batch_id:
                     delete_xuangu_batch(db_path, batch_id)
                 self.send_response(303)
-                self.send_header("Location", "/screening")
+                self.send_header("Location", "/imports")
                 self.end_headers()
                 return
 
@@ -1785,12 +1817,12 @@ def make_handler(db_path: Path, limit: int):
                     )
                     msg = quote(f"导入成功：批次 {batch_id}，sheet {sheet_count}，股票行 {row_count}")
                     self.send_response(303)
-                    self.send_header("Location", f"/screening?batch_id={quote(batch_id)}&msg={msg}")
+                    self.send_header("Location", f"/imports?batch_id={quote(batch_id)}&msg={msg}")
                     self.end_headers()
                     return
                 except Exception as exc:
                     self.send_response(303)
-                    self.send_header("Location", f"/screening?err={quote(str(exc))}")
+                    self.send_header("Location", f"/imports?err={quote(str(exc))}")
                     self.end_headers()
                     return
 
@@ -1802,7 +1834,8 @@ def make_handler(db_path: Path, limit: int):
                     config["database"]["path"] = str(db_path)
                     config.setdefault("screening", {})
                     config["screening"]["run_xuangu"] = False
-                    top_n = int(form_value(form, "top_n", "5") or "5")
+                    top_n_default = int(config.get("screening", {}).get("top_n", 5))
+                    top_n = int(form_value(form, "top_n", str(top_n_default)) or str(top_n_default))
                     config["screening"]["top_n"] = max(1, min(20, top_n))
                     xuangu_batch_id = form_value(form, "xuangu_batch_id")
                     if not xuangu_batch_id:
@@ -1944,6 +1977,21 @@ def make_handler(db_path: Path, limit: int):
             if parsed.path in {"/checks", "/screening"}:
                 checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
                 body = build_checks_html(checks, message=message, error=error).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if parsed.path in {"/imports", "/xuangu"}:
+                checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
+                body = build_checks_html(
+                    checks,
+                    message=message,
+                    error=error,
+                    include_import_sections=True,
+                ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
