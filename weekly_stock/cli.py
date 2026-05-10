@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from statistics import mean
 
 from . import db
 from .config import load_config
@@ -97,6 +98,72 @@ def print_backtest_metrics(metrics: list) -> None:
         )
 
 
+def avg_or_zero(values: list[float]) -> float:
+    return mean(values) if values else 0.0
+
+
+def print_trend_summary(rows: list, window: int) -> None:
+    if len(rows) < window * 2:
+        print(f"Need at least {window * 2} reviewed runs for rolling trend comparison; current={len(rows)}.")
+        return
+
+    recent = rows[:window]
+    previous = rows[window : window * 2]
+
+    def metric(items: list, key: str) -> float:
+        values = [float(row[key]) for row in items if row[key] is not None]
+        return avg_or_zero(values)
+
+    hit_recent = metric(recent, "hit_rate")
+    hit_prev = metric(previous, "hit_rate")
+    close_recent = metric(recent, "avg_close_gain_pct")
+    close_prev = metric(previous, "avg_close_gain_pct")
+    drawdown_recent = metric(recent, "avg_max_drawdown_pct")
+    drawdown_prev = metric(previous, "avg_max_drawdown_pct")
+
+    print(
+        "rolling "
+        f"{window}-run: "
+        f"hit={hit_recent * 100:.1f}% ({(hit_recent - hit_prev) * 100:+.1f}ppt), "
+        f"avg_close={close_recent:.2f}% ({close_recent - close_prev:+.2f}%), "
+        f"avg_drawdown={drawdown_recent:.2f}% ({drawdown_recent - drawdown_prev:+.2f}%)"
+    )
+
+
+def print_review_trend(config_path: Path, config: dict, limit: int, window: int) -> None:
+    root = project_root(config_path)
+    db_path = root / config["database"]["path"]
+    with db.connect(db_path) as conn:
+        db.ensure_weekly_tables(conn)
+        rows = db.review_trend_runs(conn, limit=limit)
+    if not rows:
+        print("No reviewed weekly runs found.")
+        return
+
+    print("run_id screen_date selected reviewed hit stop_loss avg_close avg_high avg_drawdown ml_pred avg_prob")
+    for row in rows:
+        hit = float(row["hit_rate"] or 0) * 100
+        stop_loss = float(row["stop_loss_rate"] or 0) * 100
+        avg_close = float(row["avg_close_gain_pct"] or 0)
+        avg_high = float(row["avg_high_gain_pct"] or 0)
+        avg_drawdown = float(row["avg_max_drawdown_pct"] or 0)
+        avg_prob = float(row["avg_probability_up"] or 0) * 100
+        print(
+            f"{int(row['run_id']):>6} "
+            f"{str(row['screen_date'] or '-'):<11} "
+            f"{int(row['selected_count'] or 0):>8} "
+            f"{int(row['reviewed_count'] or 0):>8} "
+            f"{hit:>5.1f}% "
+            f"{stop_loss:>9.1f}% "
+            f"{avg_close:>8.2f}% "
+            f"{avg_high:>7.2f}% "
+            f"{avg_drawdown:>11.2f}% "
+            f"{int(row['ml_prediction_count'] or 0):>7} "
+            f"{avg_prob:>7.1f}%"
+        )
+    print_trend_summary(rows, window)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weekly stock screening and review jobs.")
     parser.add_argument("--config", default="config/weekly_strategy.yaml", help="YAML strategy config path")
@@ -119,6 +186,9 @@ def main() -> None:
     runs.add_argument("--limit", type=int, default=20, help="Max runs to list")
 
     sub.add_parser("backtest", help="Run time-split ML backtest for baseline and main model")
+    trend = sub.add_parser("trend", help="Show reviewed run performance trend and rolling comparison")
+    trend.add_argument("--limit", type=int, default=20, help="How many reviewed runs to show")
+    trend.add_argument("--window", type=int, default=4, help="Rolling window size for trend delta")
 
     args = parser.parse_args()
     config_path = Path(args.config)
@@ -147,6 +217,8 @@ def main() -> None:
     elif args.command == "backtest":
         metrics = ml_backtest_job(config_path, config)
         print_backtest_metrics(metrics)
+    elif args.command == "trend":
+        print_review_trend(config_path, config, args.limit, max(1, args.window))
 
 
 if __name__ == "__main__":

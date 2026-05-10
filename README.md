@@ -9,6 +9,8 @@
 - `view_quotes.py`：本地网页看盘服务。
 - `run_xuangu.sh`：一键运行条件选股下载入库。
 - `run_server.sh`：一键启动本地看盘网页。
+- `run_daily_update.sh`：工作日收盘后更新最近一批选股的日 K，可选邮件通知。
+- `daily_update_email.py`：daily update 邮件发送脚本（由 `run_daily_update.sh` 调用）。
 - `weekly_stock/`：周末选股、规则打分和复盘模块。
 - `weekly_stock_main.py`：周末选股系统命令行入口。
 - `config/weekly_strategy.yaml`：周末选股评分和复盘配置。
@@ -150,6 +152,82 @@ BROWSER_HEADED=1 ./run_xuangu.sh
 ```
 
 进入 `http://127.0.0.1:8000/screening`，在“导入条件选股 XLSX”里点击“选择 XLSX 文件”后导入。
+
+### 每日更新最近一批选股日 K
+
+工作日收盘后，如果只想更新最近一批条件选股股票的日 K，不重新选股、不重新导入 XLSX，可以运行：
+
+```bash
+./run_daily_update.sh
+```
+
+默认行为：
+
+- 自动读取 `stocks.db` 中最近一次条件选股批次。
+- 自动把 `UPDATE_DATE` 对齐到中国 A 股最近交易日。
+- 只更新这批股票的一年日 K。
+- 已经更新到目标交易日的股票会自动跳过。
+- 默认隐藏 Firefox 窗口，复用 Firefox 默认登录状态。
+
+常用可选参数：
+
+```bash
+# 指定更新日期，脚本会自动对齐到最近交易日
+UPDATE_DATE=2026-05-12 ./run_daily_update.sh
+
+# 指定要更新的选股批次
+XUANGU_BATCH_ID=20260508 ./run_daily_update.sh
+
+# 放慢请求，减少东方财富接口重置连接
+HISTORY_DELAY=3 ./run_daily_update.sh
+
+# 只更新前 10 只，方便测试
+HISTORY_LIMIT=10 ./run_daily_update.sh
+
+# 显示浏览器窗口
+BROWSER_HEADED=1 ./run_daily_update.sh
+
+# 需要先手动登录东方财富
+WAIT_LOGIN=1 ./run_daily_update.sh
+```
+
+可选：把 daily update 统计自动发到邮箱（更新失败也会发）：
+
+```bash
+DAILY_EMAIL_TO="you@example.com" \
+SMTP_HOST="smtp.gmail.com" \
+SMTP_PORT=465 \
+SMTP_USER="you@example.com" \
+SMTP_PASS="你的邮箱SMTP授权码" \
+SMTP_USE_SSL=1 \
+./run_daily_update.sh
+```
+
+说明：
+
+- 只有设置 `DAILY_EMAIL_TO` 才会发邮件；不设置时行为和以前一致。
+- 邮件内容包含：目标日期、对齐交易日、批次号、`stocks_ok`、`rows_saved`、失败数、批次覆盖度、最近两次周末 Top 的变动列表（新增/移除/排名升降）和日志尾部。
+- 日志会保存到 `downloads/logs/daily_update_*.log`。
+- `daily_update_email.py` 统一使用环境变量读取上下文：`DAILY_UPDATE_DB_PATH`、`DAILY_UPDATE_BATCH_ID`、`DAILY_UPDATE_TARGET_DATE`、`DAILY_UPDATE_ALIGNED_DATE`、`DAILY_UPDATE_STATUS`、`DAILY_UPDATE_LOG_FILE`（由 `run_daily_update.sh` 自动注入）。
+- 常用可选项：`DAILY_EMAIL_FROM`、`SMTP_STARTTLS=1`（非 SSL 端口时）、`DAILY_EMAIL_SUBJECT_PREFIX`、`DAILY_EMAIL_LOG_LINES`。
+
+如果要单独测试邮件脚本，可以手动设置这些变量后运行：
+
+```bash
+DAILY_UPDATE_DB_PATH="/Users/cmd/workspace/stock/stocks.db" \
+DAILY_UPDATE_BATCH_ID="20260508" \
+DAILY_UPDATE_TARGET_DATE="2026-05-09" \
+DAILY_UPDATE_ALIGNED_DATE="2026-05-08" \
+DAILY_UPDATE_STATUS="0" \
+DAILY_UPDATE_LOG_FILE="/Users/cmd/workspace/stock/downloads/logs/your_log.log" \
+DAILY_EMAIL_TO="you@example.com" \
+SMTP_HOST="smtp.gmail.com" \
+SMTP_PORT=465 \
+SMTP_USER="you@example.com" \
+SMTP_PASS="你的邮箱SMTP授权码" \
+SMTP_USE_SSL=1 \
+python3 daily_update_email.py
+```
 
 ## 周末选股、预测和复盘系统
 
@@ -343,7 +421,7 @@ python3 weekly_stock_main.py predict --run-id 6
 http://127.0.0.1:8000/screening
 ```
 
-点击“生成 ML 预测”，再打开：
+点击“生成下周 Top 股票（含 ML）”，再打开：
 
 ```text
 http://127.0.0.1:8000/top
@@ -357,8 +435,11 @@ ML 配置在 `config/weekly_strategy.yaml` 的 `ml` 部分：
 - `horizon_trading_days`：预测未来几个交易日。
 - `weekly_last_trading_day_only`：是否只用每周最后一个交易日生成训练样本。
 - `positive_high_gain_pct`：未来最高涨幅达到多少算正样本。
-- `positive_close_gain_pct`：未来收盘涨幅最低要求。
-- `negative_drawdown_pct`：未来最大回撤超过多少不算好样本。
+- `positive_close_gain_pct`：按卖出规则退出后的收益最低要求。
+- `use_trade_exit_rules`：是否启用交易规则标签（默认 `true`）。
+- `exit_stop_loss_pct`：止损阈值，默认 `0.10`（跌 10% 卖出）。
+- `exit_on_break_ma20`：是否启用跌破 MA20 卖出，默认 `true`。
+- `negative_drawdown_pct`：仅在关闭 `use_trade_exit_rules` 时使用的旧标签阈值。
 - `rule_score_weight`：最终预测分数中保留多少规则分权重。
 - `min_train_samples`：最少训练样本数，样本不足会停止。
 - `backtest_train_ratio`：时间序列回测时前多少比例样本用于训练。
@@ -399,6 +480,25 @@ python3 weekly_stock_main.py backtest
 - accuracy、precision、recall。
 - Top K 命中率。
 - Top K 平均未来收益和最大回撤。
+
+查看按周复盘趋势（判断是否“越做越好”）：
+
+```bash
+python3 weekly_stock_main.py trend
+```
+
+常用参数：
+
+```bash
+# 最近 30 次复盘运行
+python3 weekly_stock_main.py trend --limit 30
+
+# 用 6 周窗口对比最近窗口 vs 上一个窗口
+python3 weekly_stock_main.py trend --window 6
+```
+
+`trend` 会输出每次 run 的命中率、止损率、平均收盘涨幅/最高涨幅/最大回撤，
+并给出滚动窗口对比，例如 `hit`、`avg_close`、`avg_drawdown` 的变化值。
 
 如果只是想在没有额外 ML 依赖时验证流程，可以临时把模型改为：
 
@@ -463,12 +563,12 @@ ml:
 - `http://127.0.0.1:8000/screening`
 - `http://127.0.0.1:8000/api/screening`
 
-页面只显示这 4 项：
+页面显示这 5 项：
 
 - 导入条件选股 XLSX：把已下载的东方财富选股 Excel 导入数据库，可覆盖同日批次。
 - 最近条件选股批次：批次、导入时间、行数、Excel 文件、查看股票、删除。
-- 周末入选股票：在页面输入选股日期和 Top N，点击生成下周 Top 股票；同一选股日期和批次会覆盖旧结果，只保留最后一次；也可以展开查看本批次候选股票列表。
-- ML 预测：点击“生成 ML 预测”，会基于已下载日 K 对当前 Top 列表生成概率，结果显示在 Top 日线图左侧。
+- 周末入选股票：在页面输入选股日期和 Top N，点击“生成下周 Top 股票（含 ML）”；同一选股日期和批次会覆盖旧结果，只保留最后一次；这一步会自动训练模型并生成 ML 概率；也可以展开查看本批次候选股票列表。
+- ML 预测：结果显示在 Top 日线图左侧，无需再次点击单独按钮。
 - 最近复盘结果：最高涨幅、收盘涨幅、最大回撤、止损和是否符合预期。
 
 ## 测试

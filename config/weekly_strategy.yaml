@@ -64,6 +64,9 @@ ml:
   min_train_samples: 30
   positive_high_gain_pct: 0.05
   positive_close_gain_pct: 0.0
+  use_trade_exit_rules: true
+  exit_stop_loss_pct: 0.10
+  exit_on_break_ma20: true
   negative_drawdown_pct: 0.06
   rule_score_weight: 0.35
   train_on_selected_universe: false

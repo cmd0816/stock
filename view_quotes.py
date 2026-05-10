@@ -259,8 +259,11 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                 for r in conn.execute(
                     """
                     SELECT
+                        CASE WHEN meets_expectation = 1 THEN '成功' ELSE '失败' END AS result,
                         code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
-                        stop_loss_triggered, meets_expectation, notes
+                        CASE WHEN stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
+                        CASE WHEN meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
+                        notes
                     FROM weekly_review_results
                     ORDER BY id DESC
                     LIMIT 20
@@ -589,21 +592,14 @@ def render_weekly_screen_form(selected_batch_id: str) -> str:
             </label>
           </div>
           <div class="form-actions">
-            <span class="form-hint">根据当前批次候选股和已下载 K 线打分排序。</span>
-            <button type="submit">生成下周 Top 股票</button>
+            <span class="form-hint">根据当前批次候选股和已下载 K 线打分排序，并自动生成 ML 概率。</span>
+            <button type="submit">生成下周 Top 股票（含 ML）</button>
           </div>
         </form>
         <div class="form-actions top-link-actions">
           <span class="form-hint">集中查看最后一次 Top 股票的日线形态。</span>
           <a class="button-link" href="/top">打开 Top 日线图</a>
         </div>
-        <form method="post" action="/actions/run_ml_predict">
-          <div class="form-actions top-link-actions">
-            <span class="form-hint">用已下载 K 线训练本地模型，并给当前 Top 股票生成 ML 概率。</span>
-            <input type="hidden" name="run_id" value="" />
-            <button type="submit">生成 ML 预测</button>
-          </div>
-        </form>
         <form method="post" action="/actions/clear_weekly_top" onsubmit="return confirm('确认清空 Top 股票列表和关联复盘结果吗？');">
           <div class="form-actions clear-actions">
             <span class="form-hint">清空当前所有 Top 股票、候选打分和关联复盘结果。</span>
@@ -693,6 +689,7 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
     weekly_reviews = render_simple_table(
         checks.get("weekly_reviews", []),
         [
+            ("result", "结果"),
             ("code", "代码"),
             ("name", "名称"),
             ("highest_gain_pct", "最高涨幅%"),
@@ -700,7 +697,7 @@ def build_checks_html(checks: Dict[str, Any], message: str = "", error: str = ""
             ("max_drawdown_pct", "最大回撤%"),
             ("stop_loss_triggered", "止损"),
             ("meets_expectation", "符合预期"),
-            ("notes", "复盘备注"),
+            ("notes", "成功/失败原因"),
         ],
         "还没有复盘记录。",
     )
@@ -1818,7 +1815,13 @@ def make_handler(db_path: Path, limit: int):
                         xuangu_batch_id=xuangu_batch_id,
                         replace_existing=True,
                     )
-                    msg = quote(f"已生成下周 Top {config['screening']['top_n']} 股票：run_id={run_id}")
+                    msg_text = f"已生成下周 Top {config['screening']['top_n']} 股票：run_id={run_id}"
+                    try:
+                        model_run_id = ml_predict_job(config_path=config_path, config=config, run_id=run_id)
+                        msg_text += f"；已生成 ML 预测：model_run_id={model_run_id}"
+                    except Exception as ml_exc:
+                        msg_text += f"；Top 已生成，但 ML 预测失败：{ml_exc}"
+                    msg = quote(msg_text)
                     self.send_response(303)
                     self.send_header("Location", f"/screening?batch_id={quote(xuangu_batch_id)}&msg={msg}")
                     self.end_headers()
@@ -2037,7 +2040,12 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), make_handler(db_path, args.limit))
     print(f"打开 http://{args.host}:{args.port}/")
     print(f"使用数据库：{db_path}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -74,6 +74,22 @@ def make_batch_id() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
+def get_latest_xuangu_batch_id(db_path: Path) -> Optional[str]:
+    if not db_path.exists():
+        return None
+    with sqlite3.connect(db_path) as conn:
+        ensure_tables(conn)
+        row = conn.execute(
+            """
+            SELECT batch_id
+            FROM xuangu_batches
+            ORDER BY imported_at_utc DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return str(row[0]) if row else None
+
+
 def ensure_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -1825,6 +1841,11 @@ def main() -> None:
         help="Do not download 1-year daily K-line history after xuangu import.",
     )
     parser.add_argument(
+        "--history-only",
+        action="store_true",
+        help="Only update 1-year daily K-line history for an existing xuangu batch. Uses latest batch when --batch-id is empty.",
+    )
+    parser.add_argument(
         "--history-limit",
         type=int,
         default=0,
@@ -1868,7 +1889,7 @@ def main() -> None:
     download_dir.mkdir(parents=True, exist_ok=True)
     timeout_ms = max(10, args.timeout) * 1000
     condition_text = args.condition.strip()
-    if not condition_text:
+    if not condition_text and not args.history_only:
         condition_file = Path(args.condition_file).expanduser().resolve()
         if condition_file.exists():
             condition_text = condition_file.read_text(encoding="utf-8").strip()
@@ -1876,11 +1897,47 @@ def main() -> None:
             raise FileNotFoundError(
                 f"No --condition provided and condition file not found: {condition_file}"
             )
-    if not condition_text:
+    if not args.history_only and not condition_text:
         raise ValueError("Condition text is empty. Please set --condition or put text in screening.txt.")
 
-    batch_id_arg = args.batch_id.strip() or make_batch_id()
+    batch_id_arg = args.batch_id.strip()
+    if args.history_only and not batch_id_arg:
+        batch_id_arg = get_latest_xuangu_batch_id(db_path) or ""
+    if not batch_id_arg:
+        batch_id_arg = make_batch_id()
     effective_user_agent = get_user_agent_for_engine(args.browser_engine)
+
+    if args.history_only:
+        existing_status = get_xuangu_batch_status(db_path, batch_id_arg)
+        if existing_status["stock_count"] <= 0:
+            raise RuntimeError(f"Xuangu batch {batch_id_arg} has no recognized stock codes.")
+        browser, context = launch_context(
+            engine=args.browser_engine,
+            headed=args.browser_headed,
+            browser_channel=args.browser_channel,
+            user_data_dir=args.browser_user_data_dir,
+            profile_directory=args.browser_profile_directory,
+        )
+        try:
+            print(f"Updating 1-year daily K-line data for xuangu batch {batch_id_arg}.")
+            if args.wait_login and args.browser_headed:
+                page = get_or_create_page(context)
+                page.goto(args.url, wait_until="domcontentloaded", timeout=timeout_ms)
+                print("请在浏览器中完成登录，然后回到终端按 Enter 继续...")
+                input()
+            download_history_1y_for_batch(
+                db_path=db_path,
+                batch_id=batch_id_arg,
+                context=context,
+                user_agent=effective_user_agent,
+                limit=max(0, args.history_limit),
+                delay_seconds=max(0.0, args.history_delay),
+                min_existing_days=max(0, args.history_min_existing_days),
+                end_date=args.history_end_date,
+            )
+        finally:
+            close_context(browser, context)
+        return
 
     if args.import_xlsx:
         xlsx_path = Path(args.import_xlsx).expanduser().resolve()

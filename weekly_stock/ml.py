@@ -269,13 +269,34 @@ def label_future(klines: Sequence[Kline], end_idx: int, horizon: int, cfg: Dict[
     if not highs or not lows or not closes:
         return None
     highest_gain = pct(max(highs), current.close)
-    close_gain = pct(closes[-1], current.close)
     max_drawdown = pct(min(lows), current.close)
-    good = (
-        highest_gain >= float(cfg.get("positive_high_gain_pct", 0.05)) * 100
-        and close_gain >= float(cfg.get("positive_close_gain_pct", 0.0)) * 100
-        and max_drawdown > -float(cfg.get("negative_drawdown_pct", 0.06)) * 100
-    )
+
+    use_exit_rules = bool(cfg.get("use_trade_exit_rules", False))
+    close_gain = pct(closes[-1], current.close)
+    if use_exit_rules:
+        stop_loss_pct = float(cfg.get("exit_stop_loss_pct", 0.10))
+        exit_on_break_ma20 = bool(cfg.get("exit_on_break_ma20", True))
+        close_gain = pct(closes[-1], current.close)
+        for future_idx in range(end_idx + 1, end_idx + 1 + horizon):
+            day = klines[future_idx]
+            if day.low is not None and day.low <= float(current.close) * (1 - stop_loss_pct):
+                close_gain = -stop_loss_pct * 100
+                break
+            if exit_on_break_ma20 and day.close is not None:
+                ma20 = moving_average(klines, future_idx, 20)
+                if ma20 and day.close < ma20:
+                    close_gain = pct(day.close, current.close)
+                    break
+        good = (
+            highest_gain >= float(cfg.get("positive_high_gain_pct", 0.05)) * 100
+            and close_gain >= float(cfg.get("positive_close_gain_pct", 0.0)) * 100
+        )
+    else:
+        good = (
+            highest_gain >= float(cfg.get("positive_high_gain_pct", 0.05)) * 100
+            and close_gain >= float(cfg.get("positive_close_gain_pct", 0.0)) * 100
+            and max_drawdown > -float(cfg.get("negative_drawdown_pct", 0.06)) * 100
+        )
     return int(good), highest_gain, close_gain, max_drawdown
 
 

@@ -446,6 +446,55 @@ def screen_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3.Row]:
     ).fetchall()
 
 
+def review_trend_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        WITH review_agg AS (
+            SELECT
+                wr.reviewed_run_id AS run_id,
+                COUNT(rr.id) AS reviewed_count,
+                AVG(CAST(rr.meets_expectation AS REAL)) AS hit_rate,
+                AVG(CAST(rr.stop_loss_triggered AS REAL)) AS stop_loss_rate,
+                AVG(rr.close_gain_pct) AS avg_close_gain_pct,
+                AVG(rr.highest_gain_pct) AS avg_high_gain_pct,
+                AVG(rr.max_drawdown_pct) AS avg_max_drawdown_pct
+            FROM weekly_review_runs wr
+            JOIN weekly_review_results rr
+                ON rr.review_id = wr.review_id
+            GROUP BY wr.reviewed_run_id
+        ),
+        ml_agg AS (
+            SELECT
+                source_run_id AS run_id,
+                COUNT(id) AS ml_prediction_count,
+                AVG(probability_up) AS avg_probability_up
+            FROM weekly_ml_predictions
+            GROUP BY source_run_id
+        )
+        SELECT
+            r.run_id,
+            r.screen_date,
+            r.selected_count,
+            ra.reviewed_count,
+            ra.hit_rate,
+            ra.stop_loss_rate,
+            ra.avg_close_gain_pct,
+            ra.avg_high_gain_pct,
+            ra.avg_max_drawdown_pct,
+            COALESCE(ma.ml_prediction_count, 0) AS ml_prediction_count,
+            ma.avg_probability_up
+        FROM weekly_screen_runs r
+        JOIN review_agg ra
+            ON ra.run_id = r.run_id
+        LEFT JOIN ml_agg ma
+            ON ma.run_id = r.run_id
+        ORDER BY r.screen_date DESC, r.run_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
 def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute(
         """

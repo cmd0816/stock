@@ -259,18 +259,39 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
     close_gain = (closes[-1] / base_close - 1) * 100 if base_close and closes else None
     max_drawdown = (min(lows) / base_close - 1) * 100 if base_close and lows else None
     stop_loss = max_drawdown is not None and max_drawdown <= -stop_loss_pct
-    meets = (highest_gain is not None and highest_gain >= expected_high) or (
+    target_hit = (highest_gain is not None and highest_gain >= expected_high) or (
         close_gain is not None and close_gain >= expected_close
     )
+    meets = target_hit and not stop_loss
 
-    notes = []
+    notes = [f"复盘区间 {future[0].trade_date} 到 {future[-1].trade_date}，共 {len(future)}/{horizon} 个交易日"]
+    success_reasons = []
+    failure_reasons = []
     if highest_gain is not None:
-        notes.append(f"下周最高涨幅 {highest_gain:.2f}%")
+        if highest_gain >= expected_high:
+            success_reasons.append(f"最高涨幅 {highest_gain:.2f}% 达到目标 {expected_high:.2f}%")
+        else:
+            failure_reasons.append(
+                f"最高涨幅 {highest_gain:.2f}% 低于目标 {expected_high:.2f}%，差 {expected_high - highest_gain:.2f}%"
+            )
     if close_gain is not None:
-        notes.append(f"下周收盘涨幅 {close_gain:.2f}%")
+        if close_gain >= expected_close:
+            success_reasons.append(f"收盘涨幅 {close_gain:.2f}% 达到目标 {expected_close:.2f}%")
+        else:
+            failure_reasons.append(
+                f"收盘涨幅 {close_gain:.2f}% 低于目标 {expected_close:.2f}%，差 {expected_close - close_gain:.2f}%"
+            )
     if stop_loss:
-        notes.append("触发止损")
-    notes.append("符合预期" if meets else "未达到预期")
+        failure_reasons.append(f"最大回撤 {max_drawdown:.2f}% 触发止损线 {-stop_loss_pct:.2f}%")
+    elif max_drawdown is not None:
+        success_reasons.append(f"最大回撤 {max_drawdown:.2f}%，未触发止损线 {-stop_loss_pct:.2f}%")
+
+    if meets:
+        notes.append("成功原因：" + "；".join(success_reasons))
+    else:
+        notes.append("失败原因：" + "；".join(failure_reasons or ["未命中上涨目标"]))
+        if success_reasons:
+            notes.append("有利因素：" + "；".join(success_reasons))
 
     return ReviewResult(
         code=selected_row["code"],

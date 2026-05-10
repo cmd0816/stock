@@ -7,7 +7,7 @@ from pathlib import Path
 from weekly_stock.config import DEFAULT_CONFIG
 from weekly_stock.db import connect, ensure_weekly_tables
 from weekly_stock.jobs import ml_backtest_job, ml_predict_job, review_selected_stock, stock_screen_job
-from weekly_stock.ml import build_training_samples
+from weekly_stock.ml import build_training_samples, label_future
 from weekly_stock.models import Kline
 from weekly_stock.trading_calendar import align_to_last_trading_day, weekly_last_trading_days
 
@@ -191,6 +191,21 @@ class WeeklyStockTests(unittest.TestCase):
         self.assertAlmostEqual(result.highest_gain_pct or 0, 12.0)
         self.assertFalse(result.stop_loss_triggered)
         self.assertTrue(result.meets_expectation)
+        self.assertIn("成功原因", result.notes)
+        self.assertIn("最高涨幅", result.notes)
+
+    def test_review_selected_stock_failure_reasons(self) -> None:
+        klines = [
+            Kline("2026-05-01", 10, 10, 10.2, 9.8, 1000, 5, 0),
+            Kline("2026-05-04", 10, 9.8, 10.2, 9.3, 1200, 6, -2),
+            Kline("2026-05-05", 9.8, 9.6, 10.1, 9.2, 1300, 7, -2),
+        ]
+        selected = {"code": "000001", "name": "测试", "screen_date": "2026-05-02"}
+        result = review_selected_stock(klines, selected, DEFAULT_CONFIG)
+        self.assertFalse(result.meets_expectation)
+        self.assertTrue(result.stop_loss_triggered)
+        self.assertIn("失败原因", result.notes)
+        self.assertIn("触发止损线", result.notes)
 
     def test_ml_predict_job_saves_predictions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,6 +324,64 @@ class WeeklyStockTests(unittest.TestCase):
         )
         self.assertGreater(len(samples), 0)
         self.assertTrue(all(sample.trade_date in allowed for sample in samples))
+
+    def test_label_future_exit_rules_stop_loss(self) -> None:
+        klines = []
+        for day in range(1, 23):
+            close = 10.0
+            high = 10.2
+            low = 9.8
+            if day == 22:
+                high = 10.0
+                low = 8.9
+                close = 9.2
+            klines.append(Kline(f"2026-05-{day:02d}", 10.0, close, high, low, 1000, 5, 0))
+
+        result = label_future(
+            klines,
+            end_idx=20,
+            horizon=1,
+            cfg={
+                "use_trade_exit_rules": True,
+                "exit_stop_loss_pct": 0.10,
+                "exit_on_break_ma20": True,
+                "positive_high_gain_pct": 0.0,
+                "positive_close_gain_pct": 0.0,
+            },
+        )
+        self.assertIsNotNone(result)
+        label, _high_gain, close_gain, _max_drawdown = result or (0, 0, 0, 0)
+        self.assertEqual(label, 0)
+        self.assertAlmostEqual(close_gain, -10.0, places=4)
+
+    def test_label_future_exit_rules_break_ma20(self) -> None:
+        klines = []
+        for day in range(1, 23):
+            close = 10.0
+            high = 10.2
+            low = 9.8
+            if day == 22:
+                close = 9.5
+                high = 9.7
+                low = 9.3
+            klines.append(Kline(f"2026-05-{day:02d}", 10.0, close, high, low, 1000, 5, 0))
+
+        result = label_future(
+            klines,
+            end_idx=20,
+            horizon=1,
+            cfg={
+                "use_trade_exit_rules": True,
+                "exit_stop_loss_pct": 0.10,
+                "exit_on_break_ma20": True,
+                "positive_high_gain_pct": 0.0,
+                "positive_close_gain_pct": -0.02,
+            },
+        )
+        self.assertIsNotNone(result)
+        label, _high_gain, close_gain, _max_drawdown = result or (0, 0, 0, 0)
+        self.assertEqual(label, 0)
+        self.assertAlmostEqual(close_gain, -5.0, places=4)
 
 
 if __name__ == "__main__":
