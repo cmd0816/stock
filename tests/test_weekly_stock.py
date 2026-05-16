@@ -180,6 +180,43 @@ class WeeklyStockTests(unittest.TestCase):
             self.assertEqual([row["run_id"] for row in runs], [second_run_id])
             self.assertEqual([row["run_id"] for row in selected], [second_run_id])
 
+    def test_stock_screen_job_uses_screen_date_klines_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = write_config(root)
+            (root / "screening.txt").write_text("测试条件", encoding="utf-8")
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                conn.execute(
+                    "INSERT INTO xuangu_batches VALUES ('b1', '2026-05-01T00:00:00Z', 'url', 'cond', 'file', 1, 2)"
+                )
+                insert_candidate(conn, "000001", "回放A", {"营业收入同比增长率": "20%", "净利润同比增长率": "20%"})
+                insert_candidate(conn, "000002", "回放B", {"营业收入同比增长率": "20%", "净利润同比增长率": "20%"})
+
+                # Screen date will be 2026-05-02. Before that date, both stocks have similar history.
+                for i in range(1, 32):
+                    insert_kline(conn, "000001", i, 10 + i * 0.1, volume=1000)
+                    insert_kline(conn, "000002", i, 10 + i * 0.1, volume=1000)
+                # Add large post-date jump only for 000002. It should not affect 2026-05-02 screening.
+                insert_kline(conn, "000002", 33, 30, volume=5000)
+                insert_kline(conn, "000002", 34, 35, volume=5000)
+                conn.commit()
+
+            run_id = stock_screen_job(
+                config_path,
+                DEFAULT_CONFIG | {"database": {"path": "stocks.db"}},
+                screen_date="2026-05-02",
+                xuangu_batch_id="b1",
+            )
+            with connect(root / "stocks.db") as conn:
+                rows = conn.execute(
+                    "SELECT code, selected_reason FROM weekly_selected_stocks WHERE run_id=? ORDER BY rank_no",
+                    (run_id,),
+                ).fetchall()
+            self.assertTrue(rows)
+            self.assertIn("最近交易日 2026-05-01", rows[0]["selected_reason"])
+
     def test_review_selected_stock_metrics(self) -> None:
         klines = [
             Kline("2026-05-01", 10, 10, 10.2, 9.8, 1000, 5, 0),

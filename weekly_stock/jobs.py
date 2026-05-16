@@ -77,7 +77,10 @@ def stock_screen_job(
             if deleted:
                 print(f"Deleted {deleted} existing weekly screen run(s) for {effective_screen_date}/{xuangu_batch_id}.")
 
-        klines_by_code = {c.code: db.load_klines(conn, c.code) for c in candidates}
+        klines_by_code = {
+            c.code: db.load_klines(conn, c.code, as_of_date=effective_screen_date)
+            for c in candidates
+        }
         ranked = rank_candidates(candidates, klines_by_code, config)
         top_n = int(config["screening"]["top_n"])
         min_score = float(config["screening"].get("min_score", 0))
@@ -98,7 +101,13 @@ def stock_screen_job(
         return run_id
 
 
-def weekly_review_job(config_path: Path, config: Dict[str, Any], review_date: Optional[str] = None, run_id: Optional[int] = None) -> int:
+def weekly_review_job(
+    config_path: Path,
+    config: Dict[str, Any],
+    review_date: Optional[str] = None,
+    run_id: Optional[int] = None,
+    replace_existing: bool = False,
+) -> int:
     root = project_root(config_path)
     db_path = root / config["database"]["path"]
     with db.connect(db_path) as conn:
@@ -118,6 +127,11 @@ def weekly_review_job(config_path: Path, config: Dict[str, Any], review_date: Op
                 conn=conn,
                 prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
             )
+
+        if replace_existing:
+            deleted = db.delete_review_for_run(conn, reviewed_run_id)
+            if deleted:
+                print(f"Deleted {deleted} existing review run(s) for run_id={reviewed_run_id}.")
 
         review_id = db.create_review_run(conn, reviewed_run_id, effective_review_date, config)
         results = [
@@ -236,6 +250,14 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
     previous = [k for k in klines if k.trade_date <= screen_date and k.close is not None]
     future = [k for k in klines if k.trade_date > screen_date and k.close is not None][:horizon]
     if not previous or not future:
+        last_trade_date = klines[-1].trade_date if klines else None
+        reasons = []
+        if not previous:
+            reasons.append("缺少选股日及之前的收盘K线")
+        if not future:
+            reasons.append("缺少选股日之后的K线")
+        if last_trade_date:
+            reasons.append(f"当前最新K线日期={last_trade_date}")
         return ReviewResult(
             code=selected_row["code"],
             name=selected_row["name"],
@@ -247,7 +269,7 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
             max_drawdown_pct=None,
             stop_loss_triggered=False,
             meets_expectation=False,
-            notes="K线不足，无法完整复盘",
+            notes="K线不足，无法完整复盘；" + "；".join(reasons),
         )
 
     base = previous[-1]

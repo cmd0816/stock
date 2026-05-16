@@ -16,6 +16,7 @@ from xuangu_to_sqlite import import_xlsx_to_sqlite
 from weekly_stock.config import load_config
 from weekly_stock import db as weekly_db
 from weekly_stock.jobs import ml_predict_job, stock_screen_job
+from weekly_stock.trading_calendar import align_to_last_trading_day
 
 
 UploadedFiles = Dict[str, Dict[str, Any]]
@@ -267,7 +268,11 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                 for r in conn.execute(
                     """
                     SELECT
-                        CASE WHEN meets_expectation = 1 THEN '成功' ELSE '失败' END AS result,
+                        CASE
+                            WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN '待复盘'
+                            WHEN meets_expectation = 1 THEN '成功'
+                            ELSE '失败'
+                        END AS result,
                         code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
                         CASE WHEN stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
                         CASE WHEN meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
@@ -278,8 +283,46 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                     """
                 ).fetchall()
             ]
+            latest_review_row = conn.execute(
+                """
+                SELECT review_id
+                FROM weekly_review_runs
+                ORDER BY review_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_review_row is not None:
+                latest_review_id = int(latest_review_row["review_id"] if isinstance(latest_review_row, sqlite3.Row) else latest_review_row[0])
+                summary_row = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_count,
+                        SUM(CASE WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
+                        SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
+                        SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count
+                    FROM weekly_review_results
+                    WHERE review_id = ?
+                    """,
+                    (latest_review_id,),
+                ).fetchone()
+                total_count = int((summary_row["total_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[0]) or 0)
+                pending_count = int((summary_row["pending_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[1]) or 0)
+                reviewed_count = int((summary_row["reviewed_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[2]) or 0)
+                success_count = int((summary_row["success_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[3]) or 0)
+                success_rate_pct = (success_count / reviewed_count * 100.0) if reviewed_count else 0.0
+                out["weekly_review_summary"] = {
+                    "review_id": latest_review_id,
+                    "total_count": total_count,
+                    "pending_count": pending_count,
+                    "reviewed_count": reviewed_count,
+                    "success_count": success_count,
+                    "success_rate_pct": success_rate_pct,
+                }
+            else:
+                out["weekly_review_summary"] = None
         else:
             out["weekly_reviews"] = []
+            out["weekly_review_summary"] = None
 
     return out
 
@@ -357,6 +400,101 @@ def fetch_top_selected_stocks(db_path: Path, run_id: int | None = None) -> tuple
                 (int(run_row["run_id"]),),
             ).fetchall()
     return dict(run_row), [dict(r) for r in rows]
+
+
+def fetch_weekly_review_history(
+    db_path: Path,
+    *,
+    review_id: int | None = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "runs": [],
+        "selected_review_id": None,
+        "selected_summary": None,
+        "selected_results": [],
+    }
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if not table_exists(conn, "weekly_review_runs") or not table_exists(conn, "weekly_review_results"):
+            return out
+
+        rows = conn.execute(
+            """
+            SELECT
+                wr.review_id,
+                wr.reviewed_run_id,
+                wr.review_date,
+                wr.created_at_utc,
+                r.screen_date,
+                r.xuangu_batch_id,
+                COUNT(rr.id) AS total_count,
+                SUM(CASE WHEN rr.review_start_date IS NULL OR rr.notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
+                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' AND rr.meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count
+            FROM weekly_review_runs wr
+            LEFT JOIN weekly_review_results rr
+                ON rr.review_id = wr.review_id
+            LEFT JOIN weekly_screen_runs r
+                ON r.run_id = wr.reviewed_run_id
+            GROUP BY wr.review_id
+            ORDER BY wr.review_id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+
+        runs: List[Dict[str, Any]] = []
+        for row in rows:
+            total_count = int((row["total_count"] or 0))
+            pending_count = int((row["pending_count"] or 0))
+            reviewed_count = int((row["reviewed_count"] or 0))
+            success_count = int((row["success_count"] or 0))
+            success_rate_pct = (success_count / reviewed_count * 100.0) if reviewed_count else 0.0
+            runs.append(
+                {
+                    "review_id": int(row["review_id"]),
+                    "reviewed_run_id": int(row["reviewed_run_id"]),
+                    "review_date": str(row["review_date"] or ""),
+                    "created_at_utc": str(row["created_at_utc"] or ""),
+                    "screen_date": str(row["screen_date"] or ""),
+                    "xuangu_batch_id": str(row["xuangu_batch_id"] or ""),
+                    "total_count": total_count,
+                    "pending_count": pending_count,
+                    "reviewed_count": reviewed_count,
+                    "success_count": success_count,
+                    "success_rate_pct": success_rate_pct,
+                }
+            )
+        out["runs"] = runs
+        if not runs:
+            return out
+
+        valid_ids = {int(item["review_id"]) for item in runs}
+        selected_review_id = review_id if review_id in valid_ids else int(runs[0]["review_id"])
+        out["selected_review_id"] = selected_review_id
+        out["selected_summary"] = next((item for item in runs if int(item["review_id"]) == selected_review_id), None)
+
+        detail_rows = conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN '待复盘'
+                    WHEN meets_expectation = 1 THEN '成功'
+                    ELSE '失败'
+                END AS result,
+                code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
+                CASE WHEN stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
+                CASE WHEN meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
+                notes
+            FROM weekly_review_results
+            WHERE review_id = ?
+            ORDER BY id DESC
+            """,
+            (selected_review_id,),
+        ).fetchall()
+        out["selected_results"] = [dict(row) for row in detail_rows]
+    return out
 
 
 def build_kline_svg(rows_desc: List[Dict[str, Any]]) -> str:
@@ -584,10 +722,6 @@ def render_weekly_screen_form(selected_batch_id: str, default_top_n: int = 5) ->
         <form method="post" action="/actions/run_weekly_screen">
           <div class="form-grid weekly-form-grid">
             <label>
-              <span>选股批次</span>
-              <input name="xuangu_batch_id" value="{html.escape(selected_batch_id)}" placeholder="例如 20260508" required />
-            </label>
-            <label>
               <span>选股日期</span>
               <input name="screen_date" value="{html.escape(today)}" placeholder="YYYY-MM-DD" />
             </label>
@@ -597,20 +731,66 @@ def render_weekly_screen_form(selected_batch_id: str, default_top_n: int = 5) ->
             </label>
           </div>
           <div class="form-actions">
-            <span class="form-hint">根据当前批次候选股和已下载 K 线打分排序，并自动生成 ML 概率。</span>
+            <span class="form-hint">系统会将“选股日期”自动对齐到最近交易日，并用该日期生成固定批次（YYYYMMDD）；同一天多次执行会复用同一批次。当前导入批次：{html.escape(selected_batch_id or '-')}。</span>
             <button type="submit">生成下周 Top 股票（含 ML）</button>
           </div>
         </form>
         <div class="form-actions top-link-actions">
           <span class="form-hint">集中查看最后一次 Top 股票的日线形态。</span>
           <a class="button-link" href="/top">打开 Top 日线图</a>
+          <a class="button-link" href="/reviews">查看复盘历史</a>
         </div>
-        <form method="post" action="/actions/clear_weekly_top" onsubmit="return confirm('确认清空 Top 股票列表和关联复盘结果吗？');">
+        <form method="post" action="/actions/clear_weekly_top" onsubmit="return confirm('确认清空 Top 股票列表吗？复盘结果会保留。');">
           <div class="form-actions clear-actions">
-            <span class="form-hint">清空当前所有 Top 股票、候选打分和关联复盘结果。</span>
+            <span class="form-hint">清空当前所有 Top 股票和候选打分（保留复盘结果）。</span>
             <button class="danger-btn" type="submit">清空 Top 列表</button>
           </div>
         </form>
+      </div>
+    """
+
+
+def render_review_runs_table(rows: List[Dict[str, Any]], selected_review_id: int | None) -> str:
+    if not rows:
+        return "<div class='empty'>还没有复盘历史记录。</div>"
+    body: List[str] = []
+    for row in rows:
+        rid = int(row.get("review_id") or 0)
+        total_count = int(row.get("total_count") or 0)
+        pending_count = int(row.get("pending_count") or 0)
+        reviewed_count = int(row.get("reviewed_count") or 0)
+        success_count = int(row.get("success_count") or 0)
+        success_rate_pct = float(row.get("success_rate_pct") or 0.0)
+        active = " class='active-row'" if selected_review_id is not None and rid == selected_review_id else ""
+        body.append(
+            "<tr"
+            + active
+            + ">"
+            + f"<td>{rid}</td>"
+            + f"<td>{html.escape(str(row.get('review_date') or '-'))}</td>"
+            + f"<td>{html.escape(str(row.get('screen_date') or '-'))}</td>"
+            + f"<td>{html.escape(str(row.get('xuangu_batch_id') or '-'))}</td>"
+            + f"<td>{html.escape(str(row.get('reviewed_run_id') or '-'))}</td>"
+            + f"<td>{total_count}</td>"
+            + f"<td>{pending_count}</td>"
+            + f"<td>{reviewed_count}</td>"
+            + f"<td>{success_count}</td>"
+            + f"<td>{success_rate_pct:.1f}%</td>"
+            + f"<td>{html.escape(str(row.get('created_at_utc') or '-'))}</td>"
+            + f"<td><a href='/reviews?review_id={rid}'>查看</a></td>"
+            + "</tr>"
+        )
+    return f"""
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>复盘ID</th><th>复盘日期</th><th>选股日期</th><th>批次</th><th>Run ID</th>
+              <th>总数</th><th>待复盘</th><th>完成复盘</th><th>成功数</th><th>成功率</th><th>创建时间 UTC</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(body)}</tbody>
+        </table>
       </div>
     """
 
@@ -698,21 +878,16 @@ def build_checks_html(
     weekly_screen_form = render_weekly_screen_form(selected_batch_id, default_top_n=default_top_n)
     latest_results = render_xuangu_result_table(checks.get("latest_xuangu_results", []), selected_batch_id)
     weekly_selected = render_weekly_selected_table(checks.get("weekly_selected", []))
-    weekly_reviews = render_simple_table(
-        checks.get("weekly_reviews", []),
-        [
-            ("result", "结果"),
-            ("code", "代码"),
-            ("name", "名称"),
-            ("highest_gain_pct", "最高涨幅%"),
-            ("close_gain_pct", "收盘涨幅%"),
-            ("max_drawdown_pct", "最大回撤%"),
-            ("stop_loss_triggered", "止损"),
-            ("meets_expectation", "符合预期"),
-            ("notes", "成功/失败原因"),
-        ],
-        "还没有复盘记录。",
-    )
+    weekly_review_summary = checks.get("weekly_review_summary") or {}
+    review_summary_html = ""
+    if weekly_review_summary:
+        review_summary_html = (
+            "<div class='notice'>"
+            f"最近一次复盘成功率：{float(weekly_review_summary.get('success_rate_pct') or 0.0):.1f}% "
+            f"（成功 {int(weekly_review_summary.get('success_count') or 0)} / 完成复盘 {int(weekly_review_summary.get('reviewed_count') or 0)}；"
+            f"待复盘 {int(weekly_review_summary.get('pending_count') or 0)} / 总数 {int(weekly_review_summary.get('total_count') or 0)}）"
+            "</div>"
+        )
     msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message and not include_import_sections else ""
     err_html = f"<div class='notice error'>{html.escape(error)}</div>" if error and not include_import_sections else ""
     meta = (
@@ -727,7 +902,7 @@ def build_checks_html(
         f"<section class='card'><h3>当前批次股票明细（批次 {html.escape(selected_batch_id or '-')}）</h3>{latest_results}</section>"
         if include_import_sections
         else f"<section class='card'><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{weekly_screen_form}{weekly_selected}<details class='candidate-details'><summary>查看本批次候选股票列表</summary>{latest_results}</details></section>"
-             f"<section class='card'><h3>最近复盘结果</h3>{weekly_reviews}</section>"
+             f"<section class='card'><h3>复盘结果</h3>{review_summary_html}<div class='form-actions'><span class='form-hint'>复盘历史已独立到新页面，可查看每次复盘成功率和明细。</span><a class='button-link' href='/reviews'>打开复盘历史页面</a></div></section>"
     )
 
     return f"""<!doctype html>
@@ -1056,6 +1231,7 @@ def build_checks_html(
       <div>
         <a href="/imports">导入页面</a>
         <a href="/screening">选股页面</a>
+        <a href="/reviews">复盘页面</a>
         <a href="/daily">日 K 线</a>
         <a href="/top">Top 日线图</a>
         <a href="/api/screening">JSON 接口</a>
@@ -1066,6 +1242,189 @@ def build_checks_html(
     {err_html}
     <div class="grid">
       {page_sections}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def build_reviews_html(review_data: Dict[str, Any], message: str = "", error: str = "") -> str:
+    runs = review_data.get("runs", [])
+    selected_review_id = review_data.get("selected_review_id")
+    selected_summary = review_data.get("selected_summary") or {}
+    selected_results = review_data.get("selected_results", [])
+    runs_table = render_review_runs_table(runs, selected_review_id)
+    details_table = render_simple_table(
+        selected_results,
+        [
+            ("result", "结果"),
+            ("code", "代码"),
+            ("name", "名称"),
+            ("highest_gain_pct", "最高涨幅%"),
+            ("close_gain_pct", "收盘涨幅%"),
+            ("max_drawdown_pct", "最大回撤%"),
+            ("stop_loss_triggered", "止损"),
+            ("meets_expectation", "符合预期"),
+            ("notes", "成功/失败原因"),
+        ],
+        "该复盘暂无结果。",
+    )
+    summary_html = "<div class='empty'>暂无复盘摘要。</div>"
+    if selected_summary:
+        summary_html = (
+            "<div class='notice'>"
+            f"当前复盘ID：{int(selected_summary.get('review_id') or 0)}，"
+            f"成功率：{float(selected_summary.get('success_rate_pct') or 0.0):.1f}% "
+            f"（成功 {int(selected_summary.get('success_count') or 0)} / 完成复盘 {int(selected_summary.get('reviewed_count') or 0)}；"
+            f"待复盘 {int(selected_summary.get('pending_count') or 0)} / 总数 {int(selected_summary.get('total_count') or 0)}）"
+            "</div>"
+        )
+    msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message else ""
+    err_html = f"<div class='notice error'>{html.escape(error)}</div>" if error else ""
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>复盘历史</title>
+  <style>
+    :root {{
+      --bg: #f3f4f6;
+      --fg: #111827;
+      --card: #ffffff;
+      --line: #e5e7eb;
+      --muted: #64748b;
+    }}
+    body {{
+      margin: 0;
+      background: linear-gradient(180deg, #f8fafc, var(--bg));
+      color: var(--fg);
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }}
+    .wrap {{
+      max-width: 1360px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }}
+    .head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }}
+    .head a {{
+      margin-left: 10px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 14px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: 0 8px 20px rgba(15,23,42,0.05);
+      overflow: hidden;
+    }}
+    .card h3 {{
+      margin: 0;
+      padding: 12px 14px;
+      font-size: 15px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+    }}
+    .table-wrap {{
+      overflow: auto;
+    }}
+    table {{
+      width: 100%;
+      min-width: 820px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      padding: 8px 10px;
+      vertical-align: top;
+    }}
+    th {{
+      background: #f9fafb;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }}
+    td a {{
+      color: #2563eb;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    td a:hover {{
+      color: #ea580c;
+      text-decoration: underline;
+    }}
+    .active-row {{
+      background: #ecfeff;
+    }}
+    .empty {{
+      padding: 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .notice {{
+      margin: 12px;
+      padding: 10px 12px;
+      border: 1px solid #fde68a;
+      background: #fffbeb;
+      color: #92400e;
+      border-radius: 8px;
+      font-size: 13px;
+    }}
+    .notice.ok {{
+      border-color: #bbf7d0;
+      background: #f0fdf4;
+      color: #166534;
+    }}
+    .notice.error {{
+      border-color: #fecaca;
+      background: #fef2f2;
+      color: #991b1b;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <h2>复盘历史页面</h2>
+      <div>
+        <a href="/imports">导入页面</a>
+        <a href="/screening">选股页面</a>
+        <a href="/reviews">复盘页面</a>
+        <a href="/daily">日 K 线</a>
+        <a href="/top">Top 日线图</a>
+      </div>
+    </div>
+    <div class="meta">可点击历史复盘记录查看明细；同一 Run 支持多次复盘追加。</div>
+    {msg_html}
+    {err_html}
+    <div class="grid">
+      <section class="card">
+        <h3>复盘历史列表</h3>
+        {runs_table}
+      </section>
+      <section class="card">
+        <h3>复盘明细</h3>
+        {summary_html}
+        {details_table}
+      </section>
     </div>
   </div>
 </body>
@@ -1352,6 +1711,7 @@ def build_daily_html(
           <h2>{html.escape(page_heading)}{html.escape(title_suffix)}</h2>
           <div>
             <a href="/screening">选股页面</a>
+            <a href="/reviews">复盘页面</a>
             <a href="/top">Top 日线图</a>
             <a href="/api/daily{('?code=' + html.escape(code)) if code else ''}">JSON 接口</a>
             <a href="/api/stocks">股票列表接口</a>
@@ -1837,18 +2197,28 @@ def make_handler(db_path: Path, limit: int):
                     top_n_default = int(config.get("screening", {}).get("top_n", 5))
                     top_n = int(form_value(form, "top_n", str(top_n_default)) or str(top_n_default))
                     config["screening"]["top_n"] = max(1, min(20, top_n))
-                    xuangu_batch_id = form_value(form, "xuangu_batch_id")
-                    if not xuangu_batch_id:
-                        raise ValueError("请先选择或填写选股批次。")
                     screen_date = form_value(form, "screen_date") or datetime.now().strftime("%Y-%m-%d")
+                    calendar_cfg = config.get("calendar", {})
+                    effective_screen_date = screen_date
+                    if calendar_cfg.get("align_to_china_trading_day", True):
+                        with weekly_db.connect(db_path) as conn:
+                            effective_screen_date = align_to_last_trading_day(
+                                screen_date,
+                                conn=conn,
+                                prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
+                            )
+                    xuangu_batch_id = effective_screen_date.replace("-", "")
                     run_id = stock_screen_job(
                         config_path=config_path,
                         config=config,
-                        screen_date=screen_date,
+                        screen_date=effective_screen_date,
                         xuangu_batch_id=xuangu_batch_id,
                         replace_existing=True,
                     )
-                    msg_text = f"已生成下周 Top {config['screening']['top_n']} 股票：run_id={run_id}"
+                    msg_text = (
+                        f"已生成下周 Top {config['screening']['top_n']} 股票：run_id={run_id}；"
+                        f"选股日期={effective_screen_date}；批次={xuangu_batch_id}"
+                    )
                     try:
                         model_run_id = ml_predict_job(config_path=config_path, config=config, run_id=run_id)
                         msg_text += f"；已生成 ML 预测：model_run_id={model_run_id}"
@@ -1953,6 +2323,18 @@ def make_handler(db_path: Path, limit: int):
                 self.wfile.write(payload)
                 return
 
+            if parsed.path == "/api/reviews":
+                review_id_text = (query.get("review_id", [""])[0] or "").strip()
+                review_id = int(review_id_text) if review_id_text.isdigit() else None
+                data = fetch_weekly_review_history(db_path, review_id=review_id)
+                payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
             if parsed.path == "/api/top":
                 run_id_text = (query.get("run_id", [""])[0] or "").strip()
                 run_id = int(run_id_text) if run_id_text.isdigit() else None
@@ -1977,6 +2359,18 @@ def make_handler(db_path: Path, limit: int):
             if parsed.path in {"/checks", "/screening"}:
                 checks = fetch_dashboard_checks(db_path, batch_id=selected_batch_id)
                 body = build_checks_html(checks, message=message, error=error).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if parsed.path in {"/reviews", "/review"}:
+                review_id_text = (query.get("review_id", [""])[0] or "").strip()
+                review_id = int(review_id_text) if review_id_text.isdigit() else None
+                review_data = fetch_weekly_review_history(db_path, review_id=review_id)
+                body = build_reviews_html(review_data, message=message, error=error).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

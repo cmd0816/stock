@@ -178,6 +178,7 @@ def main() -> None:
     review = sub.add_parser("review", help="Run weekly_review_job")
     review.add_argument("--date", default=None, help="Review date, YYYY-MM-DD")
     review.add_argument("--run-id", type=int, default=None, help="Review a specific weekly screen run")
+    review.add_argument("--replace-existing", action="store_true", help="Replace existing review run for the same run_id")
 
     predict = sub.add_parser("predict", help="Run ML prediction/re-ranking for selected stocks")
     predict.add_argument("--run-id", type=int, default=None, help="Predict a specific weekly screen run")
@@ -206,7 +207,13 @@ def main() -> None:
         )
         print(f"stock_screen_job completed: run_id={run_id}")
     elif args.command == "review":
-        review_id = weekly_review_job(config_path, config, review_date=args.date, run_id=args.run_id)
+        review_id = weekly_review_job(
+            config_path,
+            config,
+            review_date=args.date,
+            run_id=args.run_id,
+            replace_existing=args.replace_existing,
+        )
         print(f"weekly_review_job completed: review_id={review_id}")
     elif args.command == "predict":
         model_run_id = ml_predict_job(config_path, config, run_id=args.run_id)

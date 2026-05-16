@@ -71,8 +71,7 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             reviewed_run_id INTEGER NOT NULL,
             review_date TEXT NOT NULL,
             config_json TEXT NOT NULL,
-            created_at_utc TEXT NOT NULL,
-            UNIQUE(reviewed_run_id)
+            created_at_utc TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS weekly_review_results (
@@ -147,8 +146,39 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_weekly_ml_predictions_run ON weekly_ml_predictions(source_run_id);
         """
     )
+    _migrate_weekly_review_runs_to_append_mode(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_review_runs_run_id ON weekly_review_runs(reviewed_run_id)")
     conn.commit()
 
+
+
+def _migrate_weekly_review_runs_to_append_mode(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='weekly_review_runs'"
+    ).fetchone()
+    if row is None:
+        return
+    sql = str(row[0] or "").upper()
+    if "UNIQUE(REVIEWED_RUN_ID)" not in sql:
+        return
+
+    conn.execute("DROP INDEX IF EXISTS idx_weekly_review_runs_run_id")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS weekly_review_runs_new ("
+        "review_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "reviewed_run_id INTEGER NOT NULL,"
+        "review_date TEXT NOT NULL,"
+        "config_json TEXT NOT NULL,"
+        "created_at_utc TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT INTO weekly_review_runs_new (review_id, reviewed_run_id, review_date, config_json, created_at_utc) "
+        "SELECT review_id, reviewed_run_id, review_date, config_json, created_at_utc "
+        "FROM weekly_review_runs ORDER BY review_id"
+    )
+    conn.execute("DROP TABLE weekly_review_runs")
+    conn.execute("ALTER TABLE weekly_review_runs_new RENAME TO weekly_review_runs")
 
 def latest_xuangu_batch_id(conn: sqlite3.Connection) -> Optional[str]:
     row = conn.execute(
@@ -185,17 +215,24 @@ def load_xuangu_candidates(conn: sqlite3.Connection, batch_id: Optional[str] = N
     return candidates
 
 
-def load_klines(conn: sqlite3.Connection, code: str, limit: int = 260) -> List[Kline]:
-    rows = conn.execute(
-        """
+def load_klines(
+    conn: sqlite3.Connection,
+    code: str,
+    limit: int = 260,
+    as_of_date: Optional[str] = None,
+) -> List[Kline]:
+    params: List[Any] = [code]
+    sql = """
         SELECT trade_date, open, close, high, low, volume, turnover_rate, change_percent
         FROM eastmoney_stock_daily_klines
         WHERE code = ?
-        ORDER BY trade_date DESC
-        LIMIT ?
-        """,
-        (code, limit),
-    ).fetchall()
+    """
+    if as_of_date:
+        sql += " AND trade_date <= ?"
+        params.append(as_of_date)
+    sql += " ORDER BY trade_date DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [
         Kline(
             trade_date=row["trade_date"],
@@ -299,14 +336,15 @@ def delete_screen_runs(conn: sqlite3.Connection, screen_date: str, xuangu_batch_
     return len(run_ids)
 
 
-def delete_all_screen_runs(conn: sqlite3.Connection) -> int:
+def delete_all_screen_runs(conn: sqlite3.Connection, *, preserve_review_results: bool = True) -> int:
     rows = conn.execute("SELECT run_id FROM weekly_screen_runs").fetchall()
     run_ids = [int(row["run_id"]) for row in rows]
     if not run_ids:
         return 0
 
-    conn.execute("DELETE FROM weekly_review_results")
-    conn.execute("DELETE FROM weekly_review_runs")
+    if not preserve_review_results:
+        conn.execute("DELETE FROM weekly_review_results")
+        conn.execute("DELETE FROM weekly_review_runs")
     conn.execute("DELETE FROM weekly_ml_training_samples")
     conn.execute("DELETE FROM weekly_ml_predictions")
     conn.execute("DELETE FROM weekly_ml_model_runs")
@@ -609,6 +647,29 @@ def ml_predictions_for_run(conn: sqlite3.Connection, source_run_id: int) -> List
         (source_run_id,),
     ).fetchall()
 
+
+
+
+def delete_review_for_run(conn: sqlite3.Connection, reviewed_run_id: int) -> int:
+    rows = conn.execute(
+        "SELECT review_id FROM weekly_review_runs WHERE reviewed_run_id = ?",
+        (reviewed_run_id,),
+    ).fetchall()
+    review_ids = [int(row[0]) for row in rows]
+    if not review_ids:
+        return 0
+
+    placeholders = ",".join("?" * len(review_ids))
+    conn.execute(
+        f"DELETE FROM weekly_review_results WHERE review_id IN ({placeholders})",
+        review_ids,
+    )
+    conn.execute(
+        f"DELETE FROM weekly_review_runs WHERE review_id IN ({placeholders})",
+        review_ids,
+    )
+    conn.commit()
+    return len(review_ids)
 
 def create_review_run(conn: sqlite3.Connection, reviewed_run_id: int, review_date: str, config: Dict[str, Any]) -> int:
     cur = conn.execute(
