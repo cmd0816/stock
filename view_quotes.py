@@ -2470,7 +2470,7 @@ def make_handler(db_path: Path, limit: int):
 
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"Not found")
+            self._safe_write(b"Not found")
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -2487,7 +2487,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
                 return
 
             if parsed.path == "/api/stocks":
@@ -2497,7 +2497,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
                 return
 
             if parsed.path == "/api/daily":
@@ -2507,7 +2507,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
                 return
 
             if parsed.path in {"/api/checks", "/api/screening"}:
@@ -2517,7 +2517,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
                 return
 
             if parsed.path == "/api/reviews":
@@ -2529,7 +2529,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
                 return
 
             if parsed.path == "/api/top":
@@ -2557,7 +2557,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self._safe_write(payload)
                 return
 
             if parsed.path == "/":
@@ -2573,7 +2573,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._safe_write(body)
                 return
 
             if parsed.path in {"/reviews", "/review"}:
@@ -2585,7 +2585,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._safe_write(body)
                 return
 
             if parsed.path in {"/imports", "/xuangu"}:
@@ -2600,7 +2600,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._safe_write(body)
                 return
 
             if parsed.path == "/top":
@@ -2684,7 +2684,7 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._safe_write(body)
                 return
 
             if parsed.path == "/daily":
@@ -2696,12 +2696,19 @@ def make_handler(db_path: Path, limit: int):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._safe_write(body)
                 return
 
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"Not found")
+            self._safe_write(b"Not found")
+
+        def _safe_write(self, payload: bytes) -> None:
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                # Client closed the connection before receiving the full response.
+                return
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
