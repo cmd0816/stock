@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from . import db
 from .models import Kline, ReviewResult
-from .ml import backtest_models, build_training_samples, features_at, train_model
+from .ml import TrainingSample, backtest_models, build_training_samples, features_at, train_model
 from .scoring import rank_candidates
 from .trading_calendar import align_to_last_trading_day
 
@@ -18,6 +18,47 @@ def project_root(config_path: Path) -> Path:
     if resolved.parent.name == "config":
         return resolved.parent.parent
     return resolved.parent
+
+
+def apply_review_feedback_labels(
+    samples: List[TrainingSample],
+    feedback_labels: Dict[tuple[str, str], int],
+    weight: int = 1,
+) -> tuple[List[TrainingSample], Dict[str, int]]:
+    if not samples or not feedback_labels:
+        return samples, {"matched": 0, "relabeled": 0, "extra_weighted": 0}
+
+    use_weight = max(1, int(weight))
+    merged: List[TrainingSample] = []
+    matched = 0
+    relabeled = 0
+    extra_weighted = 0
+    for sample in samples:
+        key = (str(sample.code), str(sample.trade_date))
+        label = feedback_labels.get(key)
+        if label is None:
+            merged.append(sample)
+            continue
+
+        matched += 1
+        normalized_label = 1 if int(label) else 0
+        if int(sample.label) != normalized_label:
+            relabeled += 1
+        updated = TrainingSample(
+            code=sample.code,
+            trade_date=sample.trade_date,
+            features=dict(sample.features),
+            label=normalized_label,
+            future_high_gain_pct=sample.future_high_gain_pct,
+            future_close_gain_pct=sample.future_close_gain_pct,
+            future_max_drawdown_pct=sample.future_max_drawdown_pct,
+        )
+        merged.append(updated)
+        if use_weight > 1:
+            for _ in range(use_weight - 1):
+                merged.append(updated)
+            extra_weighted += use_weight - 1
+    return merged, {"matched": matched, "relabeled": relabeled, "extra_weighted": extra_weighted}
 
 
 def run_xuangu_download(config_path: Path, config: Dict[str, Any]) -> None:
@@ -164,6 +205,18 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             for code in train_codes
         }
         samples = build_training_samples(klines_by_code, ml_cfg)
+        if ml_cfg.get("use_review_feedback_labels", False):
+            recent_runs = int(ml_cfg.get("review_feedback_recent_runs", 0))
+            feedback = db.review_feedback_labels(conn, recent_runs=recent_runs)
+            feedback_weight = int(ml_cfg.get("review_feedback_weight", 1))
+            samples, feedback_stats = apply_review_feedback_labels(samples, feedback, weight=feedback_weight)
+            if feedback_stats["matched"] > 0:
+                print(
+                    "Applied review feedback labels: "
+                    f"matched={feedback_stats['matched']} "
+                    f"relabeled={feedback_stats['relabeled']} "
+                    f"extra_weighted={feedback_stats['extra_weighted']}"
+                )
         min_samples = int(ml_cfg.get("min_train_samples", 30))
         if len(samples) < min_samples:
             raise RuntimeError(

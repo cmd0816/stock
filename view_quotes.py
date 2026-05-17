@@ -6,6 +6,7 @@ import html
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,25 +21,47 @@ from weekly_stock.trading_calendar import align_to_last_trading_day
 
 
 UploadedFiles = Dict[str, Dict[str, Any]]
+TOP_RESULT_CACHE_TTL_SECONDS = 6 * 60 * 60
+_top_result_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def sqlite_connect_with_retry(db_path: Path, retries: int = 3, sleep_seconds: float = 0.2) -> sqlite3.Connection:
+    last_error: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=12)
+            conn.execute("PRAGMA busy_timeout = 12000")
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if attempt >= retries - 1:
+                raise
+            time.sleep(sleep_seconds * (attempt + 1))
+    if last_error:
+        raise last_error
+    raise sqlite3.OperationalError(f"failed to open sqlite db: {db_path}")
 
 
 def fetch_rows(db_path: Path, limit: int) -> List[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT
-                id, code, name, secid, price, open, high, low,
-                prev_close, volume, turnover, change_amount, change_percent,
-                turnover_rate, total_market_value, circulating_market_value,
-                pe_ttm, pb, fetched_at_utc
-            FROM eastmoney_stock_quotes
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    try:
+        with sqlite_connect_with_retry(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    id, code, name, secid, price, open, high, low,
+                    prev_close, volume, turnover, change_amount, change_percent,
+                    turnover_rate, total_market_value, circulating_market_value,
+                    pe_ttm, pb, fetched_at_utc
+                FROM eastmoney_stock_quotes
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
 
 
 def fetch_daily_rows(db_path: Path, limit: int, code: str = "") -> List[Dict[str, Any]]:
@@ -56,26 +79,30 @@ def fetch_daily_rows(db_path: Path, limit: int, code: str = "") -> List[Dict[str
     sql += " ORDER BY trade_date DESC LIMIT ? "
     params.append(limit)
 
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
+    try:
+        with sqlite_connect_with_retry(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
 
 
 def fetch_stock_list(db_path: Path) -> List[Dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            WITH latest AS (
-                SELECT
-                    code,
-                    COALESCE(MAX(name), '') AS name,
-                    MAX(trade_date) AS last_date,
-                    COUNT(*) AS day_count
-                FROM eastmoney_stock_daily_klines
-                GROUP BY code
-            )
+    try:
+        with sqlite_connect_with_retry(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                WITH latest AS (
+                    SELECT
+                        code,
+                        COALESCE(MAX(name), '') AS name,
+                        MAX(trade_date) AS last_date,
+                        COUNT(*) AS day_count
+                    FROM eastmoney_stock_daily_klines
+                    GROUP BY code
+                )
             SELECT
                 l.code,
                 l.name,
@@ -86,10 +113,15 @@ def fetch_stock_list(db_path: Path) -> List[Dict[str, Any]]:
             FROM latest l
             LEFT JOIN eastmoney_stock_daily_klines k
                 ON k.code = l.code AND k.trade_date = l.last_date
-            ORDER BY l.code
+            ORDER BY
+                CASE WHEN k.change_percent IS NULL THEN 1 ELSE 0 END,
+                k.change_percent DESC,
+                l.code
             """
-        ).fetchall()
-    return [dict(r) for r in rows]
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
 
 
 def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -101,7 +133,7 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def delete_xuangu_batch(db_path: Path, batch_id: str) -> int:
-    with sqlite3.connect(db_path) as conn:
+    with sqlite_connect_with_retry(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         deleted_results = conn.execute(
             "DELETE FROM xuangu_results WHERE batch_id = ?",
@@ -158,6 +190,38 @@ def form_value(form: Dict[str, List[str]], name: str, default: str = "") -> str:
     return (form.get(name, [default])[0] or default).strip()
 
 
+def normalize_top_sort_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    return "rule" if mode == "rule" else "ml"
+
+
+def cache_top_result(sort_mode: str, run: Dict[str, Any], rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    mode = normalize_top_sort_mode(sort_mode)
+    _top_result_cache[mode] = {
+        "cached_at": time.time(),
+        "run": dict(run or {}),
+        "rows": [dict(r) for r in rows],
+    }
+
+
+def get_cached_top_result(sort_mode: str) -> tuple[Dict[str, Any], List[Dict[str, Any]]] | None:
+    mode = normalize_top_sort_mode(sort_mode)
+    item = _top_result_cache.get(mode)
+    if not item:
+        return None
+    cached_at = float(item.get("cached_at") or 0)
+    if cached_at <= 0 or (time.time() - cached_at) > TOP_RESULT_CACHE_TTL_SECONDS:
+        _top_result_cache.pop(mode, None)
+        return None
+    run = dict(item.get("run") or {})
+    rows = [dict(r) for r in (item.get("rows") or [])]
+    if not rows:
+        return None
+    return run, rows
+
+
 def save_uploaded_xlsx(base_dir: Path, upload: Dict[str, Any], batch_id: str) -> Path:
     content = upload.get("content") or b""
     if not content:
@@ -177,11 +241,12 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
         screening_top_n = int(cfg.get("screening", {}).get("top_n", 5))
     except Exception:
         screening_top_n = 5
-    screening_top_n = max(1, min(20, screening_top_n))
+    screening_top_n = max(1, min(50, screening_top_n))
 
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        out: Dict[str, Any] = {"screening_top_n": screening_top_n}
+    try:
+        with sqlite_connect_with_retry(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            out: Dict[str, Any] = {"screening_top_n": screening_top_n}
 
         if table_exists(conn, "eastmoney_stock_daily_klines"):
             out["kline_coverage"] = [
@@ -324,82 +389,112 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
             out["weekly_reviews"] = []
             out["weekly_review_summary"] = None
 
-    return out
+        return out
+    except sqlite3.OperationalError:
+        return {
+            "screening_top_n": screening_top_n,
+            "selected_xuangu_batch_id": "",
+            "latest_xuangu_results": [],
+            "weekly_selected": [],
+            "weekly_reviews": [],
+            "weekly_review_summary": None,
+            "xuangu_batches": [],
+            "kline_coverage": [],
+        }
 
 
-def fetch_top_selected_stocks(db_path: Path, run_id: int | None = None) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        empty_run: Dict[str, Any] = {}
-        if not table_exists(conn, "weekly_screen_runs") or not table_exists(conn, "weekly_selected_stocks"):
-            return empty_run, []
+def fetch_top_selected_stocks(
+    db_path: Path,
+    run_id: int | None = None,
+    sort_mode: str = "ml",
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    sort_mode = normalize_top_sort_mode(sort_mode)
+    for attempt in range(3):
+        try:
+            with sqlite_connect_with_retry(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                empty_run: Dict[str, Any] = {}
+                if not table_exists(conn, "weekly_screen_runs") or not table_exists(conn, "weekly_selected_stocks"):
+                    return empty_run, []
 
-        run_row = None
-        if run_id is not None:
-            run_row = conn.execute(
-                """
-                SELECT run_id, screen_date, xuangu_batch_id, selected_count, created_at_utc
-                FROM weekly_screen_runs
-                WHERE run_id = ?
-                """,
-                (run_id,),
-            ).fetchone()
+                run_row = None
+                if run_id is not None:
+                    run_row = conn.execute(
+                        """
+                        SELECT run_id, screen_date, xuangu_batch_id, selected_count, created_at_utc
+                        FROM weekly_screen_runs
+                        WHERE run_id = ?
+                        """,
+                        (run_id,),
+                    ).fetchone()
 
-        if run_row is None:
-            run_row = conn.execute(
-                """
-                SELECT
-                    r.run_id,
-                    r.screen_date,
-                    r.xuangu_batch_id,
-                    r.selected_count,
-                    r.created_at_utc
-                FROM weekly_screen_runs r
-                WHERE EXISTS (
-                    SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id
-                )
-                ORDER BY r.screen_date DESC, r.run_id DESC
-                LIMIT 1
-                """
-            ).fetchone()
+                if run_row is None:
+                    run_row = conn.execute(
+                        """
+                        SELECT
+                            r.run_id,
+                            r.screen_date,
+                            r.xuangu_batch_id,
+                            r.selected_count,
+                            r.created_at_utc
+                        FROM weekly_screen_runs r
+                        WHERE EXISTS (
+                            SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id
+                        )
+                        ORDER BY r.screen_date DESC, r.run_id DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
 
-        if run_row is None:
-            return empty_run, []
+                if run_row is None:
+                    return empty_run, []
 
-        if table_exists(conn, "weekly_ml_predictions"):
-            rows = conn.execute(
-                """
-                SELECT
-                    s.id, s.run_id, s.screen_date, s.code, s.name, s.rank_no,
-                    s.total_score, s.selected_reason, s.status, s.created_at_utc,
-                    p.probability_up AS ml_probability_up,
-                    p.predicted_score AS ml_predicted_score,
-                    p.reason AS ml_reason
-                FROM weekly_selected_stocks s
-                LEFT JOIN weekly_ml_predictions p
-                    ON p.source_run_id = s.run_id AND p.code = s.code
-                WHERE s.run_id = ?
-                ORDER BY
-                    CASE WHEN p.predicted_score IS NULL THEN 1 ELSE 0 END,
-                    p.predicted_score DESC,
-                    s.rank_no,
-                    s.id
-                """,
-                (int(run_row["run_id"]),),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT
-                    id, run_id, screen_date, code, name, rank_no,
-                    total_score, selected_reason, status, created_at_utc
-                FROM weekly_selected_stocks
-                WHERE run_id = ?
-                ORDER BY rank_no, id
-                """,
-                (int(run_row["run_id"]),),
-            ).fetchall()
-    return dict(run_row), [dict(r) for r in rows]
+                if table_exists(conn, "weekly_ml_predictions"):
+                    order_by_sql = """
+                            CASE WHEN p.predicted_score IS NULL THEN 1 ELSE 0 END,
+                            p.predicted_score DESC,
+                            s.rank_no,
+                            s.id
+                    """
+                    if sort_mode == "rule":
+                        order_by_sql = "s.rank_no, s.id"
+                    rows = conn.execute(
+                        """
+                        SELECT
+                            s.id, s.run_id, s.screen_date, s.code, s.name, s.rank_no,
+                            s.total_score, s.selected_reason, s.status, s.created_at_utc,
+                            p.probability_up AS ml_probability_up,
+                            p.predicted_score AS ml_predicted_score,
+                            p.reason AS ml_reason
+                        FROM weekly_selected_stocks s
+                        LEFT JOIN weekly_ml_predictions p
+                            ON p.source_run_id = s.run_id AND p.code = s.code
+                        WHERE s.run_id = ?
+                        ORDER BY
+                        """
+                        + order_by_sql
+                        + """
+                        """,
+                        (int(run_row["run_id"]),),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT
+                            id, run_id, screen_date, code, name, rank_no,
+                            total_score, selected_reason, status, created_at_utc
+                        FROM weekly_selected_stocks
+                        WHERE run_id = ?
+                        ORDER BY rank_no, id
+                        """,
+                        (int(run_row["run_id"]),),
+                    ).fetchall()
+                return dict(run_row), [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            if attempt >= 2:
+                return {}, []
+            time.sleep(0.15 * (attempt + 1))
+    return {}, []
 
 
 def fetch_weekly_review_history(
@@ -414,10 +509,11 @@ def fetch_weekly_review_history(
         "selected_summary": None,
         "selected_results": [],
     }
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        if not table_exists(conn, "weekly_review_runs") or not table_exists(conn, "weekly_review_results"):
-            return out
+    try:
+        with sqlite_connect_with_retry(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if not table_exists(conn, "weekly_review_runs") or not table_exists(conn, "weekly_review_results"):
+                return out
 
         rows = conn.execute(
             """
@@ -494,7 +590,9 @@ def fetch_weekly_review_history(
             (selected_review_id,),
         ).fetchall()
         out["selected_results"] = [dict(row) for row in detail_rows]
-    return out
+        return out
+    except sqlite3.OperationalError:
+        return out
 
 
 def build_kline_svg(rows_desc: List[Dict[str, Any]]) -> str:
@@ -716,7 +814,7 @@ def render_xuangu_import_form(message: str = "", error: str = "") -> str:
 
 def render_weekly_screen_form(selected_batch_id: str, default_top_n: int = 5) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
-    top_n = max(1, min(20, int(default_top_n)))
+    top_n = max(1, min(50, int(default_top_n)))
     return f"""
       <div class="import-box compact">
         <form method="post" action="/actions/run_weekly_screen">
@@ -727,7 +825,7 @@ def render_weekly_screen_form(selected_batch_id: str, default_top_n: int = 5) ->
             </label>
             <label>
               <span>Top N</span>
-              <input name="top_n" type="number" min="1" max="20" value="{top_n}" />
+              <input name="top_n" type="number" min="1" max="50" value="{top_n}" />
             </label>
           </div>
           <div class="form-actions">
@@ -1234,7 +1332,6 @@ def build_checks_html(
         <a href="/reviews">复盘页面</a>
         <a href="/daily">日 K 线</a>
         <a href="/top">Top 日线图</a>
-        <a href="/api/screening">JSON 接口</a>
       </div>
     </div>
     <div class="meta">{meta}</div>
@@ -1441,6 +1538,7 @@ def build_daily_html(
     list_path: str = "/daily",
     list_extra_query: str = "",
     meta_prefix: str = "",
+    head_extra_html: str = "",
 ) -> str:
     chart_rows = list(reversed(rows))
     chart_data_json = json.dumps(chart_rows, ensure_ascii=False).replace("</", "<\\/")
@@ -1472,12 +1570,12 @@ def build_daily_html(
     title_suffix = f" - {selected_label}" if selected_label else ""
     selected_name = html.escape(selected_name_raw or "-")
     selected_code = html.escape(code or "-")
+    head_extra = head_extra_html or ""
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="30" />
   <title>{html.escape(page_heading)}{html.escape(title_suffix)}</title>
   <style>
     :root {{
@@ -1574,6 +1672,36 @@ def build_daily_html(
       margin-bottom: 12px;
       gap: 10px;
       flex-wrap: wrap;
+    }}
+    .head-right {{
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+      margin-left: auto;
+    }}
+    .sort-switch {{
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .sort-chip {{
+      border: 1px solid #cbd5e1;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: #0f172a;
+      text-decoration: none;
+      background: #fff;
+    }}
+    .sort-chip:hover {{
+      background: #f8fafc;
+    }}
+    .sort-chip.active {{
+      border-color: #0f766e;
+      background: #ccfbf1;
+      color: #115e59;
+      font-weight: 600;
     }}
     .head a {{
       margin-right: 10px;
@@ -1694,6 +1822,10 @@ def build_daily_html(
       .chart-grid {{
         grid-template-columns: 1fr;
       }}
+      .head-right {{
+        align-items: flex-start;
+        width: 100%;
+      }}
     }}
   </style>
 </head>
@@ -1701,7 +1833,7 @@ def build_daily_html(
   <div class="wrap">
     <div class="layout">
       <aside class="side">
-        <h3>{html.escape(sidebar_title)}</h3>
+        <h3>{html.escape(sidebar_title)}（{len(stock_list)}）</h3>
         <div class="stocks">
           {''.join(stock_links) if stock_links else "<div style='padding:12px;color:#6b7280'>No stocks found.</div>"}
         </div>
@@ -1709,16 +1841,17 @@ def build_daily_html(
       <main class="main">
         <div class="head">
           <h2>{html.escape(page_heading)}{html.escape(title_suffix)}</h2>
-          <div>
-            <a href="/screening">选股页面</a>
-            <a href="/reviews">复盘页面</a>
-            <a href="/top">Top 日线图</a>
-            <a href="/api/daily{('?code=' + html.escape(code)) if code else ''}">JSON 接口</a>
-            <a href="/api/stocks">股票列表接口</a>
+          <div class="head-right">
+            <div>
+              <a href="/screening">选股页面</a>
+              <a href="/reviews">复盘页面</a>
+              <a href="/top">Top 日线图</a>
+            </div>
+            {head_extra}
           </div>
         </div>
         <div class="meta">
-          {html.escape(meta_prefix) if meta_prefix else "自动刷新：30 秒"} | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}（{selected_code}）
+          {html.escape(meta_prefix) if meta_prefix else "手动刷新"} | 生成时间：{html.escape(now)} | 行数：{len(rows)} | 当前股票：{selected_name}（{selected_code}）
         </div>
         <div class="card">
           <div class="hover-row">
@@ -2014,7 +2147,8 @@ def build_daily_html(
           const bw = chipPlotW * (chip[b] / maxChip);
           const color = centerV >= chipAnchorClose ? 'rgba(22,163,74,0.45)' : 'rgba(220,38,38,0.45)';
           chipCtx.fillStyle = color;
-          chipCtx.fillRect(chipPadL, y0, bw, Math.max(1, y1 - y0 - 1));
+          const barInset = 1.5;
+          chipCtx.fillRect(chipPadL, y0 + barInset, bw, Math.max(1, y1 - y0 - barInset * 2));
         }}
         chipCtx.strokeStyle = '#cbd5e1';
         chipCtx.strokeRect(chipPadL, pad.top, chipPlotW, plotH);
@@ -2120,6 +2254,69 @@ def build_daily_html(
         render();
       }});
 
+      const stocksPanel = document.querySelector('.stocks');
+      const getStocksScrollKey = () => {{
+        const params = new URLSearchParams(window.location.search || '');
+        params.delete('code');
+        const suffix = params.toString();
+        return `stocks-scroll:${{window.location.pathname}}?${{suffix}}`;
+      }};
+      const saveStocksScroll = () => {{
+        if (!stocksPanel) return;
+        try {{
+          sessionStorage.setItem(getStocksScrollKey(), String(stocksPanel.scrollTop || 0));
+        }} catch (_err) {{
+          // ignore storage errors
+        }}
+      }};
+      const restoreStocksScroll = () => {{
+        if (!stocksPanel) return;
+        try {{
+          const raw = sessionStorage.getItem(getStocksScrollKey());
+          if (!raw) return;
+          const top = Number(raw);
+          if (Number.isFinite(top) && top >= 0) {{
+            stocksPanel.scrollTop = top;
+          }}
+        }} catch (_err) {{
+          // ignore storage errors
+        }}
+      }};
+      restoreStocksScroll();
+
+      const stockAnchors = Array.from(document.querySelectorAll('.stocks a.stk'));
+      stockAnchors.forEach((a) => {{
+        a.addEventListener('click', () => {{
+          saveStocksScroll();
+        }});
+      }});
+      const isTypingTarget = (target) => {{
+        if (!target) return false;
+        const tag = String(target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+        return Boolean(target.isContentEditable);
+      }};
+      window.addEventListener('keydown', (ev) => {{
+        if (ev.defaultPrevented) return;
+        if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
+        if (isTypingTarget(ev.target)) return;
+        if (!stockAnchors.length) return;
+
+        const activeIdx = stockAnchors.findIndex((a) => a.classList.contains('active'));
+        const baseIdx = activeIdx >= 0 ? activeIdx : 0;
+        let nextIdx = baseIdx;
+        if (ev.key === 'ArrowUp') {{
+          nextIdx = baseIdx <= 0 ? stockAnchors.length - 1 : baseIdx - 1;
+        }} else {{
+          nextIdx = baseIdx >= stockAnchors.length - 1 ? 0 : baseIdx + 1;
+        }}
+        const href = stockAnchors[nextIdx].getAttribute('href');
+        if (!href) return;
+        ev.preventDefault();
+        saveStocksScroll();
+        window.location.href = href;
+      }});
+
       window.addEventListener('resize', render);
       setZoomLabel();
       render();
@@ -2196,7 +2393,7 @@ def make_handler(db_path: Path, limit: int):
                     config["screening"]["run_xuangu"] = False
                     top_n_default = int(config.get("screening", {}).get("top_n", 5))
                     top_n = int(form_value(form, "top_n", str(top_n_default)) or str(top_n_default))
-                    config["screening"]["top_n"] = max(1, min(20, top_n))
+                    config["screening"]["top_n"] = max(1, min(50, top_n))
                     screen_date = form_value(form, "screen_date") or datetime.now().strftime("%Y-%m-%d")
                     calendar_cfg = config.get("calendar", {})
                     effective_screen_date = screen_date
@@ -2338,9 +2535,22 @@ def make_handler(db_path: Path, limit: int):
             if parsed.path == "/api/top":
                 run_id_text = (query.get("run_id", [""])[0] or "").strip()
                 run_id = int(run_id_text) if run_id_text.isdigit() else None
-                run, selected_rows = fetch_top_selected_stocks(db_path, run_id=run_id)
+                sort_mode = normalize_top_sort_mode((query.get("sort", ["ml"])[0] or "ml"))
+                run, selected_rows = fetch_top_selected_stocks(db_path, run_id=run_id, sort_mode=sort_mode)
+                if not selected_rows:
+                    fallback_run, fallback_rows = fetch_top_selected_stocks(db_path, run_id=None, sort_mode=sort_mode)
+                    if fallback_rows:
+                        run, selected_rows = fallback_run, fallback_rows
+                from_cache = False
+                if selected_rows:
+                    cache_top_result(sort_mode, run, selected_rows)
+                else:
+                    cached = get_cached_top_result(sort_mode)
+                    if cached is not None:
+                        run, selected_rows = cached
+                        from_cache = True
                 payload = json.dumps(
-                    {"run": run, "selected": selected_rows},
+                    {"run": run, "selected": selected_rows, "sort_mode": sort_mode, "from_cache": from_cache},
                     ensure_ascii=False,
                 ).encode("utf-8")
                 self.send_response(200)
@@ -2396,7 +2606,20 @@ def make_handler(db_path: Path, limit: int):
             if parsed.path == "/top":
                 run_id_text = (query.get("run_id", [""])[0] or "").strip()
                 run_id = int(run_id_text) if run_id_text.isdigit() else None
-                run, selected_rows = fetch_top_selected_stocks(db_path, run_id=run_id)
+                sort_mode = normalize_top_sort_mode((query.get("sort", ["ml"])[0] or "ml"))
+                run, selected_rows = fetch_top_selected_stocks(db_path, run_id=run_id, sort_mode=sort_mode)
+                if not selected_rows:
+                    fallback_run, fallback_rows = fetch_top_selected_stocks(db_path, run_id=None, sort_mode=sort_mode)
+                    if fallback_rows:
+                        run, selected_rows = fallback_run, fallback_rows
+                using_cached_top = False
+                if selected_rows:
+                    cache_top_result(sort_mode, run, selected_rows)
+                else:
+                    cached = get_cached_top_result(sort_mode)
+                    if cached is not None:
+                        run, selected_rows = cached
+                        using_cached_top = True
                 top_codes = [str(row.get("code") or "") for row in selected_rows if row.get("code")]
                 selected_code = code if code in top_codes else (top_codes[0] if top_codes else "")
                 top_stock_list = []
@@ -2422,12 +2645,30 @@ def make_handler(db_path: Path, limit: int):
                     )
                 rows = fetch_daily_rows(db_path, limit, code=selected_code) if selected_code else []
                 effective_run_id = str(run.get("run_id") or "")
-                run_query = f"&run_id={quote(effective_run_id)}" if effective_run_id else ""
-                meta_parts = ["Top 股票列表", "自动刷新：30 秒"]
+                query_parts = [f"sort={quote(sort_mode)}"]
+                run_query = "".join(f"&{part}" for part in query_parts)
+                mode_label = "ML 综合分" if sort_mode == "ml" else "规则排名"
+
+                def build_top_href(target_sort: str) -> str:
+                    parts: List[str] = [f"sort={target_sort}"]
+                    if selected_code:
+                        parts.append(f"code={quote(selected_code)}")
+                    return "/top?" + "&".join(parts)
+
+                sort_switch_html = (
+                    "<div class='sort-switch'>"
+                    f"<a class='sort-chip {'active' if sort_mode == 'ml' else ''}' href='{html.escape(build_top_href('ml'))}'>按 ML 综合分</a>"
+                    f"<a class='sort-chip {'active' if sort_mode == 'rule' else ''}' href='{html.escape(build_top_href('rule'))}'>按规则排名</a>"
+                    "</div>"
+                )
+                meta_parts = ["Top 股票列表", "手动刷新"]
                 if run:
                     meta_parts.append(f"Run {run.get('run_id')}")
                     meta_parts.append(f"选股日期：{run.get('screen_date') or '-'}")
                     meta_parts.append(f"批次：{run.get('xuangu_batch_id') or '-'}")
+                meta_parts.append(f"排序：{mode_label}")
+                if using_cached_top:
+                    meta_parts.append("数据库短暂不可读，显示最近一次成功结果")
                 body = build_daily_html(
                     rows,
                     code=selected_code,
@@ -2437,6 +2678,7 @@ def make_handler(db_path: Path, limit: int):
                     list_path="/top",
                     list_extra_query=run_query,
                     meta_prefix=" | ".join(meta_parts),
+                    head_extra_html=sort_switch_html,
                 ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")

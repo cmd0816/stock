@@ -6,7 +6,7 @@ paths:
   download_dir: downloads
 
 screening:
-  top_n: 8
+  top_n: 50
   min_score: 60
   run_xuangu: false
 
@@ -70,6 +70,9 @@ ml:
   negative_drawdown_pct: 0.06
   rule_score_weight: 0.35
   train_on_selected_universe: false
+  use_review_feedback_labels: false
+  review_feedback_weight: 1
+  review_feedback_recent_runs: 0
   backtest_train_ratio: 0.7
   backtest_top_k: 10
   lightgbm_n_estimators: 160

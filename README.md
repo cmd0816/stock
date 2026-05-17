@@ -441,6 +441,9 @@ ML 配置在 `config/weekly_strategy.yaml` 的 `ml` 部分：
 - `exit_on_break_ma20`：是否启用跌破 MA20 卖出，默认 `true`。
 - `negative_drawdown_pct`：仅在关闭 `use_trade_exit_rules` 时使用的旧标签阈值。
 - `rule_score_weight`：最终预测分数中保留多少规则分权重。
+- `use_review_feedback_labels`：是否把复盘结果（`weekly_review_results.meets_expectation`）反哺为训练标签，默认 `false`。
+- `review_feedback_weight`：反哺标签命中样本的权重倍数（通过样本复制实现），默认 `1`。
+- `review_feedback_recent_runs`：只使用最近 N 次复盘运行做反哺，`0` 表示不限制（使用所有可用复盘），默认 `0`。
 - `min_train_samples`：最少训练样本数，样本不足会停止。
 - `backtest_train_ratio`：时间序列回测时前多少比例样本用于训练。
 - `backtest_top_k`：回测时统计概率最高的前多少个样本。

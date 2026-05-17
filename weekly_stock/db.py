@@ -4,7 +4,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .models import CandidateStock, Kline, ReviewResult, ScoredStock
 
@@ -531,6 +531,55 @@ def review_trend_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3
         """,
         (limit,),
     ).fetchall()
+
+
+def review_feedback_labels(conn: sqlite3.Connection, recent_runs: int = 0) -> Dict[Tuple[str, str], int]:
+    if recent_runs and int(recent_runs) > 0:
+        rows = conn.execute(
+            """
+            WITH chosen_reviews AS (
+                SELECT review_id
+                FROM weekly_review_runs
+                ORDER BY review_id DESC
+                LIMIT ?
+            ),
+            latest_per_run AS (
+                SELECT wr.reviewed_run_id, MAX(wr.review_id) AS review_id
+                FROM weekly_review_runs wr
+                JOIN chosen_reviews cr
+                  ON cr.review_id = wr.review_id
+                GROUP BY wr.reviewed_run_id
+            )
+            SELECT rr.code, rr.base_trade_date, rr.meets_expectation
+            FROM weekly_review_results rr
+            JOIN latest_per_run lr
+              ON lr.review_id = rr.review_id
+            WHERE rr.base_trade_date IS NOT NULL
+              AND rr.base_trade_date <> ''
+            """,
+            (int(recent_runs),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            WITH latest_per_run AS (
+                SELECT reviewed_run_id, MAX(review_id) AS review_id
+                FROM weekly_review_runs
+                GROUP BY reviewed_run_id
+            )
+            SELECT rr.code, rr.base_trade_date, rr.meets_expectation
+            FROM weekly_review_results rr
+            JOIN latest_per_run lr
+              ON lr.review_id = rr.review_id
+            WHERE rr.base_trade_date IS NOT NULL
+              AND rr.base_trade_date <> ''
+            """
+        ).fetchall()
+    return {
+        (str(row["code"]), str(row["base_trade_date"])): int(row["meets_expectation"])
+        for row in rows
+        if row["code"] and row["base_trade_date"]
+    }
 
 
 def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:

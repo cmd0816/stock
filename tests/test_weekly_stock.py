@@ -6,8 +6,14 @@ from pathlib import Path
 
 from weekly_stock.config import DEFAULT_CONFIG
 from weekly_stock.db import connect, ensure_weekly_tables
-from weekly_stock.jobs import ml_backtest_job, ml_predict_job, review_selected_stock, stock_screen_job
-from weekly_stock.ml import build_training_samples, label_future
+from weekly_stock.jobs import (
+    apply_review_feedback_labels,
+    ml_backtest_job,
+    ml_predict_job,
+    review_selected_stock,
+    stock_screen_job,
+)
+from weekly_stock.ml import TrainingSample, build_training_samples, label_future
 from weekly_stock.models import Kline
 from weekly_stock.trading_calendar import align_to_last_trading_day, weekly_last_trading_days
 
@@ -292,6 +298,150 @@ class WeeklyStockTests(unittest.TestCase):
             self.assertGreaterEqual(len(predictions), 1)
             self.assertGreaterEqual(len(samples), 1)
             self.assertTrue(all(0 <= row["probability_up"] <= 1 for row in predictions))
+
+    def test_apply_review_feedback_labels_relabels_and_weights(self) -> None:
+        samples = [
+            TrainingSample(
+                code="000001",
+                trade_date="2026-05-01",
+                features={"ret_5": 1.0},
+                label=0,
+                future_high_gain_pct=1.0,
+                future_close_gain_pct=1.0,
+                future_max_drawdown_pct=-1.0,
+            ),
+            TrainingSample(
+                code="000002",
+                trade_date="2026-05-01",
+                features={"ret_5": -1.0},
+                label=1,
+                future_high_gain_pct=2.0,
+                future_close_gain_pct=2.0,
+                future_max_drawdown_pct=-2.0,
+            ),
+        ]
+        merged, stats = apply_review_feedback_labels(
+            samples,
+            {("000001", "2026-05-01"): 1},
+            weight=3,
+        )
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(stats["relabeled"], 1)
+        self.assertEqual(stats["extra_weighted"], 2)
+        relabeled = [s for s in merged if s.code == "000001" and s.trade_date == "2026-05-01"]
+        self.assertEqual(len(relabeled), 3)
+        self.assertTrue(all(s.label == 1 for s in relabeled))
+
+    def test_ml_predict_job_can_apply_review_feedback_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = write_config(root)
+            (root / "screening.txt").write_text("测试条件", encoding="utf-8")
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                conn.execute(
+                    "INSERT INTO xuangu_batches VALUES ('b1', '2026-05-01T00:00:00Z', 'url', 'cond', 'file', 1, 2)"
+                )
+                insert_candidate(conn, "000001", "强势股份", {"营业收入同比增长率": "20%", "净利润同比增长率": "15%"})
+                insert_candidate(conn, "000002", "普通股份", {"营业收入同比增长率": "5%", "净利润同比增长率": "3%"})
+                for i in range(1, 96):
+                    insert_kline(conn, "000001", i, 10 + i * 0.08, volume=1000 + i * 10)
+                    insert_kline(conn, "000002", i, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
+                conn.commit()
+
+            base_ml_cfg = {
+                **DEFAULT_CONFIG["ml"],
+                "model_name": "centroid_v1",
+                "min_train_samples": 5,
+                "lookback_trading_days": 60,
+                "sample_stride": 5,
+                "history_limit": 120,
+                "weekly_last_trading_day_only": False,
+            }
+            base_config = DEFAULT_CONFIG | {
+                "database": {"path": "stocks.db"},
+                "screening": {"top_n": 2, "min_score": 0, "run_xuangu": False},
+                "ml": base_ml_cfg,
+            }
+            run_id = stock_screen_job(config_path, base_config, screen_date="2026-05-02", xuangu_batch_id="b1")
+
+            with connect(root / "stocks.db") as conn:
+                selected_row = conn.execute(
+                    "SELECT id, code FROM weekly_selected_stocks WHERE run_id=? ORDER BY rank_no LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                self.assertIsNotNone(selected_row)
+                code = str(selected_row["code"])
+                klines = conn.execute(
+                    """
+                    SELECT trade_date, open, close, high, low, volume, turnover_rate, change_percent
+                    FROM eastmoney_stock_daily_klines
+                    WHERE code = ?
+                    ORDER BY trade_date
+                    """,
+                    (code,),
+                ).fetchall()
+                klines_obj = [
+                    Kline(
+                        trade_date=str(r["trade_date"]),
+                        open=r["open"],
+                        close=r["close"],
+                        high=r["high"],
+                        low=r["low"],
+                        volume=r["volume"],
+                        turnover_rate=r["turnover_rate"],
+                        change_percent=r["change_percent"],
+                    )
+                    for r in klines
+                ]
+                samples = build_training_samples({code: klines_obj}, base_ml_cfg)
+                self.assertGreater(len(samples), 0)
+                target_sample = samples[0]
+                flipped_label = 0 if int(target_sample.label) == 1 else 1
+                review_id = conn.execute(
+                    """
+                    INSERT INTO weekly_review_runs (reviewed_run_id, review_date, config_json, created_at_utc)
+                    VALUES (?, '2026-05-20', '{}', '2026-05-20T00:00:00Z')
+                    """,
+                    (run_id,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO weekly_review_results (
+                        review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
+                        highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered, meets_expectation,
+                        notes, created_at_utc
+                    ) VALUES (?, ?, ?, '测试', ?, '2026-05-21', '2026-05-25', 0, 0, 0, 0, ?, 'test', '2026-05-20T00:00:00Z')
+                    """,
+                    (review_id, int(selected_row["id"]), code, target_sample.trade_date, flipped_label),
+                )
+                conn.commit()
+
+            config_with_feedback = DEFAULT_CONFIG | {
+                "database": {"path": "stocks.db"},
+                "screening": {"top_n": 2, "min_score": 0, "run_xuangu": False},
+                "ml": {
+                    **base_ml_cfg,
+                    "use_review_feedback_labels": True,
+                    "review_feedback_weight": 1,
+                    "review_feedback_recent_runs": 0,
+                },
+            }
+            model_run_id = ml_predict_job(config_path, config_with_feedback, run_id=run_id)
+
+            with connect(root / "stocks.db") as conn:
+                row = conn.execute(
+                    """
+                    SELECT label
+                    FROM weekly_ml_training_samples
+                    WHERE model_run_id = ? AND code = ? AND trade_date = ?
+                    LIMIT 1
+                    """,
+                    (model_run_id, code, target_sample.trade_date),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(int(row["label"]), int(flipped_label))
 
     def test_ml_backtest_job_returns_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
