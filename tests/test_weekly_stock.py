@@ -320,7 +320,7 @@ class WeeklyStockTests(unittest.TestCase):
                 future_max_drawdown_pct=-2.0,
             ),
         ]
-        merged, stats = apply_review_feedback_labels(
+        merged, weights, stats = apply_review_feedback_labels(
             samples,
             {("000001", "2026-05-01"): 1},
             weight=3,
@@ -329,8 +329,10 @@ class WeeklyStockTests(unittest.TestCase):
         self.assertEqual(stats["relabeled"], 1)
         self.assertEqual(stats["extra_weighted"], 2)
         relabeled = [s for s in merged if s.code == "000001" and s.trade_date == "2026-05-01"]
-        self.assertEqual(len(relabeled), 3)
+        self.assertEqual(len(relabeled), 1)
         self.assertTrue(all(s.label == 1 for s in relabeled))
+        self.assertEqual(len(weights), len(merged))
+        self.assertEqual(weights, [3.0, 1.0])
 
     def test_ml_predict_job_can_apply_review_feedback_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -28,6 +28,12 @@ FEATURE_NAMES = [
     "volatility_20",
     "drawdown_20",
     "dist_high_20",
+    "ret_5_rank",
+    "ret_10_rank",
+    "ret_20_rank",
+    "close_ma20_pct_rank",
+    "volume_ratio_5_20_rank",
+    "market_ret_20",
 ]
 
 
@@ -193,6 +199,12 @@ def feature_label(name: str) -> str:
         "volatility_20": "20日波动",
         "drawdown_20": "20日回撤",
         "dist_high_20": "距20日高点",
+        "ret_5_rank": "5日涨幅排名",
+        "ret_10_rank": "10日涨幅排名",
+        "ret_20_rank": "20日涨幅排名",
+        "close_ma20_pct_rank": "偏离MA20排名",
+        "volume_ratio_5_20_rank": "量比排名",
+        "market_ret_20": "市场20日涨幅",
     }.get(name, name)
 
 
@@ -233,7 +245,7 @@ def features_at(klines: Sequence[Kline], end_idx: int) -> Optional[Dict[str, flo
     volume5 = safe_mean(k.volume for k in klines[end_idx - 4 : end_idx + 1])
     volume20 = safe_mean(k.volume for k in klines[end_idx - 19 : end_idx + 1])
     returns = []
-    for i in range(end_idx - 18, end_idx + 1):
+    for i in range(end_idx - 19, end_idx + 1):
         if i <= 0:
             continue
         returns.append(pct(klines[i].close, klines[i - 1].close))
@@ -256,6 +268,48 @@ def features_at(klines: Sequence[Kline], end_idx: int) -> Optional[Dict[str, flo
         "drawdown_20": pct(low20, high20),
         "dist_high_20": pct(current.close, high20),
     }
+
+
+def _add_cross_sectional(feature_items: List[tuple[str, Dict[str, float]]]) -> None:
+    """Add cross-sectional rank features to feature dicts in-place.
+
+    feature_items: list of (trade_date, features_dict) tuples.
+    """
+    from collections import defaultdict
+
+    by_date: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+    for _date, features in feature_items:
+        by_date[_date].append(features)
+
+    rank_features = ["ret_5", "ret_10", "ret_20", "close_ma20_pct", "volume_ratio_5_20"]
+    for _date, date_features in by_date.items():
+        n = len(date_features)
+        for feat in rank_features:
+            values = sorted(
+                ((f.get(feat, 0.0), f) for f in date_features),
+                key=lambda x: x[0],
+            )
+            for rank, (_val, f) in enumerate(values):
+                f[f"{feat}_rank"] = rank / (n - 1) if n > 1 else 0.5
+
+        ret_20s = [f.get("ret_20", 0.0) for f in date_features]
+        market_ret = mean(ret_20s) if ret_20s else 0.0
+        for f in date_features:
+            f["market_ret_20"] = market_ret
+
+
+def add_cross_sectional_features(samples: List[TrainingSample]) -> None:
+    """In-place addition of cross-sectional rank features to training samples."""
+    feature_items = [(s.trade_date, s.features) for s in samples]
+    _add_cross_sectional(feature_items)
+
+
+def add_cross_sectional_to_predictions(prediction_items: List[tuple[str, Dict[str, float]]]) -> None:
+    """In-place addition of cross-sectional rank features to prediction feature dicts.
+
+    prediction_items: list of (trade_date, features_dict) tuples.
+    """
+    _add_cross_sectional(prediction_items)
 
 
 def label_future(klines: Sequence[Kline], end_idx: int, horizon: int, cfg: Dict[str, Any]) -> Optional[tuple[int, float, float, float]]:
@@ -332,6 +386,8 @@ def build_training_samples(
                     future_max_drawdown_pct=drawdown,
                 )
             )
+    if cfg.get("use_cross_sectional_features", True):
+        add_cross_sectional_features(samples)
     return samples
 
 
@@ -440,7 +496,7 @@ def backtest_models(samples: List[TrainingSample], cfg: Dict[str, Any]) -> List[
     return metrics
 
 
-def train_logistic_regression_model(samples: List[TrainingSample]) -> SklearnLikeModel:
+def train_logistic_regression_model(samples: List[TrainingSample], sample_weights: Optional[List[float]] = None) -> SklearnLikeModel:
     try:
         from sklearn.linear_model import LogisticRegression
         from sklearn.pipeline import Pipeline
@@ -460,7 +516,10 @@ def train_logistic_regression_model(samples: List[TrainingSample]) -> SklearnLik
             ("model", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)),
         ]
     )
-    estimator.fit(x, y)
+    fit_kwargs: Dict[str, Any] = {}
+    if sample_weights is not None:
+        fit_kwargs["model__sample_weight"] = sample_weights
+    estimator.fit(x, y, **fit_kwargs)
     return SklearnLikeModel(
         model_name="logistic_regression",
         feature_names=list(FEATURE_NAMES),
@@ -469,7 +528,7 @@ def train_logistic_regression_model(samples: List[TrainingSample]) -> SklearnLik
     )
 
 
-def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any]) -> SklearnLikeModel:
+def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any], sample_weights: Optional[List[float]] = None) -> SklearnLikeModel:
     try:
         from lightgbm import LGBMClassifier
     except Exception as exc:
@@ -490,8 +549,8 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any]) -> 
     estimator = LGBMClassifier(
         n_estimators=int(cfg.get("lightgbm_n_estimators", 160)),
         learning_rate=float(cfg.get("lightgbm_learning_rate", 0.04)),
-        num_leaves=int(cfg.get("lightgbm_num_leaves", 15)),
-        max_depth=int(cfg.get("lightgbm_max_depth", 4)),
+        num_leaves=int(cfg.get("lightgbm_num_leaves", 31)),
+        max_depth=int(cfg.get("lightgbm_max_depth", 6)),
         min_child_samples=int(cfg.get("lightgbm_min_child_samples", 20)),
         subsample=float(cfg.get("lightgbm_subsample", 0.85)),
         colsample_bytree=float(cfg.get("lightgbm_colsample_bytree", 0.85)),
@@ -500,11 +559,14 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any]) -> 
         n_jobs=1,
         verbosity=-1,
     )
-    estimator.fit(x, y)
+    fit_kwargs: Dict[str, Any] = {}
+    if sample_weights is not None:
+        fit_kwargs["sample_weight"] = sample_weights
+    estimator.fit(x, y, **fit_kwargs)
     baseline = None
     baseline_name = str(cfg.get("baseline_model_name", "logistic_regression"))
     if baseline_name == "logistic_regression":
-        baseline = train_logistic_regression_model(samples).estimator
+        baseline = train_logistic_regression_model(samples, sample_weights=sample_weights).estimator
     return SklearnLikeModel(
         model_name="lightgbm",
         baseline_model_name=baseline_name if baseline is not None else None,
@@ -515,12 +577,12 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any]) -> 
     )
 
 
-def train_model(samples: List[TrainingSample], cfg: Dict[str, Any]) -> Any:
+def train_model(samples: List[TrainingSample], cfg: Dict[str, Any], sample_weights: Optional[List[float]] = None) -> Any:
     model_name = str(cfg.get("model_name", "lightgbm")).lower()
     if model_name == "lightgbm":
-        return train_lightgbm_model(samples, cfg)
+        return train_lightgbm_model(samples, cfg, sample_weights=sample_weights)
     if model_name in {"logistic_regression", "logistic"}:
-        return train_logistic_regression_model(samples)
+        return train_logistic_regression_model(samples, sample_weights=sample_weights)
     if model_name == "centroid_v1":
         return train_centroid_model(samples)
     raise ValueError(f"Unsupported ml.model_name: {model_name}")

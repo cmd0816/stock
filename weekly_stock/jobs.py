@@ -8,7 +8,15 @@ from typing import Any, Dict, List, Optional
 
 from . import db
 from .models import Kline, ReviewResult
-from .ml import TrainingSample, backtest_models, build_training_samples, features_at, train_model
+from .ml import (
+    TrainingSample,
+    add_cross_sectional_features,
+    add_cross_sectional_to_predictions,
+    backtest_models,
+    build_training_samples,
+    features_at,
+    train_model,
+)
 from .scoring import rank_candidates
 from .trading_calendar import align_to_last_trading_day
 
@@ -24,12 +32,13 @@ def apply_review_feedback_labels(
     samples: List[TrainingSample],
     feedback_labels: Dict[tuple[str, str], int],
     weight: int = 1,
-) -> tuple[List[TrainingSample], Dict[str, int]]:
+) -> tuple[List[TrainingSample], List[float], Dict[str, int]]:
     if not samples or not feedback_labels:
-        return samples, {"matched": 0, "relabeled": 0, "extra_weighted": 0}
+        return samples, [1.0] * len(samples), {"matched": 0, "relabeled": 0, "extra_weighted": 0}
 
     use_weight = max(1, int(weight))
     merged: List[TrainingSample] = []
+    sample_weights: List[float] = []
     matched = 0
     relabeled = 0
     extra_weighted = 0
@@ -38,6 +47,7 @@ def apply_review_feedback_labels(
         label = feedback_labels.get(key)
         if label is None:
             merged.append(sample)
+            sample_weights.append(1.0)
             continue
 
         matched += 1
@@ -54,11 +64,9 @@ def apply_review_feedback_labels(
             future_max_drawdown_pct=sample.future_max_drawdown_pct,
         )
         merged.append(updated)
-        if use_weight > 1:
-            for _ in range(use_weight - 1):
-                merged.append(updated)
-            extra_weighted += use_weight - 1
-    return merged, {"matched": matched, "relabeled": relabeled, "extra_weighted": extra_weighted}
+        sample_weights.append(float(use_weight))
+        extra_weighted += use_weight - 1
+    return merged, sample_weights, {"matched": matched, "relabeled": relabeled, "extra_weighted": extra_weighted}
 
 
 def run_xuangu_download(config_path: Path, config: Dict[str, Any]) -> None:
@@ -205,11 +213,12 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             for code in train_codes
         }
         samples = build_training_samples(klines_by_code, ml_cfg)
+        sample_weights: Optional[List[float]] = None
         if ml_cfg.get("use_review_feedback_labels", False):
             recent_runs = int(ml_cfg.get("review_feedback_recent_runs", 0))
             feedback = db.review_feedback_labels(conn, recent_runs=recent_runs)
             feedback_weight = int(ml_cfg.get("review_feedback_weight", 1))
-            samples, feedback_stats = apply_review_feedback_labels(samples, feedback, weight=feedback_weight)
+            samples, sample_weights, feedback_stats = apply_review_feedback_labels(samples, feedback, weight=feedback_weight)
             if feedback_stats["matched"] > 0:
                 print(
                     "Applied review feedback labels: "
@@ -223,7 +232,7 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
                 f"Not enough ML training samples: {len(samples)} < {min_samples}. "
                 "Download more K-line history or lower ml.min_train_samples."
             )
-        model = train_model(samples, ml_cfg)
+        model = train_model(samples, ml_cfg, sample_weights=sample_weights)
         positive_count = sum(1 for sample in samples if sample.label == 1)
         model_run_id = db.create_ml_model_run(
             conn=conn,
@@ -236,7 +245,7 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
         )
         db.save_ml_training_samples(conn, model_run_id, source_run_id, samples)
 
-        predictions = []
+        prediction_items: List[tuple[Any, Dict[str, float], str]] = []
         for row in selected_rows:
             code = str(row["code"])
             klines = db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
@@ -245,6 +254,17 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             features = features_at(klines, len(klines) - 1)
             if features is None:
                 continue
+            trade_date = klines[-1].trade_date
+            prediction_items.append((row, features, trade_date))
+
+        if ml_cfg.get("use_cross_sectional_features", True):
+            add_cross_sectional_to_predictions(
+                [(trade_date, features) for _row, features, trade_date in prediction_items]
+            )
+
+        predictions = []
+        for row, features, _trade_date in prediction_items:
+            code = str(row["code"])
             probability = model.predict_probability(features)
             baseline_probability = None
             if hasattr(model, "predict_baseline_probability"):

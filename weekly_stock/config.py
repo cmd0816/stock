@@ -58,11 +58,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "backtest_top_k": 10,
         "lightgbm_n_estimators": 160,
         "lightgbm_learning_rate": 0.04,
-        "lightgbm_num_leaves": 15,
-        "lightgbm_max_depth": 4,
+        "lightgbm_num_leaves": 31,
+        "lightgbm_max_depth": 6,
         "lightgbm_min_child_samples": 20,
         "lightgbm_subsample": 0.85,
         "lightgbm_colsample_bytree": 0.85,
+        "use_cross_sectional_features": True,
     },
 }
 

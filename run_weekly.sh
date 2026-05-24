@@ -148,6 +148,7 @@ if [[ "${SKIP_TOP_HISTORY:-0}" != "1" ]]; then
   else
     "$VENV_PY" - "$SCRIPT_DIR" "$DB_PATH" "$RUN_ID" "$TOP_HISTORY_TARGET_DATE" "$TOP_HISTORY_MIN_EXISTING_DAYS" <<'PY'
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from download_top_history_akshare import fetch_kline_with_akshare, save_akshare_kline_rows
