@@ -34,6 +34,7 @@ echo
 TARGET_DATE="${SCREEN_DATE:-$(date +%F)}"
 ALIGNED_SCREEN_DATE="$("$VENV_PY" - "$CONFIG_PATH" "$DB_PATH" "$TARGET_DATE" <<'PY'
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from weekly_stock.config import load_config
 from weekly_stock import db
@@ -149,7 +150,7 @@ if [[ "${SKIP_TOP_HISTORY:-0}" != "1" ]]; then
 import sys
 from pathlib import Path
 
-from eastmoney_to_sqlite import fetch_stock_history_1y, save_history_klines
+from download_top_history_akshare import fetch_kline_with_akshare, save_akshare_kline_rows
 from weekly_stock import db
 
 
@@ -158,17 +159,6 @@ def infer_market(code: str) -> int:
     if text.startswith(("6", "9")):
         return 1
     return 0
-
-
-def quote_url(code: str) -> str:
-    text = str(code or "").strip()
-    if text.startswith(("8", "4")):
-        prefix = "bj"
-    elif text.startswith(("6", "9")):
-        prefix = "sh"
-    else:
-        prefix = "sz"
-    return f"https://quote.eastmoney.com/concept/{prefix}{text}.html"
 
 
 script_dir = Path(sys.argv[1])
@@ -225,13 +215,16 @@ for row in rows:
         continue
 
     market = infer_market(code)
-    url = quote_url(code)
     try:
-        payload = fetch_stock_history_1y(market, code)
-        row_count = save_history_klines(db_path, url, market, code, payload)
-        api_name = payload.get("data", {}).get("name")
+        end_yyyymmdd = target_date.replace("-", "") if target_date else datetime.now().strftime("%Y%m%d")
+        start_yyyymmdd = (datetime.strptime(end_yyyymmdd, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+        df, source_name = fetch_kline_with_akshare(code, start_yyyymmdd, end_yyyymmdd, "qfq", source="auto")
+        records = df.to_dict(orient="records")
+        if not records:
+            raise RuntimeError("AKShare returned empty rows")
+        row_count = save_akshare_kline_rows(db_path, market, code, name, records, source_name)
         print(
-            f"Updated Top#{rank_no} {code} ({api_name or name or 'UNKNOWN'}): saved {row_count} rows, latest target={target_date}"
+            f"Updated Top#{rank_no} {code} ({name or 'UNKNOWN'}): saved {row_count} rows via AKShare ({source_name}), latest target={target_date}"
         )
         updated += 1
     except Exception as exc:

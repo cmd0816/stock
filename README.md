@@ -4,7 +4,9 @@
 
 ## 文件说明
 
-- `eastmoney_to_sqlite.py`：导入单只股票的最新行情和一年历史 K 线。
+- `eastmoney_to_sqlite.py`：导入单只股票的最新行情。
+- `download_top_history_akshare.py`：使用 AKShare 下载/更新一年日 K（`stock_zh_a_hist` 失败自动回退 `stock_zh_a_daily`）。
+- `baostock_to_sqlite.py`：使用 BaoStock 导入/更新 A 股日 K（支持按批次、按代码、按日期范围、仅补缺失换手率）。
 - `xuangu_to_sqlite.py`：打开东方财富条件选股页面，输入 `screening.txt` 条件，下载 Excel，并导入 SQLite。
 - `view_quotes.py`：本地网页看盘服务。
 - `run_xuangu.sh`：一键运行条件选股下载入库。
@@ -37,6 +39,7 @@ playwright install chromium firefox
 - SQLite，Python 自带
 - Playwright，用于浏览器模式抓取和条件选股自动化
 - openpyxl，用于读取选股下载的 Excel
+- baostock，用于 BaoStock 日 K 导入
 
 ## 导入股票行情
 
@@ -48,25 +51,39 @@ python3 eastmoney_to_sqlite.py \
   --db stocks.db
 ```
 
-导入一年日 K 线，优先直连接口：
+下载一年日 K 线（AKShare）：
 
 ```bash
-python3 eastmoney_to_sqlite.py \
-  --url "https://quote.eastmoney.com/concept/sz301071.html" \
+.venv/bin/python download_top_history_akshare.py \
   --db stocks.db \
-  --history-1y
+  --run-id 40 \
+  --top-n 50 \
+  --target-date 2026-05-23 \
+  --days 365 \
+  --adjust qfq
 ```
 
-如果直连接口被东方财富拦截，可以用浏览器模式：
+下载/更新日 K 线（BaoStock）：
 
 ```bash
-/Users/cmd/workspace/stock/.venv/bin/python eastmoney_to_sqlite.py \
-  --url "https://quote.eastmoney.com/concept/sz301071.html" \
+.venv/bin/python baostock_to_sqlite.py \
   --db stocks.db \
-  --history-1y-browser \
-  --browser-engine firefox \
-  --browser-headed \
-  --browser-wait-login
+  --batch-id 20260522 \
+  --start-date 2026-05-11 \
+  --end-date 2026-05-22 \
+  --adjust qfq
+```
+
+只补指定日期范围内 `turnover_rate` 为空的股票：
+
+```bash
+.venv/bin/python baostock_to_sqlite.py \
+  --db stocks.db \
+  --batch-id 20260522 \
+  --start-date 2026-05-11 \
+  --end-date 2026-05-22 \
+  --adjust qfq \
+  --only-null-turnover
 ```
 
 ## 条件选股下载入库
@@ -128,7 +145,7 @@ BROWSER_HEADED=1 ./run_xuangu.sh
 ./run_xuangu.sh --history-limit 5
 ```
 
-一年日 K 默认每只股票间隔 `1.5` 秒，减少东方财富接口重置连接。如果遇到大量 `socket hang up`，可以放慢：
+一年日 K 默认每只股票间隔 `1.5` 秒。如果遇到连接不稳定，可以放慢：
 
 ```bash
 ./run_xuangu.sh --history-delay 3
@@ -178,7 +195,7 @@ UPDATE_DATE=2026-05-12 ./run_daily_update.sh
 # 指定要更新的选股批次
 XUANGU_BATCH_ID=20260508 ./run_daily_update.sh
 
-# 放慢请求，减少东方财富接口重置连接
+# 放慢请求，降低请求频率
 HISTORY_DELAY=3 ./run_daily_update.sh
 
 # 只更新前 10 只，方便测试
@@ -584,7 +601,7 @@ python3 -m unittest discover -s tests -v
 
 ## 常见问题
 
-如果 `--history-1y` 报 `socket hang up`、`Empty reply` 或连接被关闭，改用 `--history-1y-browser`。
+如果一年日 K 下载失败，直接重试即可；脚本会优先使用 `stock_zh_a_hist`，失败时自动回退 `stock_zh_a_daily`。
 
 如果条件选股页面没有登录，用：
 

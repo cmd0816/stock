@@ -7,12 +7,10 @@ import re
 import sqlite3
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
-
-from eastmoney_to_sqlite import build_history_query_params, save_history_klines
+from download_top_history_akshare import fetch_kline_with_akshare, save_akshare_kline_rows
 
 CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -418,106 +416,6 @@ def get_existing_kline_counts(db_path: Path) -> Dict[str, int]:
     return {code: day_count for code, (day_count, _) in get_existing_kline_stats(db_path).items()}
 
 
-def fetch_stock_history_1y_in_context(
-    context: Any,
-    market: int,
-    code: str,
-    source_url: str,
-    user_agent: str,
-    page: Optional[Any] = None,
-    retries: int = 3,
-    end_date: Optional[str] = None,
-) -> Dict[str, Any]:
-    api_url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = build_history_query_params(market, code, end_date=end_date)
-    full_url = f"{api_url}?{urlencode(params, safe=',')}"
-    own_page = page is None
-    page = page or get_or_create_page(context)
-    try:
-        last_error: Optional[Exception] = None
-        for attempt in range(1, max(1, retries) + 1):
-            texts: List[Tuple[str, str]] = []
-            errors: List[str] = []
-
-            try:
-                api_resp = context.request.get(
-                    full_url,
-                    headers={
-                        "Accept": "application/json,text/plain,*/*",
-                        "Referer": source_url,
-                        "User-Agent": user_agent,
-                    },
-                    timeout=45000,
-                )
-                texts.append(("request", api_resp.text()))
-            except Exception as exc:
-                errors.append(f"request failed: {exc}")
-
-            try:
-                page.goto(source_url, wait_until="domcontentloaded", timeout=30000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(500 + attempt * 250)
-                text = page.evaluate(
-                    """async (url) => {
-                        const resp = await fetch(url, {
-                            method: "GET",
-                            headers: { "accept": "application/json,text/plain,*/*" },
-                            credentials: "include",
-                        });
-                        return await resp.text();
-                    }""",
-                    full_url,
-                )
-                texts.append(("page-fetch", text))
-            except Exception as exc:
-                errors.append(f"page-fetch failed: {exc}")
-
-            try:
-                response = page.goto(full_url, wait_until="commit", timeout=45000)
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass
-                text = response.text() if response is not None else page.locator("body").inner_text(timeout=5000)
-                texts.append(("page-goto", text))
-            except Exception as exc:
-                errors.append(f"page-goto failed: {exc}")
-
-            for method, text in texts:
-                try:
-                    payload = json.loads(text or "{}")
-                    data = payload.get("data", {})
-                    if data and data.get("klines"):
-                        if method != "request":
-                            print(f"History {market}.{code} succeeded via {method}")
-                        return payload
-                    rc = payload.get("rc")
-                    rt = payload.get("rt")
-                    message = payload.get("message") or payload.get("msg") or ""
-                    last_error = RuntimeError(
-                        f"empty klines payload via {method}; rc={rc} rt={rt} message={message}"
-                    )
-                except Exception as exc:
-                    snippet = str(text or "")[:180].replace("\n", " ")
-                    last_error = RuntimeError(f"invalid payload via {method}: {exc}; body={snippet}")
-
-            if errors and last_error is None:
-                last_error = RuntimeError(" | ".join(errors))
-
-            if attempt < max(1, retries):
-                wait_s = 2.0 * attempt
-                print(f"Retry history {market}.{code} attempt {attempt + 1}/{retries} after: {last_error}")
-                time.sleep(wait_s)
-
-        raise RuntimeError(str(last_error or "history request failed"))
-    finally:
-        if own_page:
-            page.close()
-
-
 def download_history_1y_for_batch(
     db_path: Path,
     batch_id: str,
@@ -565,27 +463,22 @@ def download_history_1y_for_batch(
     total_rows = 0
     failures = []
     consecutive_failures = 0
-    history_page = get_or_create_page(context)
     for idx, stock in enumerate(stocks, start=1):
         market = int(stock["market"])
         code = str(stock["code"])
         name = str(stock.get("name") or "")
-        source_url = str(stock["source_url"])
         try:
-            payload = fetch_stock_history_1y_in_context(
-                context,
-                market,
-                code,
-                source_url,
-                user_agent=user_agent,
-                page=history_page,
-                end_date=end_date,
-            )
-            row_count = save_history_klines(db_path, source_url, market, code, payload)
+            end_yyyymmdd = (end_date or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
+            start_yyyymmdd = (datetime.strptime(end_yyyymmdd, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+            df, source_name = fetch_kline_with_akshare(code, start_yyyymmdd, end_yyyymmdd, "qfq", source="auto")
+            records = df.to_dict(orient="records")
+            if not records:
+                raise RuntimeError("AKShare returned empty rows")
+            row_count = save_akshare_kline_rows(db_path, market, code, name, records, source_name)
             ok_count += 1
             total_rows += row_count
             consecutive_failures = 0
-            print(f"[{idx}/{len(stocks)}] saved {row_count} rows for {market}.{code} {name}")
+            print(f"[{idx}/{len(stocks)}] saved {row_count} rows for {market}.{code} {name} via AKShare ({source_name})")
         except Exception as exc:
             consecutive_failures += 1
             failures.append(f"{code}: {exc}")
@@ -1797,6 +1690,16 @@ def auto_download_xlsx(
         pass
 
     try:
+        # Path A: some page versions start download immediately when clicking "下载列表/导出".
+        with page.expect_download(timeout=12000) as dl_info:
+            opened = click_download_button(page)
+        print(f"Download popup opened/clicked: {opened}")
+        return dl_info.value
+    except Exception as exc:
+        print(f"Direct download event not captured on first click: {exc}")
+
+    try:
+        # Path B: classic flow requires clicking the orange "下载" in a popup/panel.
         opened = click_download_button(page)
         print(f"Download popup opened/clicked: {opened}")
         page.wait_for_timeout(800)
@@ -1807,6 +1710,16 @@ def auto_download_xlsx(
         return dl_info.value
     except Exception as exc:
         print(f"Auto confirm download did not produce a download event: {exc}")
+
+    try:
+        # Path C: fallback retry by clicking text buttons named "下载" directly.
+        with page.expect_download(timeout=12000) as dl_info:
+            if not click_first(page, ["下载", "下载列表", "导出Excel", "导出"]):
+                raise RuntimeError("no downloadable button found in fallback path")
+        print("Fallback click produced download event.")
+        return dl_info.value
+    except Exception as exc:
+        print(f"Fallback direct click did not produce a download event: {exc}")
 
     if not manual_download:
         raise RuntimeError("Could not trigger download button automatically.")

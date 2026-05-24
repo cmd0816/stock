@@ -29,8 +29,9 @@ def sqlite_connect_with_retry(db_path: Path, retries: int = 3, sleep_seconds: fl
     last_error: Exception | None = None
     for attempt in range(max(1, retries)):
         try:
-            conn = sqlite3.connect(str(db_path), timeout=12)
+            conn = sqlite3.connect(str(db_path), timeout=12, check_same_thread=False)
             conn.execute("PRAGMA busy_timeout = 12000")
+            conn.execute("PRAGMA journal_mode = WAL")
             return conn
         except sqlite3.OperationalError as exc:
             last_error = exc
@@ -86,6 +87,37 @@ def fetch_daily_rows(db_path: Path, limit: int, code: str = "") -> List[Dict[str
         return [dict(r) for r in rows]
     except sqlite3.OperationalError:
         return []
+
+
+def fetch_latest_daily_rows_by_codes(db_path: Path, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    clean_codes = [str(c).strip() for c in codes if str(c).strip()]
+    if not clean_codes:
+        return {}
+    placeholders = ",".join("?" for _ in clean_codes)
+    sql = f"""
+        WITH ranked AS (
+            SELECT
+                id, code, name, secid, trade_date, open, close, high, low,
+                volume, turnover, amplitude_percent, change_percent,
+                change_amount, turnover_rate, fetched_at_utc,
+                ROW_NUMBER() OVER (PARTITION BY code ORDER BY trade_date DESC, id DESC) AS rn
+            FROM eastmoney_stock_daily_klines
+            WHERE code IN ({placeholders})
+        )
+        SELECT
+            id, code, name, secid, trade_date, open, close, high, low,
+            volume, turnover, amplitude_percent, change_percent,
+            change_amount, turnover_rate, fetched_at_utc
+        FROM ranked
+        WHERE rn = 1
+    """
+    try:
+        with sqlite_connect_with_retry(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, clean_codes).fetchall()
+        return {str(r["code"]): dict(r) for r in rows if r["code"]}
+    except sqlite3.OperationalError:
+        return {}
 
 
 def fetch_stock_list(db_path: Path) -> List[Dict[str, Any]]:
@@ -248,148 +280,148 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
             conn.row_factory = sqlite3.Row
             out: Dict[str, Any] = {"screening_top_n": screening_top_n}
 
-        if table_exists(conn, "eastmoney_stock_daily_klines"):
-            out["kline_coverage"] = [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT
-                        code,
-                        COALESCE(MAX(name), '') AS name,
-                        COUNT(*) AS day_count,
-                        MIN(trade_date) AS first_date,
-                        MAX(trade_date) AS last_date
-                    FROM eastmoney_stock_daily_klines
-                    GROUP BY code
-                    ORDER BY code
-                    """
-                ).fetchall()
-            ]
-        else:
-            out["kline_coverage"] = []
+            if table_exists(conn, "eastmoney_stock_daily_klines"):
+                out["kline_coverage"] = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT
+                            code,
+                            COALESCE(MAX(name), '') AS name,
+                            COUNT(*) AS day_count,
+                            MIN(trade_date) AS first_date,
+                            MAX(trade_date) AS last_date
+                        FROM eastmoney_stock_daily_klines
+                        GROUP BY code
+                        ORDER BY code
+                        """
+                    ).fetchall()
+                ]
+            else:
+                out["kline_coverage"] = []
 
-        if table_exists(conn, "xuangu_batches"):
-            out["xuangu_batches"] = [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT batch_id, imported_at_utc, row_count, xlsx_path
-                    FROM xuangu_batches
-                    ORDER BY imported_at_utc DESC
-                    LIMIT 10
-                    """
-                ).fetchall()
-            ]
-        else:
-            out["xuangu_batches"] = []
+            if table_exists(conn, "xuangu_batches"):
+                out["xuangu_batches"] = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT batch_id, imported_at_utc, row_count, xlsx_path
+                        FROM xuangu_batches
+                        ORDER BY imported_at_utc DESC
+                        LIMIT 10
+                        """
+                    ).fetchall()
+                ]
+            else:
+                out["xuangu_batches"] = []
 
-        if table_exists(conn, "xuangu_results") and table_exists(conn, "xuangu_batches"):
-            selected_batch_id = batch_id
-            if not selected_batch_id:
-                row = conn.execute(
+            if table_exists(conn, "xuangu_results") and table_exists(conn, "xuangu_batches"):
+                selected_batch_id = batch_id
+                if not selected_batch_id:
+                    row = conn.execute(
+                        """
+                        SELECT batch_id FROM xuangu_batches
+                        ORDER BY imported_at_utc DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    selected_batch_id = str(row["batch_id"]) if row else ""
+                out["selected_xuangu_batch_id"] = selected_batch_id
+                out["latest_xuangu_results"] = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT row_no, stock_code, stock_name, row_json
+                        FROM xuangu_results
+                        WHERE batch_id = ?
+                        ORDER BY row_no
+                        LIMIT 1000
+                        """,
+                        (selected_batch_id,),
+                    ).fetchall()
+                ]
+            else:
+                out["selected_xuangu_batch_id"] = ""
+                out["latest_xuangu_results"] = []
+
+            if table_exists(conn, "weekly_selected_stocks"):
+                out["weekly_selected"] = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT run_id, screen_date, code, name, rank_no, total_score, selected_reason
+                        FROM weekly_selected_stocks
+                        ORDER BY id DESC
+                        LIMIT 20
+                        """
+                    ).fetchall()
+                ]
+            else:
+                out["weekly_selected"] = []
+
+            if table_exists(conn, "weekly_review_results"):
+                out["weekly_reviews"] = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT
+                            CASE
+                                WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN '待复盘'
+                                WHEN meets_expectation = 1 THEN '成功'
+                                ELSE '失败'
+                            END AS result,
+                            code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
+                            CASE WHEN stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
+                            CASE WHEN meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
+                            notes
+                        FROM weekly_review_results
+                        ORDER BY id DESC
+                        LIMIT 20
+                        """
+                    ).fetchall()
+                ]
+                latest_review_row = conn.execute(
                     """
-                    SELECT batch_id FROM xuangu_batches
-                    ORDER BY imported_at_utc DESC
+                    SELECT review_id
+                    FROM weekly_review_runs
+                    ORDER BY review_id DESC
                     LIMIT 1
                     """
                 ).fetchone()
-                selected_batch_id = str(row["batch_id"]) if row else ""
-            out["selected_xuangu_batch_id"] = selected_batch_id
-            out["latest_xuangu_results"] = [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT row_no, stock_code, stock_name, row_json
-                    FROM xuangu_results
-                    WHERE batch_id = ?
-                    ORDER BY row_no
-                    LIMIT 1000
-                    """,
-                    (selected_batch_id,),
-                ).fetchall()
-            ]
-        else:
-            out["selected_xuangu_batch_id"] = ""
-            out["latest_xuangu_results"] = []
-
-        if table_exists(conn, "weekly_selected_stocks"):
-            out["weekly_selected"] = [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT run_id, screen_date, code, name, rank_no, total_score, selected_reason
-                    FROM weekly_selected_stocks
-                    ORDER BY id DESC
-                    LIMIT 20
-                    """
-                ).fetchall()
-            ]
-        else:
-            out["weekly_selected"] = []
-
-        if table_exists(conn, "weekly_review_results"):
-            out["weekly_reviews"] = [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT
-                        CASE
-                            WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN '待复盘'
-                            WHEN meets_expectation = 1 THEN '成功'
-                            ELSE '失败'
-                        END AS result,
-                        code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
-                        CASE WHEN stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
-                        CASE WHEN meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
-                        notes
-                    FROM weekly_review_results
-                    ORDER BY id DESC
-                    LIMIT 20
-                    """
-                ).fetchall()
-            ]
-            latest_review_row = conn.execute(
-                """
-                SELECT review_id
-                FROM weekly_review_runs
-                ORDER BY review_id DESC
-                LIMIT 1
-                """
-            ).fetchone()
-            if latest_review_row is not None:
-                latest_review_id = int(latest_review_row["review_id"] if isinstance(latest_review_row, sqlite3.Row) else latest_review_row[0])
-                summary_row = conn.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS total_count,
-                        SUM(CASE WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
-                        SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
-                        SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count
-                    FROM weekly_review_results
-                    WHERE review_id = ?
-                    """,
-                    (latest_review_id,),
-                ).fetchone()
-                total_count = int((summary_row["total_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[0]) or 0)
-                pending_count = int((summary_row["pending_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[1]) or 0)
-                reviewed_count = int((summary_row["reviewed_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[2]) or 0)
-                success_count = int((summary_row["success_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[3]) or 0)
-                success_rate_pct = (success_count / reviewed_count * 100.0) if reviewed_count else 0.0
-                out["weekly_review_summary"] = {
-                    "review_id": latest_review_id,
-                    "total_count": total_count,
-                    "pending_count": pending_count,
-                    "reviewed_count": reviewed_count,
-                    "success_count": success_count,
-                    "success_rate_pct": success_rate_pct,
-                }
+                if latest_review_row is not None:
+                    latest_review_id = int(latest_review_row["review_id"] if isinstance(latest_review_row, sqlite3.Row) else latest_review_row[0])
+                    summary_row = conn.execute(
+                        """
+                        SELECT
+                            COUNT(*) AS total_count,
+                            SUM(CASE WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
+                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
+                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count
+                        FROM weekly_review_results
+                        WHERE review_id = ?
+                        """,
+                        (latest_review_id,),
+                    ).fetchone()
+                    total_count = int((summary_row["total_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[0]) or 0)
+                    pending_count = int((summary_row["pending_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[1]) or 0)
+                    reviewed_count = int((summary_row["reviewed_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[2]) or 0)
+                    success_count = int((summary_row["success_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[3]) or 0)
+                    success_rate_pct = (success_count / reviewed_count * 100.0) if reviewed_count else 0.0
+                    out["weekly_review_summary"] = {
+                        "review_id": latest_review_id,
+                        "total_count": total_count,
+                        "pending_count": pending_count,
+                        "reviewed_count": reviewed_count,
+                        "success_count": success_count,
+                        "success_rate_pct": success_rate_pct,
+                    }
+                else:
+                    out["weekly_review_summary"] = None
             else:
+                out["weekly_reviews"] = []
                 out["weekly_review_summary"] = None
-        else:
-            out["weekly_reviews"] = []
-            out["weekly_review_summary"] = None
 
-        return out
+            return out
     except sqlite3.OperationalError:
         return {
             "screening_top_n": screening_top_n,
@@ -573,19 +605,46 @@ def fetch_weekly_review_history(
 
         detail_rows = conn.execute(
             """
+            WITH latest_code_ml AS (
+                SELECT p1.code, p1.probability_up, p1.predicted_score
+                FROM weekly_ml_predictions p1
+                JOIN (
+                    SELECT code, MAX(id) AS max_id
+                    FROM weekly_ml_predictions
+                    GROUP BY code
+                ) t
+                  ON t.code = p1.code
+                 AND t.max_id = p1.id
+            )
             SELECT
                 CASE
-                    WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN '待复盘'
-                    WHEN meets_expectation = 1 THEN '成功'
+                    WHEN rr.review_start_date IS NULL OR rr.notes LIKE 'K线不足%' THEN '待复盘'
+                    WHEN rr.meets_expectation = 1 THEN '成功'
                     ELSE '失败'
                 END AS result,
-                code, name, highest_gain_pct, close_gain_pct, max_drawdown_pct,
-                CASE WHEN stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
-                CASE WHEN meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
-                notes
-            FROM weekly_review_results
-            WHERE review_id = ?
-            ORDER BY id DESC
+                rr.code,
+                rr.name,
+                COALESCE(p_run.probability_up, p_latest.probability_up) AS ml_probability_up,
+                COALESCE(p_run.predicted_score, p_latest.predicted_score) AS ml_predicted_score,
+                rr.highest_gain_pct,
+                rr.close_gain_pct,
+                rr.max_drawdown_pct,
+                CASE WHEN rr.stop_loss_triggered = 1 THEN '是' ELSE '否' END AS stop_loss_triggered,
+                CASE WHEN rr.meets_expectation = 1 THEN '是' ELSE '否' END AS meets_expectation,
+                rr.notes
+            FROM weekly_review_results rr
+            LEFT JOIN weekly_review_runs wr
+                ON wr.review_id = rr.review_id
+            LEFT JOIN weekly_ml_predictions p_run
+                ON p_run.source_run_id = wr.reviewed_run_id
+               AND p_run.code = rr.code
+            LEFT JOIN latest_code_ml p_latest
+                ON p_latest.code = rr.code
+            WHERE rr.review_id = ?
+            ORDER BY
+                CASE WHEN COALESCE(p_run.predicted_score, p_latest.predicted_score) IS NULL THEN 1 ELSE 0 END,
+                COALESCE(p_run.predicted_score, p_latest.predicted_score) DESC,
+                rr.id DESC
             """,
             (selected_review_id,),
         ).fetchall()
@@ -1357,6 +1416,8 @@ def build_reviews_html(review_data: Dict[str, Any], message: str = "", error: st
             ("result", "结果"),
             ("code", "代码"),
             ("name", "名称"),
+            ("ml_predicted_score", "ML综合分"),
+            ("ml_probability_up", "ML概率"),
             ("highest_gain_pct", "最高涨幅%"),
             ("close_gain_pct", "收盘涨幅%"),
             ("max_drawdown_pct", "最大回撤%"),
@@ -1873,6 +1934,7 @@ def build_daily_html(
           <div class="legend">
             <span><b style="color:#dc2626">阳线</b></span>
             <span><b style="color:#16a34a">阴线</b></span>
+            <span><b style="color:#64748b">成交量</b></span>
             <span><b style="color:#f59e0b">MA5</b></span>
             <span><b style="color:#3b82f6">MA10</b></span>
             <span><b style="color:#ef4444">MA20</b></span>
@@ -1907,7 +1969,7 @@ def build_daily_html(
       const ctx = canvas.getContext('2d');
       const chipCtx = chipCanvas.getContext('2d');
       const pad = {{ left: 58, right: 20, top: 18, bottom: 34 }};
-      const chartH = 420;
+      const chartH = 460;
       const maPeriods = [5, 10, 20, 30, 60, 120, 250];
       const maColors = {{
         5: '#f59e0b',
@@ -1918,19 +1980,25 @@ def build_daily_html(
         120: '#0f766e',
         250: '#374151',
       }};
+      const toNumOrNaN = (v) => {{
+        if (v === null || v === undefined) return Number.NaN;
+        if (typeof v === 'string' && v.trim() === '') return Number.NaN;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : Number.NaN;
+      }};
 
       const points = rows
         .map((r) => ({{
           trade_date: r.trade_date,
-          open: Number(r.open),
-          close: Number(r.close),
-          high: Number(r.high),
-          low: Number(r.low),
-          volume: Number(r.volume),
-          turnover: Number(r.turnover),
-          change_percent: Number(r.change_percent),
-          change_amount: Number(r.change_amount),
-          turnover_rate: Number(r.turnover_rate),
+          open: toNumOrNaN(r.open),
+          close: toNumOrNaN(r.close),
+          high: toNumOrNaN(r.high),
+          low: toNumOrNaN(r.low),
+          volume: toNumOrNaN(r.volume),
+          turnover: toNumOrNaN(r.turnover),
+          change_percent: toNumOrNaN(r.change_percent),
+          change_amount: toNumOrNaN(r.change_amount),
+          turnover_rate: toNumOrNaN(r.turnover_rate),
         }}))
         .filter((r) => ![r.open, r.close, r.high, r.low].some((v) => Number.isNaN(v)));
 
@@ -1959,6 +2027,7 @@ def build_daily_html(
 
       const fmt = (v, n = 2) => Number.isFinite(v) ? v.toLocaleString(undefined, {{ minimumFractionDigits: n, maximumFractionDigits: n }}) : '-';
       const fmtInt = (v) => Number.isFinite(v) ? Math.round(v).toLocaleString() : '-';
+      const fmtPct = (v) => Number.isFinite(v) ? `${{fmt(v)}}%` : '-';
       const clamp = (v, mn, mx) => Math.max(mn, Math.min(mx, v));
 
       const getStartIndex = () => Math.max(0, endIndex - visibleCount + 1);
@@ -2008,7 +2077,11 @@ def build_daily_html(
         chipCtx.clearRect(0, 0, chipW, chartH);
 
         const plotW = width - pad.left - pad.right;
-        const plotH = chartH - pad.top - pad.bottom;
+        const totalPlotH = chartH - pad.top - pad.bottom;
+        const volumeGap = 12;
+        const volumePlotH = Math.max(60, Math.min(120, Math.round(totalPlotH * 0.22)));
+        const plotH = totalPlotH - volumePlotH - volumeGap;
+        const volumeTop = pad.top + plotH + volumeGap;
         if (plotW <= 20 || plotH <= 20) return;
 
         const allValues = [];
@@ -2026,6 +2099,7 @@ def build_daily_html(
         const margin = (maxV - minV) * 0.06;
         minV -= margin;
         maxV += margin;
+        const maxVolume = Math.max(...visible.map((p) => (Number.isFinite(p.volume) && p.volume > 0 ? p.volume : 0)), 1);
 
         const xStep = plotW / Math.max(1, visible.length - 1);
         const candleW = Math.max(3, Math.min(9, xStep * 0.65));
@@ -2036,6 +2110,13 @@ def build_daily_html(
         ctx.lineWidth = 1;
         for (let i = 0; i <= 4; i++) {{
           const y = pad.top + (plotH * i / 4);
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(width - pad.right, y);
+          ctx.stroke();
+        }}
+        for (let i = 0; i <= 2; i++) {{
+          const y = volumeTop + (volumePlotH * i / 2);
           ctx.beginPath();
           ctx.moveTo(pad.left, y);
           ctx.lineTo(width - pad.right, y);
@@ -2062,6 +2143,18 @@ def build_daily_html(
           const top = Math.min(yo, yc);
           const h = Math.max(1, Math.abs(yc - yo));
           ctx.fillRect(x - candleW / 2, top, candleW, h);
+        }}
+
+        // Volume bars
+        for (let i = 0; i < visible.length; i++) {{
+          const p = visible[i];
+          const x = pad.left + i * xStep;
+          const up = p.close >= p.open;
+          const color = up ? 'rgba(220,38,38,0.42)' : 'rgba(22,163,74,0.42)';
+          const vol = Number.isFinite(p.volume) && p.volume > 0 ? p.volume : 0;
+          const vh = maxVolume > 0 ? (vol / maxVolume) * volumePlotH : 0;
+          ctx.fillStyle = color;
+          ctx.fillRect(x - candleW / 2, volumeTop + volumePlotH - vh, candleW, Math.max(1, vh));
         }}
 
         // MAs
@@ -2092,6 +2185,8 @@ def build_daily_html(
         ctx.font = '12px sans-serif';
         ctx.fillText(fmt(maxV), 6, pad.top + 10);
         ctx.fillText(fmt(minV), 6, pad.top + plotH);
+        ctx.fillText('VOL', 10, volumeTop + 12);
+        ctx.fillText(fmtInt(maxVolume), 6, volumeTop + volumePlotH);
         ctx.fillText(visible[0].trade_date || '', pad.left, chartH - 8);
         const endTxt = visible[visible.length - 1].trade_date || '';
         const tw = ctx.measureText(endTxt).width;
@@ -2171,7 +2266,7 @@ def build_daily_html(
           ctx.lineWidth = 1;
           ctx.beginPath();
           ctx.moveTo(x, pad.top);
-          ctx.lineTo(x, pad.top + plotH);
+          ctx.lineTo(x, volumeTop + volumePlotH);
           ctx.moveTo(pad.left, y);
           ctx.lineTo(width - pad.right, y);
           ctx.stroke();
@@ -2199,7 +2294,7 @@ def build_daily_html(
             `最低：${{fmt(p.low)}}`,
             `收盘：${{fmt(p.close)}}`,
             `涨跌：${{fmt(p.change_amount)}} (${{cp}})`,
-            `换手率：${{fmt(p.turnover_rate)}}%`,
+            `换手率：${{fmtPct(p.turnover_rate)}}`,
             `成交量：${{fmtInt(p.volume)}}`,
           ];
           tooltip.innerHTML = tips.join('<br>');
@@ -2622,11 +2717,11 @@ def make_handler(db_path: Path, limit: int):
                         using_cached_top = True
                 top_codes = [str(row.get("code") or "") for row in selected_rows if row.get("code")]
                 selected_code = code if code in top_codes else (top_codes[0] if top_codes else "")
+                latest_by_code = fetch_latest_daily_rows_by_codes(db_path, top_codes)
                 top_stock_list = []
                 for row in selected_rows:
                     stock_code = str(row.get("code") or "")
-                    latest_rows = fetch_daily_rows(db_path, 1, code=stock_code) if stock_code else []
-                    latest = latest_rows[0] if latest_rows else {}
+                    latest = latest_by_code.get(stock_code, {}) if stock_code else {}
                     ml_probability = row.get("ml_probability_up")
                     side_text = ""
                     side_class = ""

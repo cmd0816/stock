@@ -110,6 +110,8 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 20, retries: int
         "curl",
         "-sS",
         "-L",
+        "--http1.1",
+        "--compressed",
         "--retry",
         "4",
         "--retry-delay",
@@ -127,6 +129,71 @@ def fetch_json(url: str, params: Dict[str, Any], timeout: int = 20, retries: int
         result = subprocess.run(curl_cmd, capture_output=True, text=True, check=True)
         return json.loads(result.stdout)
     except Exception as exc:
+        # Dedicated retry path for Eastmoney history endpoint:
+        # warm up cookies from quote page, then request kline API with same cookie jar.
+        if "push2his.eastmoney.com/api/qt/stock/kline/get" in url:
+            secid = str(params.get("secid") or "")
+            try:
+                market_text, code = secid.split(".", 1)
+                prefix = "sh" if market_text == "1" else "sz"
+                quote_url = f"https://quote.eastmoney.com/concept/{prefix}{code}.html"
+                warm_cmd = [
+                    "curl",
+                    "-sS",
+                    "-L",
+                    "--http1.1",
+                    "--compressed",
+                    "--max-time",
+                    str(timeout),
+                    "-c",
+                    "-",
+                    "-H",
+                    f"User-Agent: {USER_AGENT}",
+                    quote_url,
+                ]
+                warm = subprocess.run(warm_cmd, capture_output=True, text=True, check=True)
+                cookie_lines = []
+                for line in warm.stdout.splitlines():
+                    if line.startswith("#") or "\t" not in line:
+                        continue
+                    cookie_lines.append(line)
+                if cookie_lines:
+                    tmp_cookie = Path("/tmp") / f"em_cookie_{int(time.time() * 1000)}.txt"
+                    try:
+                        tmp_cookie.write_text(
+                            "# Netscape HTTP Cookie File\n" + "\n".join(cookie_lines) + "\n",
+                            encoding="utf-8",
+                        )
+                        cookie_cmd = [
+                            "curl",
+                            "-sS",
+                            "-L",
+                            "--http1.1",
+                            "--compressed",
+                            "--retry",
+                            "4",
+                            "--retry-delay",
+                            "1",
+                            "--retry-all-errors",
+                            "--max-time",
+                            str(timeout),
+                            "-b",
+                            str(tmp_cookie),
+                            "-H",
+                            f"User-Agent: {USER_AGENT}",
+                            "-H",
+                            "Referer: https://quote.eastmoney.com/",
+                            full_url,
+                        ]
+                        result2 = subprocess.run(cookie_cmd, capture_output=True, text=True, check=True)
+                        return json.loads(result2.stdout)
+                    finally:
+                        try:
+                            tmp_cookie.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         raise RuntimeError(f"Request failed for {full_url}: {last_error}; curl fallback failed: {exc}") from exc
 
 

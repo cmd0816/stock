@@ -1,6 +1,7 @@
 # Core dependency for browser-based fallback mode
 playwright==1.59.0
 openpyxl==3.1.5
+baostock==0.9.1
 PyYAML==6.0.2
 numpy
 scikit-learn
