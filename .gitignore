@@ -20,4 +20,6 @@ downloads/
 
 screening.txt
 stocks.db
+stocks.db-shm
+stocks.db-wal
 *.db
