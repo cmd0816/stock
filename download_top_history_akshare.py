@@ -65,8 +65,6 @@ def extract_turnover_rate(item: dict[str, Any], source_name: str) -> float | Non
     turnover = to_float(item.get("turnover"))
     if turnover is None:
         return None
-    if source_name == "stock_zh_a_daily":
-        return turnover
     return turnover * 100
 
 

@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -86,6 +87,66 @@ def get_latest_xuangu_batch_id(db_path: Path) -> Optional[str]:
             """
         ).fetchone()
     return str(row[0]) if row else None
+
+
+def get_latest_selected_run_with_batch(db_path: Path) -> Optional[Tuple[int, str]]:
+    if not db_path.exists():
+        return None
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT r.run_id, COALESCE(r.xuangu_batch_id, '') AS batch_id
+                FROM weekly_screen_runs r
+                WHERE EXISTS (SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id)
+                ORDER BY r.screen_date DESC, r.run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    return int(row["run_id"]), str(row["batch_id"] or "")
+
+
+def try_review_previous_selected_run(
+    project_root: Path,
+    db_path: Path,
+    previous_batch_id: str,
+    current_batch_id: str,
+    review_date: Optional[str] = None,
+) -> None:
+    if not previous_batch_id or previous_batch_id == current_batch_id:
+        return
+    previous_run = get_latest_selected_run_with_batch(db_path)
+    if previous_run is None:
+        return
+    prev_run_id, prev_run_batch = previous_run
+    if prev_run_batch != previous_batch_id:
+        return
+
+    config_path = project_root / "config/weekly_strategy.yaml"
+    cmd = [
+        sys.executable,
+        str(project_root / "weekly_stock_main.py"),
+        "--config",
+        str(config_path),
+        "review",
+        "--run-id",
+        str(prev_run_id),
+    ]
+    if review_date:
+        cmd.extend(["--date", review_date])
+    print(
+        f"Detected new xuangu batch {current_batch_id}; "
+        f"review previous selected run_id={prev_run_id} (batch={previous_batch_id})."
+    )
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as exc:
+        print(f"Warning: auto review previous run failed: {exc}")
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -1789,6 +1850,11 @@ def main() -> None:
         action="store_true",
         help="Require page condition text to exactly contain screening.txt after normalization",
     )
+    parser.add_argument(
+        "--skip-auto-review-prev",
+        action="store_true",
+        help="Do not auto review previous selected run when a new xuangu batch is imported.",
+    )
 
     parser.add_argument("--browser-engine", default="chromium", choices=["chromium", "firefox", "webkit"])
     parser.add_argument("--browser-channel", default="chrome", help="Chromium channel: chrome/chromium/msedge")
@@ -1798,6 +1864,8 @@ def main() -> None:
     args = parser.parse_args()
 
     db_path = Path(args.db).expanduser().resolve()
+    root_dir = Path(__file__).resolve().parent
+    previous_latest_batch_id = get_latest_xuangu_batch_id(db_path) or ""
     download_dir = Path(args.download_dir).expanduser().resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
     timeout_ms = max(10, args.timeout) * 1000
@@ -1873,6 +1941,14 @@ def main() -> None:
         )
         print(f"Imported xlsx: {xlsx_path}")
         print(f"Imported batch_id={batch_id}, sheets={sheet_count}, rows={row_count} into {db_path}")
+        if not args.skip_auto_review_prev:
+            try_review_previous_selected_run(
+                project_root=root_dir,
+                db_path=db_path,
+                previous_batch_id=previous_latest_batch_id,
+                current_batch_id=batch_id,
+                review_date=args.history_end_date,
+            )
         return
 
     browser, context = launch_context(
@@ -1947,6 +2023,14 @@ def main() -> None:
         )
         print(f"Download saved: {xlsx_path}")
         print(f"Imported batch_id={batch_id}, sheets={sheet_count}, rows={row_count} into {db_path}")
+        if not args.skip_auto_review_prev:
+            try_review_previous_selected_run(
+                project_root=root_dir,
+                db_path=db_path,
+                previous_batch_id=previous_latest_batch_id,
+                current_batch_id=batch_id,
+                review_date=args.history_end_date,
+            )
         if args.skip_history_1y:
             print("Skipped 1-year daily K-line history download.")
         else:

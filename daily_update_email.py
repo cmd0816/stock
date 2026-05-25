@@ -33,17 +33,40 @@ def parse_log(log_text: str) -> dict:
     if m_download:
         stats["pending_stocks"] = int(m_download.group(1))
         stats["skipped_covered"] = int(m_download.group(2))
+    else:
+        # Compatibility with download_batch_history.py logs.
+        m_download_batch = re.search(
+            r"Batch \S+: (\d+) stocks pending \(skipped (\d+) already covered\)",
+            log_text,
+        )
+        if m_download_batch:
+            stats["pending_stocks"] = int(m_download_batch.group(1))
+            stats["skipped_covered"] = int(m_download_batch.group(2))
 
     m_summary = re.search(r"History download summary: stocks_ok=(\d+), rows_saved=(\d+)", log_text)
     if m_summary:
         stats["stocks_ok"] = int(m_summary.group(1))
         stats["rows_saved"] = int(m_summary.group(2))
+    else:
+        # Compatibility with download_batch_history.py logs.
+        m_summary_batch = re.search(
+            r"Download summary: total=(\d+), baostock_ok=(\d+), akshare_ok=(\d+), failed=(\d+)",
+            log_text,
+        )
+        if m_summary_batch:
+            baostock_ok = int(m_summary_batch.group(2))
+            akshare_ok = int(m_summary_batch.group(3))
+            stats["stocks_ok"] = baostock_ok + akshare_ok
+            stats["failure_count"] = int(m_summary_batch.group(4))
 
     m_fail = re.search(r"History download completed with (\d+) failures:", log_text)
     if m_fail:
         stats["failure_count"] = int(m_fail.group(1))
 
-    stats["all_covered"] = "already have at least" in log_text and "skip history download" in log_text
+    stats["all_covered"] = (
+        ("already have at least" in log_text and "skip history download" in log_text)
+        or ("already have sufficient K-line data" in log_text and "skip download" in log_text)
+    )
     return stats
 
 

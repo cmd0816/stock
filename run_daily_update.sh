@@ -13,22 +13,12 @@ if [[ ! -x "$VENV_PY" ]]; then
   echo "  python3 -m venv .venv"
   echo "  source .venv/bin/activate"
   echo "  pip install -r requirements.txt"
-  echo "  playwright install chromium firefox"
   exit 1
 fi
 
 if [[ ! -f "$DB_PATH" ]]; then
   echo "Error: DB not found: $DB_PATH"
   echo "Run ./run_weekly.sh or ./run_xuangu.sh first."
-  exit 1
-fi
-
-if ! "$VENV_PY" -c "import playwright" >/dev/null 2>&1; then
-  echo "Error: missing playwright in .venv"
-  echo "Run:"
-  echo "  source $SCRIPT_DIR/.venv/bin/activate"
-  echo "  pip install -r $SCRIPT_DIR/requirements.txt"
-  echo "  playwright install firefox"
   exit 1
 fi
 
@@ -71,51 +61,178 @@ BATCH_ID="${XUANGU_BATCH_ID:-$LATEST_BATCH_ID}"
 
 if [[ -z "$BATCH_ID" ]]; then
   echo "Error: no xuangu batch found in $DB_PATH"
-  echo "Run ./run_weekly.sh or import a xuangu XLSX first."
+  echo "Run ./run_xuangu.sh or import a xuangu XLSX first."
   exit 1
 fi
 
-echo "Daily K-line update"
+echo "Daily update: download K-line -> review previous (when new batch) -> screen latest batch -> ML predict"
 echo "Project: $SCRIPT_DIR"
 echo "Target date: $TARGET_DATE"
 echo "China trading aligned date: $ALIGNED_DATE"
 echo "Xuangu batch: $BATCH_ID"
 echo
 
-ARGS=(
-  "$SCRIPT_DIR/xuangu_to_sqlite.py"
-  --history-only
-  --url "https://xuangu.eastmoney.com/"
-  --db "$DB_PATH"
-  --download-dir "$SCRIPT_DIR/downloads"
-  --batch-id "$BATCH_ID"
-  --history-end-date "$ALIGNED_DATE"
-  --history-delay "${HISTORY_DELAY:-1.5}"
-  --browser-engine firefox
-)
-
-if [[ -n "${HISTORY_LIMIT:-}" ]]; then
-  ARGS+=(--history-limit "$HISTORY_LIMIT")
-fi
-
-if [[ -n "${HISTORY_MIN_EXISTING_DAYS:-}" ]]; then
-  ARGS+=(--history-min-existing-days "$HISTORY_MIN_EXISTING_DAYS")
-fi
-
-if [[ "${WAIT_LOGIN:-0}" == "1" ]]; then
-  ARGS+=(--browser-headed --wait-login)
-elif [[ "${BROWSER_HEADED:-0}" == "1" ]]; then
-  ARGS+=(--browser-headed)
-fi
-
 LOG_DIR="$SCRIPT_DIR/downloads/logs"
 mkdir -p "$LOG_DIR"
 RUN_LOG="$LOG_DIR/daily_update_${BATCH_ID}_${ALIGNED_DATE}_$(date +%H%M%S).log"
+touch "$RUN_LOG"
+
+RUN_STATUS=0
+
+{
+  echo
+  echo "Step 1/4: Download latest batch daily K-line data (BaoStock first, AKShare fallback)..."
+} | tee -a "$RUN_LOG"
+
+HISTORY_ARGS=(
+  "$SCRIPT_DIR/download_batch_history.py"
+  --db "$DB_PATH"
+  --batch-id "$BATCH_ID"
+  --end-date "$ALIGNED_DATE"
+  --delay "${HISTORY_DELAY:-1.5}"
+)
+
+if [[ -n "${HISTORY_LIMIT:-}" ]]; then
+  HISTORY_ARGS+=(--limit "$HISTORY_LIMIT")
+fi
+
+if [[ -n "${HISTORY_MIN_EXISTING_DAYS:-}" ]]; then
+  HISTORY_ARGS+=(--min-existing-days "$HISTORY_MIN_EXISTING_DAYS")
+fi
 
 set +e
-"$VENV_PY" "${ARGS[@]}" "$@" 2>&1 | tee "$RUN_LOG"
-RUN_STATUS=${PIPESTATUS[0]}
+"$VENV_PY" -u "${HISTORY_ARGS[@]}" 2>&1 | tee -a "$RUN_LOG"
+HISTORY_STATUS=${PIPESTATUS[0]}
 set -e
+if [[ "$HISTORY_STATUS" -ne 0 ]]; then
+  RUN_STATUS=$HISTORY_STATUS
+fi
+
+PREV_RUN_INFO="$("$VENV_PY" - "$DB_PATH" <<'PY'
+import sys
+from pathlib import Path
+from weekly_stock import db
+
+db_path = Path(sys.argv[1])
+with db.connect(db_path) as conn:
+    row = conn.execute(
+        """
+        SELECT r.run_id, COALESCE(r.xuangu_batch_id, '') AS batch_id
+        FROM weekly_screen_runs r
+        WHERE EXISTS (SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id)
+        ORDER BY r.screen_date DESC, r.run_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+if not row:
+    print("|")
+else:
+    print(f"{int(row['run_id'])}|{str(row['batch_id'] or '')}")
+PY
+)"
+PREV_RUN_ID="${PREV_RUN_INFO%%|*}"
+PREV_RUN_BATCH="${PREV_RUN_INFO#*|}"
+
+if [[ -n "$PREV_RUN_ID" && "$PREV_RUN_BATCH" != "$BATCH_ID" ]]; then
+  {
+    echo
+    echo "Step 2/4: New xuangu batch detected, review previous selected run..."
+    echo "Previous run_id=$PREV_RUN_ID batch=$PREV_RUN_BATCH -> current batch=$BATCH_ID"
+  } | tee -a "$RUN_LOG"
+
+  REVIEW_EXISTS="$("$VENV_PY" - "$DB_PATH" "$PREV_RUN_ID" "$ALIGNED_DATE" <<'PY'
+import sys
+from pathlib import Path
+from weekly_stock import db
+
+db_path = Path(sys.argv[1])
+run_id = int(sys.argv[2])
+review_date = sys.argv[3]
+with db.connect(db_path) as conn:
+    row = conn.execute(
+        "SELECT 1 FROM weekly_review_runs WHERE reviewed_run_id = ? AND review_date = ? LIMIT 1",
+        (run_id, review_date),
+    ).fetchone()
+print("1" if row else "")
+PY
+)"
+
+  if [[ -n "$REVIEW_EXISTS" ]]; then
+    echo "Skip review: run_id=$PREV_RUN_ID already reviewed on $ALIGNED_DATE." | tee -a "$RUN_LOG"
+  else
+    set +e
+    "$VENV_PY" -u "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" review --run-id "$PREV_RUN_ID" --date "$ALIGNED_DATE" 2>&1 | tee -a "$RUN_LOG"
+    REVIEW_STATUS=${PIPESTATUS[0]}
+    set -e
+    if [[ "$REVIEW_STATUS" -ne 0 ]]; then
+      RUN_STATUS=$REVIEW_STATUS
+    fi
+  fi
+else
+  {
+    echo
+    echo "Step 2/4: No new xuangu batch switch detected, skip previous-run review."
+  } | tee -a "$RUN_LOG"
+fi
+
+{
+  echo
+  echo "Step 3/4: Screen latest xuangu batch..."
+} | tee -a "$RUN_LOG"
+
+set +e
+SCREEN_OUTPUT=$("$VENV_PY" -u "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" screen --date "$ALIGNED_DATE" --replace-existing --xuangu-batch-id "$BATCH_ID" 2>&1)
+SCREEN_STATUS=$?
+set -e
+echo "$SCREEN_OUTPUT" | tee -a "$RUN_LOG"
+if [[ "$SCREEN_STATUS" -ne 0 ]]; then
+  RUN_STATUS=$SCREEN_STATUS
+fi
+
+RUN_ID="$(printf '%s\n' "$SCREEN_OUTPUT" | sed -n 's/.*run_id=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
+if [[ -z "$RUN_ID" ]]; then
+  RUN_ID="$("$VENV_PY" - "$DB_PATH" "$ALIGNED_DATE" "$BATCH_ID" <<'PY'
+import sys
+from pathlib import Path
+from weekly_stock import db
+db_path = Path(sys.argv[1])
+screen_date = sys.argv[2]
+batch_id = sys.argv[3]
+with db.connect(db_path) as conn:
+    row = conn.execute(
+        """
+        SELECT run_id
+        FROM weekly_screen_runs
+        WHERE screen_date = ?
+          AND COALESCE(xuangu_batch_id, '') = COALESCE(?, '')
+        ORDER BY run_id DESC
+        LIMIT 1
+        """,
+        (screen_date, batch_id),
+    ).fetchone()
+print(int(row["run_id"]) if row else "")
+PY
+)"
+fi
+
+if [[ -n "$RUN_ID" ]]; then
+  echo "Resolved latest run_id: $RUN_ID" | tee -a "$RUN_LOG"
+  {
+    echo
+    echo "Step 4/4: Train ML model and predict using latest selected stocks..."
+  } | tee -a "$RUN_LOG"
+
+  set +e
+  "$VENV_PY" -u "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" predict --run-id "$RUN_ID" 2>&1 | tee -a "$RUN_LOG"
+  PREDICT_STATUS=${PIPESTATUS[0]}
+  set -e
+  if [[ "$PREDICT_STATUS" -ne 0 ]]; then
+    RUN_STATUS=$PREDICT_STATUS
+  fi
+else
+  echo "Warning: failed to resolve run_id after screen; skip ML predict." | tee -a "$RUN_LOG"
+  RUN_STATUS=1
+fi
 
 if [[ -n "${DAILY_EMAIL_TO:-}" ]]; then
   DAILY_UPDATE_DB_PATH="$DB_PATH" \
