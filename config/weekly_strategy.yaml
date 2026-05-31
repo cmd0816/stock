@@ -54,6 +54,7 @@ review:
 
 ml:
   enabled: false
+  rerank_after_predict: true
   model_name: logistic_regression
   baseline_model_name: logistic_regression
   history_limit: 320

@@ -56,6 +56,41 @@ def add_if(reasons: List[str], condition: bool, reason: str) -> bool:
     return False
 
 
+def compute_tie_breaker(klines: List[Kline]) -> float:
+    """当规则总分相同时，用近期动量/量能/新高接近度做进一步区分。"""
+    if len(klines) < 11:
+        return 0.0
+    last = latest(klines)
+    if last is None or last.close is None or last.close <= 0:
+        return 0.0
+
+    # 1. 近3日涨幅 (-5%~+5% 映射到 0~10)
+    gain_3d = 0.0
+    base = klines[-4]
+    if base.close and base.close > 0:
+        gain_3d = (last.close / base.close - 1) * 100
+    score1 = max(0.0, min(gain_3d + 5.0, 10.0))
+
+    # 2. 收盘价接近10日高点的程度 (0~10)
+    high_10d = max((k.high or 0.0) for k in klines[-10:])
+    score2 = 0.0
+    if high_10d > 0:
+        score2 = (last.close / high_10d) * 10.0
+
+    # 3. 成交量放大倍数 (0~10)
+    recent_vols = [k.volume for k in klines[-3:] if k.volume is not None]
+    base_vols = [k.volume for k in klines[-13:-3] if k.volume is not None]
+    score3 = 0.0
+    if recent_vols and base_vols:
+        recent_mean = mean(recent_vols)
+        base_mean = mean(base_vols)
+        if base_mean and base_mean > 0:
+            ratio = recent_mean / base_mean
+            score3 = min(ratio, 3.0) * (10.0 / 3.0)
+
+    return round(score1 + score2 + score3, 2)
+
+
 def score_candidate(candidate: CandidateStock, klines: List[Kline], config: Dict[str, Any]) -> ScoredStock:
     scoring = config["scoring"]
     weights = scoring["weights"]
@@ -68,6 +103,7 @@ def score_candidate(candidate: CandidateStock, klines: List[Kline], config: Dict
     score.breakout = score_breakout(klines, scoring, weights["breakout"], reasons)
     score.fundamentals = score_fundamentals(candidate, scoring, weights["fundamentals"], reasons)
     score.risk = score_risk(candidate, klines, scoring, weights["risk"], reasons)
+    score.tie_breaker = round(compute_tie_breaker(klines) / 10, 2)
 
     if not klines:
         reasons.append("历史K线不足，主要依据选股结果字段打分")
@@ -193,4 +229,8 @@ def score_risk(candidate: CandidateStock, klines: List[Kline], scoring: Dict[str
 
 def rank_candidates(candidates: List[CandidateStock], klines_by_code: Dict[str, List[Kline]], config: Dict[str, Any]) -> List[ScoredStock]:
     scored = [score_candidate(c, klines_by_code.get(c.code, []), config) for c in candidates]
-    return sorted(scored, key=lambda item: (item.score.total, item.score.trend, item.score.breakout), reverse=True)
+    return sorted(
+        scored,
+        key=lambda item: (item.score.total, item.score.tie_breaker, item.score.trend, item.score.breakout),
+        reverse=True,
+    )

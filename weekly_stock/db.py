@@ -89,6 +89,7 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             max_drawdown_pct REAL,
             stop_loss_triggered INTEGER NOT NULL,
             meets_expectation INTEGER NOT NULL,
+            best_exit_meets_expectation INTEGER NOT NULL DEFAULT 0,
             notes TEXT NOT NULL,
             created_at_utc TEXT NOT NULL,
             FOREIGN KEY (review_id) REFERENCES weekly_review_runs(review_id),
@@ -148,6 +149,7 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_weekly_review_runs_to_append_mode(conn)
+    _add_column_if_missing(conn, "weekly_review_results", "best_exit_meets_expectation", "INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_review_runs_run_id ON weekly_review_runs(reviewed_run_id)")
     conn.commit()
 
@@ -180,6 +182,19 @@ def _migrate_weekly_review_runs_to_append_mode(conn: sqlite3.Connection) -> None
     )
     conn.execute("DROP TABLE weekly_review_runs")
     conn.execute("ALTER TABLE weekly_review_runs_new RENAME TO weekly_review_runs")
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    col_def: str,
+) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(str(r["name"]) == column for r in rows):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+
 
 def latest_xuangu_batch_id(conn: sqlite3.Connection) -> Optional[str]:
     row = conn.execute(
@@ -742,8 +757,8 @@ def save_review_results(conn: sqlite3.Connection, review_id: int, selected_rows:
             INSERT INTO weekly_review_results (
                 review_id, selected_id, code, name, base_trade_date, review_start_date,
                 review_end_date, highest_gain_pct, close_gain_pct, max_drawdown_pct,
-                stop_loss_triggered, meets_expectation, notes, created_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stop_loss_triggered, meets_expectation, best_exit_meets_expectation, notes, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 review_id,
@@ -758,6 +773,7 @@ def save_review_results(conn: sqlite3.Connection, review_id: int, selected_rows:
                 result.max_drawdown_pct,
                 int(result.stop_loss_triggered),
                 int(result.meets_expectation),
+                int(result.best_exit_meets_expectation),
                 result.notes,
                 utc_now(),
             ),

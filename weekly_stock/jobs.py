@@ -289,6 +289,27 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             )
         predictions.sort(key=lambda item: (item["predicted_score"], item["probability_up"]), reverse=True)
         db.save_ml_predictions(conn, model_run_id, source_run_id, predictions)
+
+        # ML re-ranking: reorder selected stocks by predicted_score when enabled
+        rerank_enabled = bool(ml_cfg.get("rerank_after_predict", False))
+        if rerank_enabled:
+            code_to_score = {p["code"]: p["predicted_score"] for p in predictions}
+            selected_rows = db.selected_stocks_for_run(conn, source_run_id)
+            reranked = sorted(
+                selected_rows,
+                key=lambda r: (code_to_score.get(str(r["code"]), 0.0),),
+                reverse=True,
+            )
+            for new_rank, row in enumerate(reranked, start=1):
+                conn.execute(
+                    "UPDATE weekly_selected_stocks SET rank_no = ? WHERE id = ?",
+                    (new_rank, int(row["id"])),
+                )
+            conn.commit()
+            print(
+                f"ML rerank completed: reordered {len(reranked)} selected stocks by predicted_score."
+            )
+
         return model_run_id
 
 
@@ -342,6 +363,7 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
             max_drawdown_pct=None,
             stop_loss_triggered=False,
             meets_expectation=False,
+            best_exit_meets_expectation=False,
             notes="K线不足，无法完整复盘；" + "；".join(reasons),
         )
 
@@ -358,6 +380,7 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         close_gain is not None and close_gain >= expected_close
     )
     meets = target_hit and not stop_loss
+    best_exit_meets = target_hit  # 假设达到目标即止盈，不考虑后续回撤
 
     notes = [f"复盘区间 {future[0].trade_date} 到 {future[-1].trade_date}，共 {len(future)}/{horizon} 个交易日"]
     success_reasons = []
@@ -399,5 +422,6 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         max_drawdown_pct=max_drawdown,
         stop_loss_triggered=stop_loss,
         meets_expectation=meets,
+        best_exit_meets_expectation=best_exit_meets,
         notes="；".join(notes),
     )

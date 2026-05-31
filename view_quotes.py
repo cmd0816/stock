@@ -396,7 +396,8 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                             COUNT(*) AS total_count,
                             SUM(CASE WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
                             SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
-                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count
+                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count,
+                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND best_exit_meets_expectation = 1 THEN 1 ELSE 0 END) AS best_exit_success_count
                         FROM weekly_review_results
                         WHERE review_id = ?
                         """,
@@ -406,7 +407,9 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                     pending_count = int((summary_row["pending_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[1]) or 0)
                     reviewed_count = int((summary_row["reviewed_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[2]) or 0)
                     success_count = int((summary_row["success_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[3]) or 0)
+                    best_exit_success_count = int((summary_row["best_exit_success_count"] if isinstance(summary_row, sqlite3.Row) else summary_row[4]) or 0)
                     success_rate_pct = (success_count / reviewed_count * 100.0) if reviewed_count else 0.0
+                    best_exit_success_rate_pct = (best_exit_success_count / reviewed_count * 100.0) if reviewed_count else 0.0
                     out["weekly_review_summary"] = {
                         "review_id": latest_review_id,
                         "total_count": total_count,
@@ -414,6 +417,8 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                         "reviewed_count": reviewed_count,
                         "success_count": success_count,
                         "success_rate_pct": success_rate_pct,
+                        "best_exit_success_count": best_exit_success_count,
+                        "best_exit_success_rate_pct": best_exit_success_rate_pct,
                     }
                 else:
                     out["weekly_review_summary"] = None
@@ -559,7 +564,8 @@ def fetch_weekly_review_history(
                 COUNT(rr.id) AS total_count,
                 SUM(CASE WHEN rr.review_start_date IS NULL OR rr.notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
-                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' AND rr.meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count
+                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' AND rr.meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count,
+                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' AND rr.best_exit_meets_expectation = 1 THEN 1 ELSE 0 END) AS best_exit_success_count
             FROM weekly_review_runs wr
             LEFT JOIN weekly_review_results rr
                 ON rr.review_id = wr.review_id
@@ -578,7 +584,9 @@ def fetch_weekly_review_history(
             pending_count = int((row["pending_count"] or 0))
             reviewed_count = int((row["reviewed_count"] or 0))
             success_count = int((row["success_count"] or 0))
+            best_exit_success_count = int((row["best_exit_success_count"] or 0))
             success_rate_pct = (success_count / reviewed_count * 100.0) if reviewed_count else 0.0
+            best_exit_success_rate_pct = (best_exit_success_count / reviewed_count * 100.0) if reviewed_count else 0.0
             runs.append(
                 {
                     "review_id": int(row["review_id"]),
@@ -592,6 +600,8 @@ def fetch_weekly_review_history(
                     "reviewed_count": reviewed_count,
                     "success_count": success_count,
                     "success_rate_pct": success_rate_pct,
+                    "best_exit_success_count": best_exit_success_count,
+                    "best_exit_success_rate_pct": best_exit_success_rate_pct,
                 }
             )
         out["runs"] = runs
@@ -918,6 +928,8 @@ def render_review_runs_table(rows: List[Dict[str, Any]], selected_review_id: int
         reviewed_count = int(row.get("reviewed_count") or 0)
         success_count = int(row.get("success_count") or 0)
         success_rate_pct = float(row.get("success_rate_pct") or 0.0)
+        best_exit_success_count = int(row.get("best_exit_success_count") or 0)
+        best_exit_success_rate_pct = float(row.get("best_exit_success_rate_pct") or 0.0)
         active = " class='active-row'" if selected_review_id is not None and rid == selected_review_id else ""
         body.append(
             "<tr"
@@ -933,6 +945,8 @@ def render_review_runs_table(rows: List[Dict[str, Any]], selected_review_id: int
             + f"<td>{reviewed_count}</td>"
             + f"<td>{success_count}</td>"
             + f"<td>{success_rate_pct:.1f}%</td>"
+            + f"<td>{best_exit_success_count}</td>"
+            + f"<td>{best_exit_success_rate_pct:.1f}%</td>"
             + f"<td>{html.escape(str(row.get('created_at_utc') or '-'))}</td>"
             + f"<td><a href='/reviews?review_id={rid}'>查看</a></td>"
             + "</tr>"
@@ -943,7 +957,7 @@ def render_review_runs_table(rows: List[Dict[str, Any]], selected_review_id: int
           <thead>
             <tr>
               <th>复盘ID</th><th>复盘日期</th><th>选股日期</th><th>批次</th><th>Run ID</th>
-              <th>总数</th><th>待复盘</th><th>完成复盘</th><th>成功数</th><th>成功率</th><th>创建时间 UTC</th><th>操作</th>
+              <th>总数</th><th>待复盘</th><th>完成复盘</th><th>成功数</th><th>成功率</th><th>最佳退出成功数</th><th>最佳退出成功率</th><th>创建时间 UTC</th><th>操作</th>
             </tr>
           </thead>
           <tbody>{''.join(body)}</tbody>
@@ -1043,6 +1057,8 @@ def build_checks_html(
             f"最近一次复盘成功率：{float(weekly_review_summary.get('success_rate_pct') or 0.0):.1f}% "
             f"（成功 {int(weekly_review_summary.get('success_count') or 0)} / 完成复盘 {int(weekly_review_summary.get('reviewed_count') or 0)}；"
             f"待复盘 {int(weekly_review_summary.get('pending_count') or 0)} / 总数 {int(weekly_review_summary.get('total_count') or 0)}）"
+            f" | 最佳退出成功率：{float(weekly_review_summary.get('best_exit_success_rate_pct') or 0.0):.1f}%"
+            f"（{int(weekly_review_summary.get('best_exit_success_count') or 0)} / 完成复盘）"
             "</div>"
         )
     msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message and not include_import_sections else ""
@@ -1435,6 +1451,8 @@ def build_reviews_html(review_data: Dict[str, Any], message: str = "", error: st
             f"成功率：{float(selected_summary.get('success_rate_pct') or 0.0):.1f}% "
             f"（成功 {int(selected_summary.get('success_count') or 0)} / 完成复盘 {int(selected_summary.get('reviewed_count') or 0)}；"
             f"待复盘 {int(selected_summary.get('pending_count') or 0)} / 总数 {int(selected_summary.get('total_count') or 0)}）"
+            f" | 最佳退出成功率：{float(selected_summary.get('best_exit_success_rate_pct') or 0.0):.1f}%"
+            f"（{int(selected_summary.get('best_exit_success_count') or 0)} / 完成复盘）"
             "</div>"
         )
     msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message else ""

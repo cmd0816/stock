@@ -31,11 +31,12 @@ class ScoreBreakdown:
     breakout: float = 0
     fundamentals: float = 0
     risk: float = 0
+    tie_breaker: float = 0
     reasons: List[str] = field(default_factory=list)
 
     @property
     def total(self) -> float:
-        return self.trend + self.volume_turnover + self.breakout + self.fundamentals + self.risk
+        return self.trend + self.volume_turnover + self.breakout + self.fundamentals + self.risk + self.tie_breaker
 
 
 @dataclass
@@ -57,4 +58,5 @@ class ReviewResult:
     max_drawdown_pct: Optional[float]
     stop_loss_triggered: bool
     meets_expectation: bool
+    best_exit_meets_expectation: bool
     notes: str
