@@ -38,7 +38,7 @@ def print_ml_predictions(config_path: Path, config: dict, model_run_id: int) -> 
         print("No ML predictions generated.")
         return
 
-    print("rank code   name        prob_up baseline predicted_score reason")
+    print("rank code   name        prob_up baseline predicted_score focus reason")
     for rank, pred in enumerate(predictions, start=1):
         code = str(pred["code"])
         name = str(pred["name"] or "")[:8]
@@ -51,7 +51,12 @@ def print_ml_predictions(config_path: Path, config: dict, model_run_id: int) -> 
         baseline = features.get("baseline_probability_up")
         baseline_txt = f"{float(baseline) * 100:>6.1f}%" if baseline is not None else "     -"
         reason = str(pred["reason"] or "").replace("\n", " ")[:80]
-        print(f"{rank:>4} {code:<6} {name:<8} {prob:>6.1f}% {baseline_txt} {score:>15.2f} {reason}")
+        # 对前5名进行重点标记
+        focus = "【推荐】" if rank <= 5 else "       "
+        print(f"{rank:>4} {code:<6} {name:<8} {prob:>6.1f}% {baseline_txt} {score:>15.2f} {focus} {reason}")
+    if predictions:
+        avg_prob = sum(float(p["probability_up"]) * 100 for p in predictions) / len(predictions)
+        print(f"\n平均上涨概率: {avg_prob:.1f}% | 前5名为模型最推荐的标的")
 
 
 def print_screen_runs(config_path: Path, config: dict, limit: int) -> None:
@@ -95,6 +100,16 @@ def print_backtest_metrics(metrics: list) -> None:
             f"{item.top_k_avg_close_gain_pct:>8.2f}% "
             f"{item.top_k_avg_high_gain_pct:>7.2f}% "
             f"{item.top_k_avg_max_drawdown_pct:>11.2f}%"
+        )
+    # 强调对选股系统更有价值的指标
+    print()
+    print("【重点关注】对选股系统而言，以下指标比整体准确率更有意义：")
+    for item in metrics:
+        print(
+            f"  • {item.model_name}: Top-{item.top_k} 命中率={item.top_k_hit_rate*100:.1f}% | "
+            f"平均最高涨幅={item.top_k_avg_high_gain_pct:+.2f}% | "
+            f"平均收盘涨幅={item.top_k_avg_close_gain_pct:+.2f}% | "
+            f"平均最大回撤={item.top_k_avg_max_drawdown_pct:+.2f}%"
         )
 
 
@@ -162,6 +177,17 @@ def print_review_trend(config_path: Path, config: dict, limit: int, window: int)
             f"{avg_prob:>7.1f}%"
         )
     print_trend_summary(rows, window)
+    # 提示用户关注核心实盘指标
+    if rows:
+        latest = rows[0]
+        print()
+        print(
+            "【实盘效果】最近一期: 命中率="
+            f"{float(latest['hit_rate'] or 0)*100:.1f}% | "
+            f"平均收盘={float(latest['avg_close_gain_pct'] or 0):+.2f}% | "
+            f"平均最高={float(latest['avg_high_gain_pct'] or 0):+.2f}% | "
+            f"止损率={float(latest['stop_loss_rate'] or 0)*100:.1f}%"
+        )
 
 
 def main() -> None:

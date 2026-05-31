@@ -4,7 +4,7 @@ import subprocess
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import db
 from .models import Kline, ReviewResult
@@ -67,6 +67,37 @@ def apply_review_feedback_labels(
         sample_weights.append(float(use_weight))
         extra_weighted += use_weight - 1
     return merged, sample_weights, {"matched": matched, "relabeled": relabeled, "extra_weighted": extra_weighted}
+
+
+def attach_context_features_to_samples(conn: Any, samples: List[TrainingSample]) -> None:
+    if not samples:
+        return
+    code_dates = [(str(sample.code), str(sample.trade_date)) for sample in samples]
+    context_by_key = db.load_ml_context_features(conn, code_dates)
+    if not context_by_key:
+        return
+    for sample in samples:
+        ctx = context_by_key.get((str(sample.code), str(sample.trade_date)))
+        if not ctx:
+            continue
+        sample.features.update(ctx)
+
+
+def attach_context_features_to_prediction_items(
+    conn: Any,
+    prediction_items: List[Tuple[Any, Dict[str, float], str]],
+) -> None:
+    if not prediction_items:
+        return
+    code_dates = [(str(row["code"]), str(trade_date)) for row, _features, trade_date in prediction_items]
+    context_by_key = db.load_ml_context_features(conn, code_dates)
+    if not context_by_key:
+        return
+    for row, features, trade_date in prediction_items:
+        ctx = context_by_key.get((str(row["code"]), str(trade_date)))
+        if not ctx:
+            continue
+        features.update(ctx)
 
 
 def run_xuangu_download(config_path: Path, config: Dict[str, Any]) -> None:
@@ -213,6 +244,7 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             for code in train_codes
         }
         samples = build_training_samples(klines_by_code, ml_cfg)
+        attach_context_features_to_samples(conn, samples)
         sample_weights: Optional[List[float]] = None
         if ml_cfg.get("use_review_feedback_labels", False):
             recent_runs = int(ml_cfg.get("review_feedback_recent_runs", 0))
@@ -256,6 +288,8 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
                 continue
             trade_date = klines[-1].trade_date
             prediction_items.append((row, features, trade_date))
+
+        attach_context_features_to_prediction_items(conn, prediction_items)
 
         if ml_cfg.get("use_cross_sectional_features", True):
             add_cross_sectional_to_predictions(
@@ -324,7 +358,8 @@ def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
             code: db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
             for code in train_codes
         }
-    samples = build_training_samples(klines_by_code, ml_cfg)
+        samples = build_training_samples(klines_by_code, ml_cfg)
+        attach_context_features_to_samples(conn, samples)
     min_samples = int(ml_cfg.get("min_train_samples", 30))
     if len(samples) < min_samples:
         raise RuntimeError(

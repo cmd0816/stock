@@ -68,16 +68,17 @@ SMTP_USE_SSL=1 \
 
 > 目标：复盘上周、选股本周、生成下周 Top 股票列表。
 
-### 完整流程（6 步）
+### 完整流程（7 步）
 
 | 步骤 | 内容 | 说明 |
 |------|------|------|
 | 1 | **复盘上周** | 计算上一期入选股票的一周表现（最高涨幅、收盘涨幅、最大回撤、是否止损） |
 | 2 | **条件选股** | 打开东方财富条件选股页面，按 `screening.txt` 条件下载 Excel 并入库 |
-| 3 | **规则打分** | 对候选池股票打分，选出 Top 3~4 只 |
-| 4 | **补齐 K 线** | 下载/更新本周 Top 股票的一年日 K |
-| 5 | **ML 回测** | 检查模型最近表现 |
-| 6 | **ML 训练+预测** | 训练模型，为 Top 股票生成 ML 预测概率 |
+| 3 | **批次日线刷新** | 对本次批次股票补齐日 K（`baostock` 优先，失败回退 `akshare`），并更新资金流/板块上下文 |
+| 4 | **规则打分** | 对候选池股票打分，选出 Top 3~4 只 |
+| 5 | **补齐 Top K 线** | 下载/更新本周 Top 股票的一年日 K（用于复盘充分性） |
+| 6 | **ML 回测** | 检查模型最近表现 |
+| 7 | **ML 训练+预测** | 训练模型，为 Top 股票生成 ML 预测概率 |
 
 ### 一键执行
 
@@ -105,6 +106,9 @@ SKIP_REVIEW=1 ./run_weekly.sh
 # 跳过东方财富下载（已手动导入过 XLSX 和 K 线）
 SKIP_XUANGU=1 ./run_weekly.sh
 
+# 跳过批次日线刷新（会跳过 baostock/akshare 批次补K与上下文更新）
+SKIP_BATCH_HISTORY=1 ./run_weekly.sh
+
 # 跳过 ML 回测（只想快速生成本周预测）
 SKIP_BACKTEST=1 ./run_weekly.sh
 
@@ -119,6 +123,15 @@ BROWSER_HEADED=1 ./run_weekly.sh
 
 # 先手动登录东方财富
 WAIT_LOGIN=1 ./run_weekly.sh
+
+# 批次日线刷新请求间隔（秒）
+HISTORY_DELAY=1.5 ./run_weekly.sh
+
+# 批次日线只刷新前 N 只（测试）
+HISTORY_LIMIT=20 ./run_weekly.sh
+
+# 批次日线最小已存在天数阈值
+HISTORY_MIN_EXISTING_DAYS=200 ./run_weekly.sh
 ```
 
 ### 关于 ML 预测
@@ -141,7 +154,7 @@ ml:
 | 文件/目录 | 说明 |
 |-----------|------|
 | `run_daily_update.sh` | **工作日一键流程**：新批次切换时复盘上一期 + 基于最新批次做 screen + ML 预测 |
-| `run_weekly.sh` | **周末一键流程**（复盘+选股+打分+ML） |
+| `run_weekly.sh` | **周末一键流程**（复盘+选股+批次补K+打分+ML） |
 | `run_xuangu.sh` | 条件选股下载入库（被 `run_weekly.sh` 调用，也可单独用） |
 | `run_server.sh` | 启动本地看盘网页服务 |
 | `eastmoney_to_sqlite.py` | 导入单只股票最新行情 |

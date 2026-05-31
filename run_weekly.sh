@@ -58,6 +58,7 @@ echo
 
 ALIGNED_BATCH_ID="${ALIGNED_SCREEN_DATE//-/}"
 TODAY_DATE="$(date +%F)"
+EFFECTIVE_BATCH_ID="${XUANGU_BATCH_ID:-$ALIGNED_BATCH_ID}"
 
 if [[ "${SKIP_REVIEW:-0}" != "1" ]]; then
   echo "Step 1/6: Review previous selected stocks..."
@@ -86,29 +87,51 @@ PY
   fi
   echo
 else
-  echo "Step 1/6: Review skipped by SKIP_REVIEW=1"
+  echo "Step 1/7: Review skipped by SKIP_REVIEW=1"
   echo
 fi
 
 if [[ "${SKIP_XUANGU:-0}" != "1" ]]; then
-  echo "Step 2/6: Download/import xuangu results and update 1-year K-line data..."
-  XUANGU_ARGS=(--batch-id "${XUANGU_BATCH_ID:-$ALIGNED_BATCH_ID}" --history-end-date "$ALIGNED_SCREEN_DATE")
+  echo "Step 2/7: Download/import xuangu results..."
+  XUANGU_ARGS=(--batch-id "$EFFECTIVE_BATCH_ID" --history-end-date "$ALIGNED_SCREEN_DATE")
   "$SCRIPT_DIR/run_xuangu.sh" "${XUANGU_ARGS[@]}" "$@"
   echo
 else
-  echo "Step 2/6: Xuangu download/import skipped by SKIP_XUANGU=1"
+  echo "Step 2/7: Xuangu download/import skipped by SKIP_XUANGU=1"
+  echo
+fi
+
+if [[ "${SKIP_BATCH_HISTORY:-0}" != "1" ]]; then
+  echo "Step 3/7: Refresh latest batch daily K-line (BaoStock first, AKShare fallback) and ML context..."
+  BATCH_HISTORY_ARGS=(
+    "$SCRIPT_DIR/download_batch_history.py"
+    --db "$DB_PATH"
+    --batch-id "$EFFECTIVE_BATCH_ID"
+    --end-date "$ALIGNED_SCREEN_DATE"
+    --delay "${HISTORY_DELAY:-1.5}"
+  )
+  if [[ -n "${HISTORY_LIMIT:-}" ]]; then
+    BATCH_HISTORY_ARGS+=(--limit "$HISTORY_LIMIT")
+  fi
+  if [[ -n "${HISTORY_MIN_EXISTING_DAYS:-}" ]]; then
+    BATCH_HISTORY_ARGS+=(--min-existing-days "$HISTORY_MIN_EXISTING_DAYS")
+  fi
+  "$VENV_PY" -u "${BATCH_HISTORY_ARGS[@]}"
+  echo
+else
+  echo "Step 3/7: Batch history refresh skipped by SKIP_BATCH_HISTORY=1"
   echo
 fi
 
 SCREEN_ARGS=(screen --date "$ALIGNED_SCREEN_DATE" --replace-existing)
-SCREEN_ARGS+=(--xuangu-batch-id "${XUANGU_BATCH_ID:-$ALIGNED_BATCH_ID}")
+SCREEN_ARGS+=(--xuangu-batch-id "$EFFECTIVE_BATCH_ID")
 
-echo "Step 3/6: Generate rule-based Top stocks..."
+echo "Step 4/7: Generate rule-based Top stocks..."
 SCREEN_OUTPUT="$("$VENV_PY" "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" "${SCREEN_ARGS[@]}")"
 echo "$SCREEN_OUTPUT"
 RUN_ID="$(printf '%s\n' "$SCREEN_OUTPUT" | sed -n 's/.*run_id=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
 if [[ -z "$RUN_ID" ]]; then
-  RUN_ID="$("$VENV_PY" - "$DB_PATH" "$ALIGNED_SCREEN_DATE" "${XUANGU_BATCH_ID:-$ALIGNED_BATCH_ID}" <<'PY'
+  RUN_ID="$("$VENV_PY" - "$DB_PATH" "$ALIGNED_SCREEN_DATE" "$EFFECTIVE_BATCH_ID" <<'PY'
 import sys
 from pathlib import Path
 from weekly_stock import db
@@ -140,7 +163,7 @@ fi
 echo
 
 if [[ "${SKIP_TOP_HISTORY:-0}" != "1" ]]; then
-  echo "Step 4/6: Download/update 1-year K-line for this run's Top stocks (for review)..."
+  echo "Step 5/7: Download/update 1-year K-line for this run's Top stocks (for review)..."
   TOP_HISTORY_TARGET_DATE="${TOP_HISTORY_TARGET_DATE:-$TODAY_DATE}"
   TOP_HISTORY_MIN_EXISTING_DAYS="${TOP_HISTORY_MIN_EXISTING_DAYS:-200}"
   if [[ -z "${RUN_ID:-}" ]]; then
@@ -237,20 +260,20 @@ PY
   fi
   echo
 else
-  echo "Step 4/6: Top history download skipped by SKIP_TOP_HISTORY=1"
+  echo "Step 5/7: Top history download skipped by SKIP_TOP_HISTORY=1"
   echo
 fi
 
 if [[ "${SKIP_BACKTEST:-0}" != "1" ]]; then
-  echo "Step 5/6: Backtest ML models..."
+  echo "Step 6/7: Backtest ML models..."
   "$VENV_PY" "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" backtest
   echo
 else
-  echo "Step 5/6: ML backtest skipped by SKIP_BACKTEST=1"
+  echo "Step 6/7: ML backtest skipped by SKIP_BACKTEST=1"
   echo
 fi
 
-echo "Step 6/6: Train ML models and predict Top stocks..."
+echo "Step 7/7: Train ML models and predict Top stocks..."
 PREDICT_ARGS=(predict)
 if [[ -n "${RUN_ID:-}" ]]; then
   PREDICT_ARGS+=(--run-id "$RUN_ID")

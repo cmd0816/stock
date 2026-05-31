@@ -28,12 +28,32 @@ FEATURE_NAMES = [
     "volatility_20",
     "drawdown_20",
     "dist_high_20",
+    "rsi_14",
+    "macd_dif",
+    "macd_dea",
+    "macd_hist",
+    "boll_pct",
+    "boll_width",
+    "atr_14",
+    "consecutive_days",
+    "upper_shadow_pct",
+    "lower_shadow_pct",
+    "body_pct",
+    "price_volume_corr_10",
+    "momentum_5_20",
     "ret_5_rank",
     "ret_10_rank",
     "ret_20_rank",
     "close_ma20_pct_rank",
     "volume_ratio_5_20_rank",
     "market_ret_20",
+    "fund_main_net_ratio",
+    "fund_main_net_ratio_5",
+    "fund_main_net_ratio_20",
+    "fund_main_net_trend",
+    "sector_ret_5",
+    "sector_ret_20",
+    "sector_momentum_5_20",
 ]
 
 
@@ -199,12 +219,32 @@ def feature_label(name: str) -> str:
         "volatility_20": "20日波动",
         "drawdown_20": "20日回撤",
         "dist_high_20": "距20日高点",
+        "rsi_14": "RSI(14)",
+        "macd_dif": "MACD快线",
+        "macd_dea": "MACD慢线",
+        "macd_hist": "MACD柱",
+        "boll_pct": "布林带位置",
+        "boll_width": "布林带宽度",
+        "atr_14": "ATR(14)",
+        "consecutive_days": "连续涨跌天数",
+        "upper_shadow_pct": "上影线比例",
+        "lower_shadow_pct": "下影线比例",
+        "body_pct": "实体比例",
+        "price_volume_corr_10": "量价相关(10日)",
+        "momentum_5_20": "动量差异(5-20)",
         "ret_5_rank": "5日涨幅排名",
         "ret_10_rank": "10日涨幅排名",
         "ret_20_rank": "20日涨幅排名",
         "close_ma20_pct_rank": "偏离MA20排名",
         "volume_ratio_5_20_rank": "量比排名",
         "market_ret_20": "市场20日涨幅",
+        "fund_main_net_ratio": "主力净流入占比",
+        "fund_main_net_ratio_5": "5日主力净流入占比",
+        "fund_main_net_ratio_20": "20日主力净流入占比",
+        "fund_main_net_trend": "主力净流入趋势(5-20)",
+        "sector_ret_5": "板块5日动量",
+        "sector_ret_20": "板块20日动量",
+        "sector_momentum_5_20": "板块动量差(5-20)",
     }.get(name, name)
 
 
@@ -223,6 +263,143 @@ def moving_average(klines: Sequence[Kline], end_idx: int, days: int) -> float:
     if end_idx + 1 < days:
         return 0.0
     return safe_mean(k.close for k in klines[end_idx - days + 1 : end_idx + 1])
+
+
+def ema(values: List[float], period: int) -> List[float]:
+    """计算指数移动平均，返回与输入等长的列表，前period-1个为简单平均。"""
+    if not values or period <= 0:
+        return values[:]
+    k = 2.0 / (period + 1)
+    result: List[float] = []
+    for i, v in enumerate(values):
+        if i < period - 1:
+            result.append(safe_mean(values[max(0, i - period + 1) : i + 1]))
+        elif i == period - 1:
+            result.append(safe_mean(values[:period]))
+        else:
+            result.append(v * k + result[-1] * (1 - k))
+    return result
+
+
+def rsi(closes: List[float], period: int = 14) -> float:
+    """计算RSI，返回最后一个值。数据不足时返回50.0。"""
+    if len(closes) < period + 1:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_gain = safe_mean(gains[:period])
+    avg_loss = safe_mean(losses[:period])
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    # Wilder's smoothing
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float, float, float]:
+    """返回最后一个(dif, dea, hist)。数据不足时返回(0,0,0)。"""
+    if len(closes) < slow + signal:
+        return 0.0, 0.0, 0.0
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    difs = [f - s for f, s in zip(ema_fast, ema_slow)]
+    deas = ema(difs, signal)
+    last_dif = difs[-1]
+    last_dea = deas[-1]
+    return last_dif, last_dea, last_dif - last_dea
+
+
+def bollinger(closes: List[float], period: int = 20, std_multiplier: float = 2.0) -> tuple[float, float, float]:
+    """返回(价格相对布林带位置%, 带宽)。数据不足时返回(50, 0)。
+    boll_pct = 0 表示在下轨，100 表示在上轨，50 表示在中轨。
+    """
+    if len(closes) < period:
+        return 50.0, 0.0
+    recent = closes[-period:]
+    mid = mean(recent)
+    std = pstdev(recent) or 1e-9
+    upper = mid + std_multiplier * std
+    lower = mid - std_multiplier * std
+    current = closes[-1]
+    boll_pct = (current - lower) / (upper - lower) * 100.0 if upper != lower else 50.0
+    boll_width = (upper - lower) / mid * 100.0 if mid else 0.0
+    return boll_pct, boll_width
+
+
+def atr(klines: Sequence[Kline], end_idx: int, period: int = 14) -> float:
+    """平均真实波幅，基于end_idx往前period天。"""
+    if end_idx < period:
+        return 0.0
+    trs: List[float] = []
+    for i in range(end_idx - period + 1, end_idx + 1):
+        if i <= 0:
+            continue
+        high = klines[i].high
+        low = klines[i].low
+        prev_close = klines[i - 1].close
+        if high is None or low is None or prev_close is None:
+            continue
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return safe_mean(trs)
+
+
+def consecutive_days(klines: Sequence[Kline], end_idx: int) -> int:
+    """连续涨跌天数，正数连涨，负数连跌，0表示平。"""
+    if end_idx < 1:
+        return 0
+    count = 0
+    direction = 0
+    for i in range(end_idx, 0, -1):
+        c = klines[i].close
+        p = klines[i - 1].close
+        if c is None or p is None:
+            break
+        if c > p:
+            d = 1
+        elif c < p:
+            d = -1
+        else:
+            d = 0
+        if direction == 0:
+            direction = d
+            if d != 0:
+                count = d
+        elif d == direction:
+            count += d
+        else:
+            break
+    return count
+
+
+def price_volume_corr(klines: Sequence[Kline], end_idx: int, period: int = 10) -> float:
+    """收盘价与成交量的相关系数，范围[-1,1]。"""
+    if end_idx + 1 < period:
+        return 0.0
+    closes = []
+    volumes = []
+    for i in range(end_idx - period + 1, end_idx + 1):
+        if klines[i].close is not None and klines[i].volume is not None:
+            closes.append(float(klines[i].close))
+            volumes.append(float(klines[i].volume))
+    if len(closes) < 3:
+        return 0.0
+    m_c = mean(closes)
+    m_v = mean(volumes)
+    s_c = pstdev(closes) or 1e-9
+    s_v = pstdev(volumes) or 1e-9
+    cov = sum((c - m_c) * (v - m_v) for c, v in zip(closes, volumes)) / len(closes)
+    return max(-1.0, min(1.0, cov / (s_c * s_v)))
 
 
 def features_at(klines: Sequence[Kline], end_idx: int) -> Optional[Dict[str, float]]:
@@ -252,6 +429,36 @@ def features_at(klines: Sequence[Kline], end_idx: int) -> Optional[Dict[str, flo
 
     high20 = max(highs20) if highs20 else current.close
     low20 = min(lows20) if lows20 else current.close
+
+    # ---- 新增技术指标特征 ----
+    # 需要足够长的close序列
+    closes_all = [k.close for k in klines[: end_idx + 1] if k.close is not None]
+    rsi_14 = rsi(closes_all, 14) if len(closes_all) >= 14 else 50.0
+    macd_dif, macd_dea, macd_hist = macd(closes_all, 12, 26, 9) if len(closes_all) >= 35 else (0.0, 0.0, 0.0)
+    boll_pct, boll_width = bollinger(closes_all, 20, 2.0) if len(closes_all) >= 20 else (50.0, 0.0)
+    atr_14_val = atr(klines, end_idx, 14)
+    cons_days = consecutive_days(klines, end_idx)
+
+    # K线形态特征（当日）
+    upper_shadow_pct = 0.0
+    lower_shadow_pct = 0.0
+    body_pct = 0.0
+    if current.high is not None and current.low is not None and current.high != current.low:
+        body = abs((current.close or 0) - (current.open or current.close or 0))
+        upper_shadow = current.high - max(current.close or current.high, current.open or current.high)
+        lower_shadow = min(current.close or current.low, current.open or current.low) - current.low
+        amplitude = current.high - current.low
+        upper_shadow_pct = upper_shadow / amplitude * 100.0
+        lower_shadow_pct = lower_shadow / amplitude * 100.0
+        body_pct = body / amplitude * 100.0
+
+    # 量价相关性
+    pv_corr = price_volume_corr(klines, end_idx, 10)
+
+    # 动量差异（5日 vs 20日动量的差异，反映加速度）
+    ret_5_prev = pct(klines[end_idx - 5].close, klines[end_idx - 10].close) if end_idx >= 10 else 0.0
+    momentum_5_20 = ret_values[0] - ret_5_prev
+
     return {
         "ret_5": ret_values[0],
         "ret_10": ret_values[1],
@@ -267,6 +474,19 @@ def features_at(klines: Sequence[Kline], end_idx: int) -> Optional[Dict[str, flo
         "volatility_20": pstdev(returns) if len(returns) >= 2 else 0.0,
         "drawdown_20": pct(low20, high20),
         "dist_high_20": pct(current.close, high20),
+        "rsi_14": rsi_14,
+        "macd_dif": macd_dif,
+        "macd_dea": macd_dea,
+        "macd_hist": macd_hist,
+        "boll_pct": boll_pct,
+        "boll_width": boll_width,
+        "atr_14": atr_14_val,
+        "consecutive_days": cons_days,
+        "upper_shadow_pct": upper_shadow_pct,
+        "lower_shadow_pct": lower_shadow_pct,
+        "body_pct": body_pct,
+        "price_volume_corr_10": pv_corr,
+        "momentum_5_20": momentum_5_20,
     }
 
 

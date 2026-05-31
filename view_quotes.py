@@ -268,17 +268,29 @@ def save_uploaded_xlsx(base_dir: Path, upload: Dict[str, Any], batch_id: str) ->
 
 def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
     config_path = db_path.parent / "config/weekly_strategy.yaml"
+    cfg: Dict[str, Any] = {}
     try:
         cfg = load_config(config_path)
         screening_top_n = int(cfg.get("screening", {}).get("top_n", 5))
     except Exception:
         screening_top_n = 5
     screening_top_n = max(1, min(50, screening_top_n))
+    ml_cfg = cfg.get("ml", {}) if isinstance(cfg, dict) else {}
 
+    ml_status: Dict[str, Any] = {
+        "enabled": bool(ml_cfg.get("enabled", False)),
+        "model_name": str(ml_cfg.get("model_name", "-")),
+        "horizon_trading_days": int(ml_cfg.get("horizon_trading_days", 5)),
+        "positive_high_gain_pct": float(ml_cfg.get("positive_high_gain_pct", 0.05)),
+        "positive_close_gain_pct": float(ml_cfg.get("positive_close_gain_pct", 0.0)),
+        "use_trade_exit_rules": bool(ml_cfg.get("use_trade_exit_rules", True)),
+        "negative_drawdown_pct": float(ml_cfg.get("negative_drawdown_pct", 0.06)),
+        "use_review_feedback": bool(ml_cfg.get("use_review_feedback_labels", False)),
+    }
     try:
         with sqlite_connect_with_retry(db_path) as conn:
             conn.row_factory = sqlite3.Row
-            out: Dict[str, Any] = {"screening_top_n": screening_top_n}
+            out: Dict[str, Any] = {"screening_top_n": screening_top_n, "ml_status": ml_status}
 
             if table_exists(conn, "eastmoney_stock_daily_klines"):
                 out["kline_coverage"] = [
@@ -1052,6 +1064,17 @@ def build_checks_html(
     weekly_review_summary = checks.get("weekly_review_summary") or {}
     review_summary_html = ""
     if weekly_review_summary:
+        # 根据当前ML配置动态说明成功标准
+        ml_status = checks.get("ml_status", {})
+        if ml_status.get("enabled") and not ml_status.get("use_trade_exit_rules"):
+            label_desc = (
+                f"未来{int(ml_status.get('horizon_trading_days', 5))}日"
+                f"最高价≥{float(ml_status.get('positive_high_gain_pct', 0.05))*100:.0f}%"
+                f" 且 收盘≥{float(ml_status.get('positive_close_gain_pct', 0))*100:.0f}%"
+                f" 且 回撤≤{float(ml_status.get('negative_drawdown_pct', 0.06))*100:.0f}%"
+            )
+        else:
+            label_desc = "达到预期涨幅目标"
         review_summary_html = (
             "<div class='notice'>"
             f"最近一次复盘成功率：{float(weekly_review_summary.get('success_rate_pct') or 0.0):.1f}% "
@@ -1059,7 +1082,32 @@ def build_checks_html(
             f"待复盘 {int(weekly_review_summary.get('pending_count') or 0)} / 总数 {int(weekly_review_summary.get('total_count') or 0)}）"
             f" | 最佳退出成功率：{float(weekly_review_summary.get('best_exit_success_rate_pct') or 0.0):.1f}%"
             f"（{int(weekly_review_summary.get('best_exit_success_count') or 0)} / 完成复盘）"
+            f"<br><small>当前成功标准：{html.escape(label_desc)}</small>"
             "</div>"
+        )
+    # ML模型状态卡片
+    ml_status = checks.get("ml_status", {})
+    ml_card_html = ""
+    if ml_status.get("enabled"):
+        model_name = str(ml_status.get("model_name", "-"))
+        feedback_on = "已开启" if ml_status.get("use_review_feedback") else "未开启"
+        if not ml_status.get("use_trade_exit_rules"):
+            label_desc = (
+                f"未来5日最高价≥{float(ml_status.get('positive_high_gain_pct', 0.05))*100:.0f}%"
+                f" 收盘≥{float(ml_status.get('positive_close_gain_pct', 0))*100:.0f}%"
+                f" 回撤≤{float(ml_status.get('negative_drawdown_pct', 0.06))*100:.0f}%"
+            )
+        else:
+            label_desc = "使用交易退出规则"
+        ml_card_html = (
+            "<section class='card'><h3>🤖 ML 模型状态</h3>"
+            "<div style='padding:12px 14px;font-size:13px;color:#334155;'>"
+            f"<b>模型：</b>{html.escape(model_name)} | "
+            f"<b>正样本定义：</b>{html.escape(label_desc)} | "
+            f"<b>复盘反馈：</b>{html.escape(feedback_on)}"
+            "<br><span style='color:#64748b;font-size:12px;'>"
+            "提示：对选股系统而言，Top-K 命中率和平均最高涨幅比整体准确率更有意义。"
+            "</span></div></section>"
         )
     msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message and not include_import_sections else ""
     err_html = f"<div class='notice error'>{html.escape(error)}</div>" if error and not include_import_sections else ""
@@ -1074,7 +1122,8 @@ def build_checks_html(
         f"<section class='card'><h3>最近条件选股批次</h3>{batches}</section>"
         f"<section class='card'><h3>当前批次股票明细（批次 {html.escape(selected_batch_id or '-')}）</h3>{latest_results}</section>"
         if include_import_sections
-        else f"<section class='card'><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{weekly_screen_form}{weekly_selected}<details class='candidate-details'><summary>查看本批次候选股票列表</summary>{latest_results}</details></section>"
+        else f"{ml_card_html}"
+             f"<section class='card'><h3>周末入选股票（批次 {html.escape(selected_batch_id or '-')}）</h3>{weekly_screen_form}{weekly_selected}<details class='candidate-details'><summary>查看本批次候选股票列表</summary>{latest_results}</details></section>"
              f"<section class='card'><h3>复盘结果</h3>{review_summary_html}<div class='form-actions'><span class='form-hint'>复盘历史已独立到新页面，可查看每次复盘成功率和明细。</span><a class='button-link' href='/reviews'>打开复盘历史页面</a></div></section>"
     )
 
@@ -1453,6 +1502,7 @@ def build_reviews_html(review_data: Dict[str, Any], message: str = "", error: st
             f"待复盘 {int(selected_summary.get('pending_count') or 0)} / 总数 {int(selected_summary.get('total_count') or 0)}）"
             f" | 最佳退出成功率：{float(selected_summary.get('best_exit_success_rate_pct') or 0.0):.1f}%"
             f"（{int(selected_summary.get('best_exit_success_count') or 0)} / 完成复盘）"
+            "<br><small>成功标准：未来5日最高价≥3% 且 收盘≥-2% 且 回撤≤10%</small>"
             "</div>"
         )
     msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message else ""
@@ -1625,6 +1675,7 @@ def build_daily_html(
     for s in stock_list:
         s_code = str(s.get("code", ""))
         active = "active" if s_code == code else ""
+        top_pick = "top-pick" if s.get("top_pick") else ""
         s_name = html.escape(str(s.get("name", "")))
         rank_no = s.get("rank_no")
         code_label = f"#{rank_no} {s_code}" if rank_no else s_code
@@ -1633,7 +1684,7 @@ def build_daily_html(
         cp_cls = str(s.get("side_class") or ("up" if isinstance(cp, (int, float)) and cp > 0 else "down" if isinstance(cp, (int, float)) and cp < 0 else ""))
         href = f"{list_path}?code={quote(s_code)}{list_extra_query}"
         stock_links.append(
-            f"<a class='stk {active}' href='{html.escape(href)}'>"
+            f"<a class='stk {active} {top_pick}' href='{html.escape(href)}'>"
             f"<span class='c'>{html.escape(code_label)}</span>"
             f"<span class='n'>{s_name}</span>"
             f"<span class='p {cp_cls}'>{cp_txt}</span>"
@@ -1740,6 +1791,16 @@ def build_daily_html(
     }}
     .stk .p.down {{
       color: #1d4ed8;
+    }}
+    .stk.top-pick {{
+      background: #fffbeb;
+      border-left: 3px solid #f59e0b;
+      padding-left: 9px;
+    }}
+    .stk.top-pick .c::after {{
+      content: " ★";
+      color: #f59e0b;
+      font-size: 11px;
     }}
     .main {{
       min-width: 0;
@@ -2737,7 +2798,7 @@ def make_handler(db_path: Path, limit: int):
                 selected_code = code if code in top_codes else (top_codes[0] if top_codes else "")
                 latest_by_code = fetch_latest_daily_rows_by_codes(db_path, top_codes)
                 top_stock_list = []
-                for row in selected_rows:
+                for idx, row in enumerate(selected_rows):
                     stock_code = str(row.get("code") or "")
                     latest = latest_by_code.get(stock_code, {}) if stock_code else {}
                     ml_probability = row.get("ml_probability_up")
@@ -2754,6 +2815,7 @@ def make_handler(db_path: Path, limit: int):
                             "last_change_percent": latest.get("change_percent"),
                             "side_text": side_text,
                             "side_class": side_class,
+                            "top_pick": idx < 5,
                         }
                     )
                 rows = fetch_daily_rows(db_path, limit, code=selected_code) if selected_code else []
@@ -2768,11 +2830,19 @@ def make_handler(db_path: Path, limit: int):
                         parts.append(f"code={quote(selected_code)}")
                     return "/top?" + "&".join(parts)
 
+                top_hint = (
+                    "<div style='font-size:12px;color:#64748b;margin-top:6px;'>"
+                    "💡 按 ML 综合分排序时，列表前 5 名（带★标记）为模型最推荐标的"
+                    "</div>"
+                    if sort_mode == "ml"
+                    else ""
+                )
                 sort_switch_html = (
                     "<div class='sort-switch'>"
                     f"<a class='sort-chip {'active' if sort_mode == 'ml' else ''}' href='{html.escape(build_top_href('ml'))}'>按 ML 综合分</a>"
                     f"<a class='sort-chip {'active' if sort_mode == 'rule' else ''}' href='{html.escape(build_top_href('rule'))}'>按规则排名</a>"
                     "</div>"
+                    f"{top_hint}"
                 )
                 meta_parts = ["Top 股票列表", "手动刷新"]
                 if run:

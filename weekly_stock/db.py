@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -150,6 +151,7 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
     )
     _migrate_weekly_review_runs_to_append_mode(conn)
     _add_column_if_missing(conn, "weekly_review_results", "best_exit_meets_expectation", "INTEGER NOT NULL DEFAULT 0")
+    ensure_market_context_tables(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_review_runs_run_id ON weekly_review_runs(reviewed_run_id)")
     conn.commit()
 
@@ -194,6 +196,38 @@ def _add_column_if_missing(
     if any(str(r["name"]) == column for r in rows):
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+
+
+def ensure_market_context_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS stock_fund_flow_daily (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            main_net_inflow REAL,
+            main_net_inflow_ratio REAL,
+            source_url TEXT NOT NULL,
+            raw_line TEXT NOT NULL,
+            fetched_at_utc TEXT NOT NULL,
+            UNIQUE(code, trade_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_sector_map (
+            code TEXT PRIMARY KEY,
+            sector_name TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            raw_line TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_fund_flow_code_date
+            ON stock_fund_flow_daily(code, trade_date);
+        CREATE INDEX IF NOT EXISTS idx_sector_name
+            ON stock_sector_map(sector_name);
+        """
+    )
+    conn.commit()
 
 
 def latest_xuangu_batch_id(conn: sqlite3.Connection) -> Optional[str]:
@@ -607,6 +641,222 @@ def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
         """
     ).fetchall()
     return [str(row["code"]) for row in rows]
+
+
+def upsert_fund_flow_rows(
+    conn: sqlite3.Connection,
+    rows: Iterable[Dict[str, Any]],
+) -> int:
+    ensure_market_context_tables(conn)
+    values = []
+    fetched_at = utc_now()
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        trade_date = str(row.get("trade_date") or "").strip()
+        source_url = str(row.get("source_url") or "").strip()
+        if not code or not trade_date or not source_url:
+            continue
+        values.append(
+            (
+                code,
+                trade_date,
+                row.get("main_net_inflow"),
+                row.get("main_net_inflow_ratio"),
+                source_url,
+                json.dumps(row.get("raw_line") or {}, ensure_ascii=False, default=str),
+                fetched_at,
+            )
+        )
+    if not values:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO stock_fund_flow_daily (
+            code, trade_date, main_net_inflow, main_net_inflow_ratio,
+            source_url, raw_line, fetched_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code, trade_date) DO UPDATE SET
+            main_net_inflow=COALESCE(excluded.main_net_inflow, stock_fund_flow_daily.main_net_inflow),
+            main_net_inflow_ratio=COALESCE(excluded.main_net_inflow_ratio, stock_fund_flow_daily.main_net_inflow_ratio),
+            source_url=excluded.source_url,
+            raw_line=excluded.raw_line,
+            fetched_at_utc=excluded.fetched_at_utc
+        """,
+        values,
+    )
+    return len(values)
+
+
+def upsert_sector_rows(
+    conn: sqlite3.Connection,
+    rows: Iterable[Dict[str, Any]],
+) -> int:
+    ensure_market_context_tables(conn)
+    values = []
+    updated_at = utc_now()
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        sector_name = str(row.get("sector_name") or "").strip()
+        source_url = str(row.get("source_url") or "").strip()
+        if not code or not sector_name or not source_url:
+            continue
+        values.append(
+            (
+                code,
+                sector_name,
+                source_url,
+                json.dumps(row.get("raw_line") or {}, ensure_ascii=False, default=str),
+                updated_at,
+            )
+        )
+    if not values:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO stock_sector_map (
+            code, sector_name, source_url, raw_line, updated_at_utc
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            sector_name=excluded.sector_name,
+            source_url=excluded.source_url,
+            raw_line=excluded.raw_line,
+            updated_at_utc=excluded.updated_at_utc
+        """,
+        values,
+    )
+    return len(values)
+
+
+def _rolling_mean(values: List[float], end_idx: int, window: int) -> float:
+    if window <= 0 or end_idx < 0:
+        return 0.0
+    start = max(0, end_idx - window + 1)
+    segment = values[start : end_idx + 1]
+    if not segment:
+        return 0.0
+    return sum(segment) / len(segment)
+
+
+def load_ml_context_features(
+    conn: sqlite3.Connection,
+    code_dates: Iterable[Tuple[str, str]],
+) -> Dict[Tuple[str, str], Dict[str, float]]:
+    """Load contextual ML features (fund flow + sector momentum) by (code, trade_date)."""
+    items = [(str(code), str(trade_date)) for code, trade_date in code_dates if code and trade_date]
+    if not items:
+        return {}
+    ensure_market_context_tables(conn)
+
+    codes = sorted({code for code, _ in items})
+    min_date = min(date for _, date in items)
+    max_date = max(date for _, date in items)
+
+    # Pull a wider window so 20-day rolling stats are available near min_date.
+    try:
+        start_dt = datetime.strptime(min_date, "%Y-%m-%d").date() - timedelta(days=45)
+        query_start_date = start_dt.strftime("%Y-%m-%d")
+    except Exception:
+        query_start_date = min_date
+
+    placeholder_codes = ",".join("?" for _ in codes)
+    fund_rows = conn.execute(
+        f"""
+        SELECT code, trade_date, main_net_inflow_ratio
+        FROM stock_fund_flow_daily
+        WHERE code IN ({placeholder_codes})
+          AND trade_date BETWEEN ? AND ?
+        ORDER BY code, trade_date
+        """,
+        [*codes, query_start_date, max_date],
+    ).fetchall()
+
+    fund_ratio_by_code_date: Dict[Tuple[str, str], float] = {}
+    fund_series_by_code: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    for row in fund_rows:
+        code = str(row["code"])
+        trade_date = str(row["trade_date"])
+        ratio = float(row["main_net_inflow_ratio"] or 0.0)
+        fund_ratio_by_code_date[(code, trade_date)] = ratio
+        fund_series_by_code[code].append((trade_date, ratio))
+
+    fund_roll_by_code_date: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    for code, series in fund_series_by_code.items():
+        ratios = [value for _date, value in series]
+        for idx, (trade_date, _value) in enumerate(series):
+            fund_5 = _rolling_mean(ratios, idx, 5)
+            fund_20 = _rolling_mean(ratios, idx, 20)
+            fund_roll_by_code_date[(code, trade_date)] = (fund_5, fund_20)
+
+    sector_rows = conn.execute(
+        f"""
+        SELECT code, sector_name
+        FROM stock_sector_map
+        WHERE code IN ({placeholder_codes})
+        """,
+        codes,
+    ).fetchall()
+    sector_by_code = {str(row["code"]): str(row["sector_name"] or "") for row in sector_rows}
+    sectors = sorted({sector for sector in sector_by_code.values() if sector})
+    if not sectors:
+        # No sector map yet; return fund-flow-only features.
+        out: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for code, trade_date in items:
+            fund_ratio = fund_ratio_by_code_date.get((code, trade_date), 0.0)
+            fund_5, fund_20 = fund_roll_by_code_date.get((code, trade_date), (0.0, 0.0))
+            out[(code, trade_date)] = {
+                "fund_main_net_ratio": fund_ratio,
+                "fund_main_net_ratio_5": fund_5,
+                "fund_main_net_ratio_20": fund_20,
+                "fund_main_net_trend": fund_5 - fund_20,
+                "sector_ret_5": 0.0,
+                "sector_ret_20": 0.0,
+                "sector_momentum_5_20": 0.0,
+            }
+        return out
+
+    placeholder_sectors = ",".join("?" for _ in sectors)
+    sector_day_rows = conn.execute(
+        f"""
+        SELECT k.trade_date, m.sector_name, AVG(COALESCE(k.change_percent, 0.0)) AS sector_ret_1d
+        FROM eastmoney_stock_daily_klines k
+        JOIN stock_sector_map m
+          ON m.code = k.code
+        WHERE m.sector_name IN ({placeholder_sectors})
+          AND k.trade_date BETWEEN ? AND ?
+        GROUP BY k.trade_date, m.sector_name
+        ORDER BY m.sector_name, k.trade_date
+        """,
+        [*sectors, query_start_date, max_date],
+    ).fetchall()
+
+    sector_series: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    for row in sector_day_rows:
+        sector_series[str(row["sector_name"])].append((str(row["trade_date"]), float(row["sector_ret_1d"] or 0.0)))
+
+    sector_roll: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    for sector, series in sector_series.items():
+        rets = [value for _date, value in series]
+        for idx, (trade_date, _value) in enumerate(series):
+            ret_5 = _rolling_mean(rets, idx, 5)
+            ret_20 = _rolling_mean(rets, idx, 20)
+            sector_roll[(sector, trade_date)] = (ret_5, ret_20)
+
+    out: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for code, trade_date in items:
+        fund_ratio = fund_ratio_by_code_date.get((code, trade_date), 0.0)
+        fund_5, fund_20 = fund_roll_by_code_date.get((code, trade_date), (0.0, 0.0))
+        sector = sector_by_code.get(code, "")
+        sec_5, sec_20 = sector_roll.get((sector, trade_date), (0.0, 0.0))
+        out[(code, trade_date)] = {
+            "fund_main_net_ratio": fund_ratio,
+            "fund_main_net_ratio_5": fund_5,
+            "fund_main_net_ratio_20": fund_20,
+            "fund_main_net_trend": fund_5 - fund_20,
+            "sector_ret_5": sec_5,
+            "sector_ret_20": sec_20,
+            "sector_momentum_5_20": sec_5 - sec_20,
+        }
+    return out
 
 
 def create_ml_model_run(
