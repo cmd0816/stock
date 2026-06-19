@@ -57,6 +57,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "exit_on_break_ma20": True,
         "negative_drawdown_pct": 0.06,
         "rule_score_weight": 0.35,
+        "normalize_rule_score_for_blend": True,
         "train_on_selected_universe": False,
         "use_review_feedback_labels": False,
         "review_feedback_weight": 1,

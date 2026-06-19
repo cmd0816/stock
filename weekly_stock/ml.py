@@ -51,9 +51,11 @@ FEATURE_NAMES = [
     "fund_main_net_ratio_5",
     "fund_main_net_ratio_20",
     "fund_main_net_trend",
+    "fund_flow_available",
     "sector_ret_5",
     "sector_ret_20",
     "sector_momentum_5_20",
+    "sector_available",
 ]
 
 
@@ -242,9 +244,11 @@ def feature_label(name: str) -> str:
         "fund_main_net_ratio_5": "5日主力净流入占比",
         "fund_main_net_ratio_20": "20日主力净流入占比",
         "fund_main_net_trend": "主力净流入趋势(5-20)",
+        "fund_flow_available": "资金流数据可用",
         "sector_ret_5": "板块5日动量",
         "sector_ret_20": "板块20日动量",
         "sector_momentum_5_20": "板块动量差(5-20)",
+        "sector_available": "板块数据可用",
     }.get(name, name)
 
 
@@ -509,8 +513,16 @@ def _add_cross_sectional(feature_items: List[tuple[str, Dict[str, float]]]) -> N
                 ((f.get(feat, 0.0), f) for f in date_features),
                 key=lambda x: x[0],
             )
-            for rank, (_val, f) in enumerate(values):
-                f[f"{feat}_rank"] = rank / (n - 1) if n > 1 else 0.5
+            start = 0
+            while start < n:
+                end = start + 1
+                while end < n and values[end][0] == values[start][0]:
+                    end += 1
+                average_rank = (start + end - 1) / 2
+                percentile = average_rank / (n - 1) if n > 1 else 0.5
+                for _value, features in values[start:end]:
+                    features[f"{feat}_rank"] = percentile
+                start = end
 
         ret_20s = [f.get("ret_20", 0.0) for f in date_features]
         market_ret = mean(ret_20s) if ret_20s else 0.0
@@ -589,7 +601,11 @@ def build_training_samples(
         if cfg.get("weekly_last_trading_day_only", True):
             allowed_dates = weekly_last_trading_days(k.trade_date for k in klines)
         max_idx = len(klines) - horizon - 1
-        for idx in range(lookback, max_idx + 1, stride):
+        # Weekly mode already performs temporal downsampling. Applying a second
+        # index-based stride here skips valid week ends whenever holidays shift
+        # their positions in the per-stock series.
+        index_step = 1 if allowed_dates is not None else stride
+        for idx in range(lookback, max_idx + 1, index_step):
             if allowed_dates is not None and klines[idx].trade_date not in allowed_dates:
                 continue
             features = features_at(klines, idx)
@@ -678,8 +694,17 @@ def evaluate_predictions(
     fp = sum(1 for y, p in zip(labels, predicted) if y == 0 and p == 1)
     fn = sum(1 for y, p in zip(labels, predicted) if y == 1 and p == 0)
     correct = sum(1 for y, p in zip(labels, predicted) if y == p)
-    ranked = sorted(zip(probabilities, samples), key=lambda item: item[0], reverse=True)
-    top = [sample for _, sample in ranked[: max(1, top_k)]]
+    # The production decision is made independently on each screening date.
+    # Selecting one global Top-K across an entire multi-week test period makes
+    # the metric depend on probability calibration between weeks and badly
+    # overstates a handful of extreme predictions.
+    by_date: Dict[str, List[tuple[float, TrainingSample]]] = {}
+    for probability, sample in zip(probabilities, samples):
+        by_date.setdefault(sample.trade_date, []).append((probability, sample))
+    top: List[TrainingSample] = []
+    for rows in by_date.values():
+        ranked = sorted(rows, key=lambda item: item[0], reverse=True)
+        top.extend(sample for _, sample in ranked[: max(1, top_k)])
     return BacktestMetrics(
         model_name=model_name,
         train_count=train_count,
@@ -696,23 +721,79 @@ def evaluate_predictions(
     )
 
 
-def backtest_models(samples: List[TrainingSample], cfg: Dict[str, Any]) -> List[BacktestMetrics]:
+def apply_training_label_overrides(
+    samples: List[TrainingSample],
+    feedback_labels: Dict[tuple[str, str], int],
+    weight: int = 1,
+) -> tuple[List[TrainingSample], List[float], Dict[str, int]]:
+    if not samples or not feedback_labels:
+        return samples, [1.0] * len(samples), {"matched": 0, "relabeled": 0, "extra_weighted": 0}
+
+    use_weight = max(1, int(weight))
+    merged: List[TrainingSample] = []
+    sample_weights: List[float] = []
+    matched = 0
+    relabeled = 0
+    extra_weighted = 0
+    for sample in samples:
+        label = feedback_labels.get((str(sample.code), str(sample.trade_date)))
+        if label is None:
+            merged.append(sample)
+            sample_weights.append(1.0)
+            continue
+
+        matched += 1
+        normalized_label = 1 if int(label) else 0
+        if int(sample.label) != normalized_label:
+            relabeled += 1
+        merged.append(
+            TrainingSample(
+                code=sample.code,
+                trade_date=sample.trade_date,
+                features=dict(sample.features),
+                label=normalized_label,
+                future_high_gain_pct=sample.future_high_gain_pct,
+                future_close_gain_pct=sample.future_close_gain_pct,
+                future_max_drawdown_pct=sample.future_max_drawdown_pct,
+            )
+        )
+        sample_weights.append(float(use_weight))
+        extra_weighted += use_weight - 1
+    return merged, sample_weights, {
+        "matched": matched,
+        "relabeled": relabeled,
+        "extra_weighted": extra_weighted,
+    }
+
+
+def backtest_models(
+    samples: List[TrainingSample],
+    cfg: Dict[str, Any],
+    feedback_labels: Optional[Dict[tuple[str, str], int]] = None,
+) -> List[BacktestMetrics]:
     train_samples, test_samples = split_samples_by_time(
         samples,
         train_ratio=float(cfg.get("backtest_train_ratio", 0.7)),
     )
     if not train_samples or not test_samples:
         raise RuntimeError("Not enough samples for ML backtest.")
+    sample_weights: Optional[List[float]] = None
+    if cfg.get("use_review_feedback_labels", False) and feedback_labels:
+        train_samples, sample_weights, _stats = apply_training_label_overrides(
+            train_samples,
+            feedback_labels,
+            weight=int(cfg.get("review_feedback_weight", 1)),
+        )
     top_k = int(cfg.get("backtest_top_k", 10))
     metrics: List[BacktestMetrics] = []
 
     baseline_name = str(cfg.get("baseline_model_name", "logistic_regression")).lower()
     if baseline_name == "logistic_regression":
-        baseline = train_logistic_regression_model(train_samples)
+        baseline = train_logistic_regression_model(train_samples, sample_weights=sample_weights)
         baseline_probs = [baseline.predict_probability(s.features) for s in test_samples]
         metrics.append(evaluate_predictions("logistic_regression", test_samples, baseline_probs, len(train_samples), top_k))
 
-    main = train_model(train_samples, cfg)
+    main = train_model(train_samples, cfg, sample_weights=sample_weights)
     main_probs = [main.predict_probability(s.features) for s in test_samples]
     metrics.append(evaluate_predictions(str(cfg.get("model_name", "lightgbm")), test_samples, main_probs, len(train_samples), top_k))
     return metrics

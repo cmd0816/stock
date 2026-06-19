@@ -141,18 +141,48 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
         );
 
+        CREATE TABLE IF NOT EXISTS weekly_ml_prediction_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_run_id INTEGER NOT NULL,
+            source_run_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            probability_up REAL NOT NULL,
+            predicted_score REAL NOT NULL,
+            feature_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            UNIQUE(model_run_id, code),
+            FOREIGN KEY (model_run_id) REFERENCES weekly_ml_model_runs(model_run_id),
+            FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_weekly_candidates_run ON weekly_screen_candidates(run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_selected_run ON weekly_selected_stocks(run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_review_run ON weekly_review_results(review_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_ml_samples_model ON weekly_ml_training_samples(model_run_id);
         CREATE INDEX IF NOT EXISTS idx_weekly_ml_samples_code_date ON weekly_ml_training_samples(code, trade_date);
         CREATE INDEX IF NOT EXISTS idx_weekly_ml_predictions_run ON weekly_ml_predictions(source_run_id);
+        CREATE INDEX IF NOT EXISTS idx_weekly_ml_prediction_history_run
+            ON weekly_ml_prediction_history(source_run_id, model_run_id);
         """
     )
     _migrate_weekly_review_runs_to_append_mode(conn)
     _add_column_if_missing(conn, "weekly_review_results", "best_exit_meets_expectation", "INTEGER NOT NULL DEFAULT 0")
     ensure_market_context_tables(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_review_runs_run_id ON weekly_review_runs(reviewed_run_id)")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO weekly_ml_prediction_history (
+            model_run_id, source_run_id, code, name, probability_up,
+            predicted_score, feature_json, reason, created_at_utc
+        )
+        SELECT
+            model_run_id, source_run_id, code, name, probability_up,
+            predicted_score, feature_json, reason, created_at_utc
+        FROM weekly_ml_predictions
+        """
+    )
     conn.commit()
 
 
@@ -375,6 +405,10 @@ def delete_screen_runs(conn: sqlite3.Connection, screen_date: str, xuangu_batch_
             model_run_ids,
         )
         conn.execute(
+            f"DELETE FROM weekly_ml_prediction_history WHERE model_run_id IN ({model_placeholders})",
+            model_run_ids,
+        )
+        conn.execute(
             f"DELETE FROM weekly_ml_model_runs WHERE model_run_id IN ({model_placeholders})",
             model_run_ids,
         )
@@ -397,6 +431,7 @@ def delete_all_screen_runs(conn: sqlite3.Connection, *, preserve_review_results:
         conn.execute("DELETE FROM weekly_review_runs")
     conn.execute("DELETE FROM weekly_ml_training_samples")
     conn.execute("DELETE FROM weekly_ml_predictions")
+    conn.execute("DELETE FROM weekly_ml_prediction_history")
     conn.execute("DELETE FROM weekly_ml_model_runs")
     conn.execute("DELETE FROM weekly_selected_stocks")
     conn.execute("DELETE FROM weekly_screen_candidates")
@@ -583,13 +618,20 @@ def review_trend_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3
     ).fetchall()
 
 
-def review_feedback_labels(conn: sqlite3.Connection, recent_runs: int = 0) -> Dict[Tuple[str, str], int]:
+def review_feedback_labels(
+    conn: sqlite3.Connection,
+    recent_runs: int = 0,
+    as_of_date: Optional[str] = None,
+) -> Dict[Tuple[str, str], int]:
+    cutoff_sql = "WHERE review_date < ?" if as_of_date else ""
+    cutoff_params: List[Any] = [str(as_of_date)] if as_of_date else []
     if recent_runs and int(recent_runs) > 0:
         rows = conn.execute(
-            """
+            f"""
             WITH chosen_reviews AS (
                 SELECT review_id
                 FROM weekly_review_runs
+                {cutoff_sql}
                 ORDER BY review_id DESC
                 LIMIT ?
             ),
@@ -612,14 +654,15 @@ def review_feedback_labels(conn: sqlite3.Connection, recent_runs: int = 0) -> Di
               AND rr.close_gain_pct IS NOT NULL
               AND rr.max_drawdown_pct IS NOT NULL
             """,
-            (int(recent_runs),),
+            (*cutoff_params, int(recent_runs)),
         ).fetchall()
     else:
         rows = conn.execute(
-            """
+            f"""
             WITH latest_per_run AS (
                 SELECT reviewed_run_id, MAX(review_id) AS review_id
                 FROM weekly_review_runs
+                {cutoff_sql}
                 GROUP BY reviewed_run_id
             )
             SELECT rr.code, rr.base_trade_date, rr.meets_expectation
@@ -633,7 +676,8 @@ def review_feedback_labels(conn: sqlite3.Connection, recent_runs: int = 0) -> Di
               AND rr.highest_gain_pct IS NOT NULL
               AND rr.close_gain_pct IS NOT NULL
               AND rr.max_drawdown_pct IS NOT NULL
-            """
+            """,
+            cutoff_params,
         ).fetchall()
     return {
         (str(row["code"]), str(row["base_trade_date"])): int(row["meets_expectation"])
@@ -818,9 +862,11 @@ def load_ml_context_features(
                 "fund_main_net_ratio_5": fund_5,
                 "fund_main_net_ratio_20": fund_20,
                 "fund_main_net_trend": fund_5 - fund_20,
+                "fund_flow_available": 1.0 if (code, trade_date) in fund_ratio_by_code_date else 0.0,
                 "sector_ret_5": 0.0,
                 "sector_ret_20": 0.0,
                 "sector_momentum_5_20": 0.0,
+                "sector_available": 0.0,
             }
         return out
 
@@ -862,9 +908,11 @@ def load_ml_context_features(
             "fund_main_net_ratio_5": fund_5,
             "fund_main_net_ratio_20": fund_20,
             "fund_main_net_trend": fund_5 - fund_20,
+            "fund_flow_available": 1.0 if (code, trade_date) in fund_ratio_by_code_date else 0.0,
             "sector_ret_5": sec_5,
             "sector_ret_20": sec_20,
             "sector_momentum_5_20": sec_5 - sec_20,
+            "sector_available": 1.0 if (sector, trade_date) in sector_roll else 0.0,
         }
     return out
 
@@ -939,6 +987,8 @@ def save_ml_predictions(
 ) -> None:
     conn.execute("DELETE FROM weekly_ml_predictions WHERE source_run_id = ?", (source_run_id,))
     for pred in predictions:
+        created_at = utc_now()
+        payload = json.dumps(pred.get("features") or {}, ensure_ascii=False, default=str)
         conn.execute(
             """
             INSERT INTO weekly_ml_predictions (
@@ -953,9 +1003,28 @@ def save_ml_predictions(
                 pred.get("name"),
                 pred["probability_up"],
                 pred["predicted_score"],
-                json.dumps(pred.get("features") or {}, ensure_ascii=False, default=str),
+                payload,
                 pred.get("reason") or "",
-                utc_now(),
+                created_at,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO weekly_ml_prediction_history (
+                model_run_id, source_run_id, code, name, probability_up,
+                predicted_score, feature_json, reason, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                model_run_id,
+                source_run_id,
+                pred["code"],
+                pred.get("name"),
+                pred["probability_up"],
+                pred["predicted_score"],
+                payload,
+                pred.get("reason") or "",
+                created_at,
             ),
         )
     conn.commit()

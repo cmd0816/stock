@@ -79,6 +79,8 @@ ml:
   exit_on_break_ma20: true
   negative_drawdown_pct: 0.06
   rule_score_weight: 0.25
+  # 将入选股规则分转为横截面百分位后再与ML概率混合，避免95分附近的小数差异失去作用
+  normalize_rule_score_for_blend: true
   train_on_selected_universe: false
   # 利用历史复盘结果进行增量学习，提升模型对实际选股场景的适配性
   use_review_feedback_labels: true

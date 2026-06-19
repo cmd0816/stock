@@ -10,11 +10,12 @@ from . import db
 from .models import Kline, ReviewResult
 from .ml import (
     TrainingSample,
-    add_cross_sectional_features,
     add_cross_sectional_to_predictions,
+    apply_training_label_overrides,
     backtest_models,
     build_training_samples,
     features_at,
+    split_samples_by_time,
     train_model,
 )
 from .scoring import rank_candidates
@@ -33,40 +34,7 @@ def apply_review_feedback_labels(
     feedback_labels: Dict[tuple[str, str], int],
     weight: int = 1,
 ) -> tuple[List[TrainingSample], List[float], Dict[str, int]]:
-    if not samples or not feedback_labels:
-        return samples, [1.0] * len(samples), {"matched": 0, "relabeled": 0, "extra_weighted": 0}
-
-    use_weight = max(1, int(weight))
-    merged: List[TrainingSample] = []
-    sample_weights: List[float] = []
-    matched = 0
-    relabeled = 0
-    extra_weighted = 0
-    for sample in samples:
-        key = (str(sample.code), str(sample.trade_date))
-        label = feedback_labels.get(key)
-        if label is None:
-            merged.append(sample)
-            sample_weights.append(1.0)
-            continue
-
-        matched += 1
-        normalized_label = 1 if int(label) else 0
-        if int(sample.label) != normalized_label:
-            relabeled += 1
-        updated = TrainingSample(
-            code=sample.code,
-            trade_date=sample.trade_date,
-            features=dict(sample.features),
-            label=normalized_label,
-            future_high_gain_pct=sample.future_high_gain_pct,
-            future_close_gain_pct=sample.future_close_gain_pct,
-            future_max_drawdown_pct=sample.future_max_drawdown_pct,
-        )
-        merged.append(updated)
-        sample_weights.append(float(use_weight))
-        extra_weighted += use_weight - 1
-    return merged, sample_weights, {"matched": matched, "relabeled": relabeled, "extra_weighted": extra_weighted}
+    return apply_training_label_overrides(samples, feedback_labels, weight=weight)
 
 
 def attach_context_features_to_samples(conn: Any, samples: List[TrainingSample]) -> None:
@@ -98,6 +66,20 @@ def attach_context_features_to_prediction_items(
         if not ctx:
             continue
         features.update(ctx)
+
+
+def normalized_rule_scores(rows: List[Any], enabled: bool = True) -> Dict[str, float]:
+    raw_by_code = {str(row["code"]): float(row["total_score"] or 0.0) for row in rows}
+    if not enabled:
+        return raw_by_code
+    unique_scores = sorted(set(raw_by_code.values()))
+    if len(unique_scores) <= 1:
+        return {code: 50.0 for code in raw_by_code}
+    percentile_by_score = {
+        score: rank * 100.0 / (len(unique_scores) - 1)
+        for rank, score in enumerate(unique_scores)
+    }
+    return {code: percentile_by_score[score] for code, score in raw_by_code.items()}
 
 
 def download_review_history_for_selected_stocks(
@@ -328,12 +310,18 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
         selected_rows = db.selected_stocks_for_run(conn, source_run_id)
         if not selected_rows:
             raise RuntimeError(f"Run {source_run_id} has no selected stocks.")
+        screen_date = str(selected_rows[0]["screen_date"])
 
         train_codes = db.all_downloaded_codes(conn)
         if ml_cfg.get("train_on_selected_universe", False):
             train_codes = db.selected_codes_for_run(conn, source_run_id)
         klines_by_code = {
-            code: db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
+            code: db.load_klines(
+                conn,
+                code,
+                limit=int(ml_cfg.get("history_limit", 320)),
+                as_of_date=screen_date,
+            )
             for code in train_codes
         }
         samples = build_training_samples(klines_by_code, ml_cfg)
@@ -341,7 +329,18 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
         sample_weights: Optional[List[float]] = None
         if ml_cfg.get("use_review_feedback_labels", False):
             recent_runs = int(ml_cfg.get("review_feedback_recent_runs", 0))
-            feedback = db.review_feedback_labels(conn, recent_runs=recent_runs)
+            feedback = db.review_feedback_labels(
+                conn,
+                recent_runs=recent_runs,
+                as_of_date=screen_date,
+            )
+            # A historical replay may only learn from reviews that were already
+            # available before its screening date.
+            feedback = {
+                key: label
+                for key, label in feedback.items()
+                if str(key[1]) < screen_date
+            }
             feedback_weight = int(ml_cfg.get("review_feedback_weight", 1))
             samples, sample_weights, feedback_stats = apply_review_feedback_labels(samples, feedback, weight=feedback_weight)
             if feedback_stats["matched"] > 0:
@@ -370,33 +369,49 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
         )
         db.save_ml_training_samples(conn, model_run_id, source_run_id, samples)
 
-        prediction_items: List[tuple[Any, Dict[str, float], str]] = []
-        for row in selected_rows:
-            code = str(row["code"])
-            klines = db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
-            if not klines:
+        # Build cross-sectional features over the same downloaded universe used
+        # for training, then take the selected rows from that snapshot. Computing
+        # ranks only inside Top-N gives the same feature a different meaning at
+        # train and prediction time.
+        prediction_universe: List[tuple[Any, Dict[str, float], str]] = []
+        for code, klines in klines_by_code.items():
+            if not klines or klines[-1].trade_date != screen_date:
                 continue
             features = features_at(klines, len(klines) - 1)
             if features is None:
                 continue
-            trade_date = klines[-1].trade_date
-            prediction_items.append((row, features, trade_date))
+            prediction_universe.append(({"code": code}, features, screen_date))
 
-        attach_context_features_to_prediction_items(conn, prediction_items)
+        attach_context_features_to_prediction_items(conn, prediction_universe)
 
         if ml_cfg.get("use_cross_sectional_features", True):
             add_cross_sectional_to_predictions(
-                [(trade_date, features) for _row, features, trade_date in prediction_items]
+                [(trade_date, features) for _row, features, trade_date in prediction_universe]
             )
 
+        universe_features = {
+            str(row["code"]): (features, trade_date)
+            for row, features, trade_date in prediction_universe
+        }
+        prediction_items: List[tuple[Any, Dict[str, float], str]] = []
+        for row in selected_rows:
+            item = universe_features.get(str(row["code"]))
+            if item is not None:
+                prediction_items.append((row, item[0], item[1]))
+
+        rule_scores = normalized_rule_scores(
+            selected_rows,
+            enabled=bool(ml_cfg.get("normalize_rule_score_for_blend", True)),
+        )
         predictions = []
-        for row, features, _trade_date in prediction_items:
+        for row, features, feature_trade_date in prediction_items:
             code = str(row["code"])
             probability = model.predict_probability(features)
             baseline_probability = None
             if hasattr(model, "predict_baseline_probability"):
                 baseline_probability = model.predict_baseline_probability(features)
-            rule_score = float(row["total_score"] or 0)
+            raw_rule_score = float(row["total_score"] or 0)
+            rule_score = rule_scores.get(code, raw_rule_score)
             rule_weight = float(ml_cfg.get("rule_score_weight", 0.35))
             predicted_score = probability * 100 * (1 - rule_weight) + rule_score * rule_weight
             predictions.append(
@@ -407,6 +422,10 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
                     "predicted_score": round(predicted_score, 2),
                     "features": {
                         **features,
+                        "feature_trade_date": feature_trade_date,
+                        "cross_section_size": len(prediction_universe),
+                        "raw_rule_score": raw_rule_score,
+                        "normalized_rule_score": rule_score,
                         "baseline_probability_up": round(baseline_probability, 4)
                         if baseline_probability is not None
                         else None,
@@ -453,13 +472,25 @@ def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
         }
         samples = build_training_samples(klines_by_code, ml_cfg)
         attach_context_features_to_samples(conn, samples)
+        feedback = None
+        if ml_cfg.get("use_review_feedback_labels", False):
+            _train_samples, test_samples = split_samples_by_time(
+                samples,
+                train_ratio=float(ml_cfg.get("backtest_train_ratio", 0.7)),
+            )
+            feedback_cutoff = min((sample.trade_date for sample in test_samples), default=None)
+            feedback = db.review_feedback_labels(
+                conn,
+                recent_runs=int(ml_cfg.get("review_feedback_recent_runs", 0)),
+                as_of_date=feedback_cutoff,
+            )
     min_samples = int(ml_cfg.get("min_train_samples", 30))
     if len(samples) < min_samples:
         raise RuntimeError(
             f"Not enough ML backtest samples: {len(samples)} < {min_samples}. "
             "Download more K-line history or lower ml.min_train_samples."
         )
-    return backtest_models(samples, ml_cfg)
+    return backtest_models(samples, ml_cfg, feedback_labels=feedback)
 
 
 def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[str, Any]) -> ReviewResult:

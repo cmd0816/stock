@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 from weekly_stock.config import DEFAULT_CONFIG
@@ -14,7 +15,7 @@ from weekly_stock.jobs import (
     review_selected_stock,
     stock_screen_job,
 )
-from weekly_stock.ml import TrainingSample, build_training_samples, label_future
+from weekly_stock.ml import TrainingSample, build_training_samples, evaluate_predictions, label_future
 from weekly_stock.models import Kline
 from weekly_stock.trading_calendar import align_to_last_trading_day, weekly_last_trading_days
 
@@ -114,6 +115,36 @@ def insert_kline(conn: sqlite3.Connection, code: str, day: int, close: float, vo
         ) VALUES ('url', 0, ?, ?, '测试', ?, ?, ?, ?, ?, ?, 0, 0, 1, 0, ?, 'raw', 'now')
         """,
         (code, f"0.{code}", trade_date, close - 0.2, close, close + 0.5, close - 0.5, volume, turnover_rate),
+    )
+
+
+def insert_kline_on_date(
+    conn: sqlite3.Connection,
+    code: str,
+    trade_date: str,
+    close: float,
+    volume: float = 1000,
+    turnover_rate: float = 5,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO eastmoney_stock_daily_klines (
+            source_url, market, code, secid, name, trade_date, open, close, high, low,
+            volume, turnover, amplitude_percent, change_percent, change_amount,
+            turnover_rate, raw_line, fetched_at_utc
+        ) VALUES ('url', 0, ?, ?, '测试', ?, ?, ?, ?, ?, ?, 0, 0, 1, 0, ?, 'raw', 'now')
+        """,
+        (
+            code,
+            f"0.{code}",
+            trade_date,
+            close - 0.2,
+            close,
+            close + 0.5,
+            close - 0.5,
+            volume,
+            turnover_rate,
+        ),
     )
 
 
@@ -264,9 +295,21 @@ class WeeklyStockTests(unittest.TestCase):
                 )
                 insert_candidate(conn, "000001", "强势股份", {"营业收入同比增长率": "20%", "净利润同比增长率": "15%"})
                 insert_candidate(conn, "000002", "普通股份", {"营业收入同比增长率": "5%", "净利润同比增长率": "3%"})
-                for i in range(1, 96):
-                    insert_kline(conn, "000001", i, 10 + i * 0.08, volume=1000 + i * 10)
-                    insert_kline(conn, "000002", i, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
+                start = date(2026, 1, 1)
+                for i in range(100):
+                    trade_date = (start + timedelta(days=i)).isoformat()
+                    insert_kline_on_date(conn, "000001", trade_date, 10 + i * 0.08, volume=1000 + i * 10)
+                    insert_kline_on_date(
+                        conn,
+                        "000002",
+                        trade_date,
+                        12 + ((i % 8) - 4) * 0.03,
+                        volume=900 + (i % 5) * 15,
+                    )
+                    insert_kline_on_date(conn, "000003", trade_date, 8 + i * 0.02, volume=700 + i)
+                screen_date = (start + timedelta(days=99)).isoformat()
+                # A future jump must not enter either training or prediction.
+                insert_kline_on_date(conn, "000002", (start + timedelta(days=100)).isoformat(), 30, volume=5000)
                 conn.commit()
 
             config = DEFAULT_CONFIG | {
@@ -282,13 +325,13 @@ class WeeklyStockTests(unittest.TestCase):
                     "weekly_last_trading_day_only": False,
                 },
             }
-            run_id = stock_screen_job(config_path, config, screen_date="2026-05-02", xuangu_batch_id="b1")
+            run_id = stock_screen_job(config_path, config, screen_date=screen_date, xuangu_batch_id="b1")
             model_run_id = ml_predict_job(config_path, config, run_id=run_id)
 
             with connect(root / "stocks.db") as conn:
                 models = conn.execute("SELECT * FROM weekly_ml_model_runs WHERE model_run_id=?", (model_run_id,)).fetchall()
                 predictions = conn.execute(
-                    "SELECT code, probability_up, predicted_score FROM weekly_ml_predictions WHERE source_run_id=?",
+                    "SELECT code, probability_up, predicted_score, feature_json FROM weekly_ml_predictions WHERE source_run_id=?",
                     (run_id,),
                 ).fetchall()
                 samples = conn.execute(
@@ -299,6 +342,28 @@ class WeeklyStockTests(unittest.TestCase):
             self.assertGreaterEqual(len(predictions), 1)
             self.assertGreaterEqual(len(samples), 1)
             self.assertTrue(all(0 <= row["probability_up"] <= 1 for row in predictions))
+            self.assertTrue(
+                all(json.loads(row["feature_json"])["feature_trade_date"] == screen_date for row in predictions)
+            )
+            self.assertTrue(
+                all(json.loads(row["feature_json"])["cross_section_size"] == 3 for row in predictions)
+            )
+
+            second_model_run_id = ml_predict_job(config_path, config, run_id=run_id)
+            with connect(root / "stocks.db") as conn:
+                current_model_ids = {
+                    int(row["model_run_id"])
+                    for row in conn.execute(
+                        "SELECT model_run_id FROM weekly_ml_predictions WHERE source_run_id=?",
+                        (run_id,),
+                    )
+                }
+                history_count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM weekly_ml_prediction_history WHERE source_run_id=?",
+                    (run_id,),
+                ).fetchone()["n"]
+            self.assertEqual(current_model_ids, {second_model_run_id})
+            self.assertEqual(history_count, len(predictions) * 2)
 
     def test_apply_review_feedback_labels_relabels_and_weights(self) -> None:
         samples = [
@@ -464,8 +529,12 @@ class WeeklyStockTests(unittest.TestCase):
                 )
                 conn.commit()
                 labels = review_feedback_labels(conn)
+                labels_before_review = review_feedback_labels(conn, as_of_date="2026-05-08")
+                labels_after_review = review_feedback_labels(conn, as_of_date="2026-05-09")
 
             self.assertEqual(labels, {("000001", "2026-05-01"): 1})
+            self.assertEqual(labels_before_review, {})
+            self.assertEqual(labels_after_review, labels)
 
     def test_ml_predict_job_can_apply_review_feedback_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -480,9 +549,18 @@ class WeeklyStockTests(unittest.TestCase):
                 )
                 insert_candidate(conn, "000001", "强势股份", {"营业收入同比增长率": "20%", "净利润同比增长率": "15%"})
                 insert_candidate(conn, "000002", "普通股份", {"营业收入同比增长率": "5%", "净利润同比增长率": "3%"})
-                for i in range(1, 96):
-                    insert_kline(conn, "000001", i, 10 + i * 0.08, volume=1000 + i * 10)
-                    insert_kline(conn, "000002", i, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
+                start = date(2026, 1, 1)
+                for i in range(100):
+                    trade_date = (start + timedelta(days=i)).isoformat()
+                    insert_kline_on_date(conn, "000001", trade_date, 10 + i * 0.08, volume=1000 + i * 10)
+                    insert_kline_on_date(
+                        conn,
+                        "000002",
+                        trade_date,
+                        12 + ((i % 8) - 4) * 0.03,
+                        volume=900 + (i % 5) * 15,
+                    )
+                screen_date = (start + timedelta(days=99)).isoformat()
                 conn.commit()
 
             base_ml_cfg = {
@@ -499,7 +577,7 @@ class WeeklyStockTests(unittest.TestCase):
                 "screening": {"top_n": 2, "min_score": 0, "run_xuangu": False},
                 "ml": base_ml_cfg,
             }
-            run_id = stock_screen_job(config_path, base_config, screen_date="2026-05-02", xuangu_batch_id="b1")
+            run_id = stock_screen_job(config_path, base_config, screen_date=screen_date, xuangu_batch_id="b1")
 
             with connect(root / "stocks.db") as conn:
                 selected_row = conn.execute(
@@ -534,12 +612,22 @@ class WeeklyStockTests(unittest.TestCase):
                 self.assertGreater(len(samples), 0)
                 target_sample = samples[0]
                 flipped_label = 0 if int(target_sample.label) == 1 else 1
+                review_date = (
+                    date.fromisoformat(target_sample.trade_date) + timedelta(days=7)
+                ).isoformat()
+                review_start = (
+                    date.fromisoformat(target_sample.trade_date) + timedelta(days=1)
+                ).isoformat()
+                review_end = (
+                    date.fromisoformat(target_sample.trade_date) + timedelta(days=5)
+                ).isoformat()
+                self.assertLess(review_date, screen_date)
                 review_id = conn.execute(
                     """
                     INSERT INTO weekly_review_runs (reviewed_run_id, review_date, config_json, created_at_utc)
-                    VALUES (?, '2026-05-20', '{}', '2026-05-20T00:00:00Z')
+                    VALUES (?, ?, '{}', ?)
                     """,
-                    (run_id,),
+                    (run_id, review_date, f"{review_date}T00:00:00Z"),
                 ).lastrowid
                 conn.execute(
                     """
@@ -547,9 +635,18 @@ class WeeklyStockTests(unittest.TestCase):
                         review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
                         highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered, meets_expectation,
                         notes, created_at_utc
-                    ) VALUES (?, ?, ?, '测试', ?, '2026-05-21', '2026-05-25', 0, 0, 0, 0, ?, 'test', '2026-05-20T00:00:00Z')
+                    ) VALUES (?, ?, ?, '测试', ?, ?, ?, 0, 0, 0, 0, ?, 'test', ?)
                     """,
-                    (review_id, int(selected_row["id"]), code, target_sample.trade_date, flipped_label),
+                    (
+                        review_id,
+                        int(selected_row["id"]),
+                        code,
+                        target_sample.trade_date,
+                        review_start,
+                        review_end,
+                        flipped_label,
+                        f"{review_date}T00:00:00Z",
+                    ),
                 )
                 conn.commit()
 
@@ -610,6 +707,35 @@ class WeeklyStockTests(unittest.TestCase):
             self.assertEqual(metrics[0].model_name, "centroid_v1")
             self.assertGreater(metrics[0].test_count, 0)
 
+    def test_backtest_top_k_is_selected_per_trade_date(self) -> None:
+        def sample(code: str, trade_date: str, label: int, close_gain: float) -> TrainingSample:
+            return TrainingSample(
+                code=code,
+                trade_date=trade_date,
+                features={},
+                label=label,
+                future_high_gain_pct=close_gain,
+                future_close_gain_pct=close_gain,
+                future_max_drawdown_pct=-1.0,
+            )
+
+        samples = [
+            sample("000001", "2026-05-01", 1, 5.0),
+            sample("000002", "2026-05-01", 0, -2.0),
+            sample("000003", "2026-05-08", 0, -3.0),
+            sample("000004", "2026-05-08", 1, 4.0),
+        ]
+        metrics = evaluate_predictions(
+            "test",
+            samples,
+            [0.9, 0.1, 0.8, 0.2],
+            train_count=10,
+            top_k=1,
+        )
+        # One row is selected from each date: hit on 2026-05-01 and miss on 2026-05-08.
+        self.assertAlmostEqual(metrics.top_k_hit_rate, 0.5)
+        self.assertAlmostEqual(metrics.top_k_avg_close_gain_pct, 1.0)
+
     def test_trading_calendar_aligns_to_latest_trade_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -646,6 +772,26 @@ class WeeklyStockTests(unittest.TestCase):
         )
         self.assertGreater(len(samples), 0)
         self.assertTrue(all(sample.trade_date in allowed for sample in samples))
+
+        eligible_dates = {
+            k.trade_date
+            for idx, k in enumerate(klines)
+            if idx >= 60 and idx <= len(klines) - 6 and k.trade_date in allowed
+        }
+        samples_with_stride = build_training_samples(
+            {"000001": klines},
+            {
+                **DEFAULT_CONFIG["ml"],
+                "weekly_last_trading_day_only": True,
+                "lookback_trading_days": 20,
+                "horizon_trading_days": 5,
+                "sample_stride": 5,
+            },
+        )
+        self.assertEqual(
+            {sample.trade_date for sample in samples_with_stride},
+            eligible_dates,
+        )
 
     def test_label_future_exit_rules_stop_loss(self) -> None:
         klines = []

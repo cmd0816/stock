@@ -63,9 +63,11 @@ class MlContextFeatureTests(unittest.TestCase):
             self.assertAlmostEqual(float(features["fund_main_net_ratio"]), 3.0, places=8)
             self.assertAlmostEqual(float(features["fund_main_net_ratio_5"]), 2.0, places=8)
             self.assertAlmostEqual(float(features["fund_main_net_ratio_20"]), 2.0, places=8)
+            self.assertEqual(float(features["fund_flow_available"]), 1.0)
             self.assertAlmostEqual(float(features["sector_ret_5"]), 3.0, places=8)
             self.assertAlmostEqual(float(features["sector_ret_20"]), 3.0, places=8)
             self.assertAlmostEqual(float(features["sector_momentum_5_20"]), 0.0, places=8)
+            self.assertEqual(float(features["sector_available"]), 1.0)
 
 
 if __name__ == "__main__":

@@ -137,6 +137,9 @@ HISTORY_MIN_EXISTING_DAYS=200 ./run_weekly.sh
 ### 关于 ML 预测
 
 - ML 是**可选第二层**，只用于对规则选出的 Top 股票做概率重排，**不替代规则分数**。
+- 训练和预测都严格截断到选股日；横截面排名使用同一批已下载股票计算，避免历史回放读取未来行情。
+- 规则分会先转换为入选股内百分位，再按 `rule_score_weight` 与 ML 概率混合。
+- 回测的 Top-K 指标按每个交易周分别取 Top-K 后汇总，不再跨整个测试期只取一次。
 - 默认 ML 关闭，如需开启，修改 `config/weekly_strategy.yaml`：
 
 ```yaml
@@ -356,7 +359,8 @@ BaoStock：
 - `weekly_screen_candidates` —— 候选股票打分明细
 - `weekly_selected_stocks` —— 最终入选股票
 - `weekly_review_runs` / `weekly_review_results` —— 复盘运行和结果
-- `weekly_ml_model_runs` / `weekly_ml_training_samples` / `weekly_ml_predictions` —— ML 训练与预测
+- `weekly_ml_model_runs` / `weekly_ml_training_samples` / `weekly_ml_predictions` —— ML 模型、训练样本和当前预测
+- `weekly_ml_prediction_history` —— 每次模型运行的追加式预测快照
 
 ---
 
