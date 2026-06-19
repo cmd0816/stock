@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 
 from weekly_stock.config import DEFAULT_CONFIG
-from weekly_stock.db import connect, ensure_weekly_tables
+from weekly_stock.db import connect, ensure_weekly_tables, review_feedback_labels
 from weekly_stock.jobs import (
     apply_review_feedback_labels,
+    download_review_history_for_selected_stocks,
     ml_backtest_job,
     ml_predict_job,
     review_selected_stock,
@@ -334,6 +335,138 @@ class WeeklyStockTests(unittest.TestCase):
         self.assertEqual(len(weights), len(merged))
         self.assertEqual(weights, [3.0, 1.0])
 
+    def test_review_history_download_uses_all_selected_stocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "stocks.db"
+            with connect(db_path) as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                run_id = conn.execute(
+                    """
+                    INSERT INTO weekly_screen_runs (
+                        screen_date, xuangu_batch_id, strategy_config_json, screening_text,
+                        candidate_count, selected_count, created_at_utc
+                    ) VALUES ('2026-05-01', 'b1', '{}', '', 6, 6, 'now')
+                    """
+                ).lastrowid
+                for idx in range(1, 7):
+                    conn.execute(
+                        """
+                        INSERT INTO weekly_selected_stocks (
+                            run_id, screen_date, code, name, rank_no, total_score, selected_reason, created_at_utc
+                        ) VALUES (?, '2026-05-01', ?, ?, ?, 80, 'test', 'now')
+                        """,
+                        (run_id, f"00000{idx}", f"测试{idx}", idx),
+                    )
+                conn.commit()
+                selected_rows = conn.execute(
+                    "SELECT * FROM weekly_selected_stocks WHERE run_id=? ORDER BY rank_no",
+                    (run_id,),
+                ).fetchall()
+
+            import download_top_history_akshare as downloader
+
+            called_codes = []
+            original_fetch = downloader.fetch_kline_with_akshare
+            original_save = downloader.save_akshare_kline_rows
+
+            class FakeFrame:
+                def to_dict(self, orient: str) -> list[dict]:
+                    if orient != "records":
+                        raise AssertionError(orient)
+                    return [{"date": "2026-05-08", "open": 10, "close": 11, "high": 11, "low": 10}]
+
+            def fake_fetch(symbol: str, start: str, end: str, adjust: str, source: str = "auto"):
+                called_codes.append(symbol)
+                return FakeFrame(), "fake"
+
+            def fake_save(db_path_arg: Path, market: int, code: str, name: str, rows: list[dict], source_name: str = "fake") -> int:
+                return len(rows)
+
+            try:
+                downloader.fetch_kline_with_akshare = fake_fetch
+                downloader.save_akshare_kline_rows = fake_save
+                stats = download_review_history_for_selected_stocks(
+                    db_path,
+                    selected_rows,
+                    "2026-05-08",
+                    {
+                        **DEFAULT_CONFIG,
+                        "review": {
+                            **DEFAULT_CONFIG["review"],
+                            "download_min_existing_days": 200,
+                        },
+                    },
+                )
+            finally:
+                downloader.fetch_kline_with_akshare = original_fetch
+                downloader.save_akshare_kline_rows = original_save
+
+            self.assertEqual(stats["total"], 6)
+            self.assertEqual(stats["updated"], 6)
+            self.assertEqual(called_codes, [f"00000{idx}" for idx in range(1, 7)])
+
+    def test_review_feedback_labels_skip_incomplete_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stocks.db"
+            with connect(db_path) as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                run_id = conn.execute(
+                    """
+                    INSERT INTO weekly_screen_runs (
+                        screen_date, xuangu_batch_id, strategy_config_json, screening_text,
+                        candidate_count, selected_count, created_at_utc
+                    ) VALUES ('2026-05-01', 'b1', '{}', '', 2, 2, 'now')
+                    """
+                ).lastrowid
+                selected_ids = []
+                for idx, code in enumerate(("000001", "000002"), start=1):
+                    selected_ids.append(
+                        conn.execute(
+                            """
+                            INSERT INTO weekly_selected_stocks (
+                                run_id, screen_date, code, name, rank_no, total_score, selected_reason, created_at_utc
+                            ) VALUES (?, '2026-05-01', ?, '测试', ?, 80, 'test', 'now')
+                            """,
+                            (run_id, code, idx),
+                        ).lastrowid
+                    )
+                review_id = conn.execute(
+                    """
+                    INSERT INTO weekly_review_runs (reviewed_run_id, review_date, config_json, created_at_utc)
+                    VALUES (?, '2026-05-08', '{}', 'now')
+                    """,
+                    (run_id,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO weekly_review_results (
+                        review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
+                        highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered,
+                        meets_expectation, best_exit_meets_expectation, notes, created_at_utc
+                    ) VALUES (?, ?, '000001', '完整', '2026-05-01', '2026-05-04', '2026-05-08',
+                        6, 3, -2, 0, 1, 1, 'ok', 'now')
+                    """,
+                    (review_id, selected_ids[0]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO weekly_review_results (
+                        review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
+                        highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered,
+                        meets_expectation, best_exit_meets_expectation, notes, created_at_utc
+                    ) VALUES (?, ?, '000002', '缺K', '2026-05-01', NULL, NULL,
+                        NULL, NULL, NULL, 0, 0, 0, 'K线不足', 'now')
+                    """,
+                    (review_id, selected_ids[1]),
+                )
+                conn.commit()
+                labels = review_feedback_labels(conn)
+
+            self.assertEqual(labels, {("000001", "2026-05-01"): 1})
+
     def test_ml_predict_job_can_apply_review_feedback_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -571,6 +704,29 @@ class WeeklyStockTests(unittest.TestCase):
         label, _high_gain, close_gain, _max_drawdown = result or (0, 0, 0, 0)
         self.assertEqual(label, 0)
         self.assertAlmostEqual(close_gain, -5.0, places=4)
+
+    def test_label_future_any_target_logic_matches_review_goal(self) -> None:
+        klines = [Kline("2026-05-01", 10.0, 10.0, 10.0, 10.0, 1000, 5, 0)]
+        klines.append(Kline("2026-05-02", 10.0, 10.1, 10.6, 9.7, 1000, 5, 0))
+
+        result = label_future(
+            klines,
+            end_idx=0,
+            horizon=1,
+            cfg={
+                "use_trade_exit_rules": False,
+                "positive_high_gain_pct": 0.05,
+                "positive_close_gain_pct": 0.02,
+                "positive_target_logic": "any",
+                "negative_drawdown_pct": 0.06,
+            },
+        )
+        self.assertIsNotNone(result)
+        label, high_gain, close_gain, max_drawdown = result or (0, 0, 0, 0)
+        self.assertEqual(label, 1)
+        self.assertAlmostEqual(high_gain, 6.0, places=4)
+        self.assertAlmostEqual(close_gain, 1.0, places=4)
+        self.assertAlmostEqual(max_drawdown, -3.0, places=4)
 
 
 if __name__ == "__main__":

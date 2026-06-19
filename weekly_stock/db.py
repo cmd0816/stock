@@ -606,6 +606,11 @@ def review_feedback_labels(conn: sqlite3.Connection, recent_runs: int = 0) -> Di
               ON lr.review_id = rr.review_id
             WHERE rr.base_trade_date IS NOT NULL
               AND rr.base_trade_date <> ''
+              AND rr.review_start_date IS NOT NULL
+              AND rr.review_end_date IS NOT NULL
+              AND rr.highest_gain_pct IS NOT NULL
+              AND rr.close_gain_pct IS NOT NULL
+              AND rr.max_drawdown_pct IS NOT NULL
             """,
             (int(recent_runs),),
         ).fetchall()
@@ -623,6 +628,11 @@ def review_feedback_labels(conn: sqlite3.Connection, recent_runs: int = 0) -> Di
               ON lr.review_id = rr.review_id
             WHERE rr.base_trade_date IS NOT NULL
               AND rr.base_trade_date <> ''
+              AND rr.review_start_date IS NOT NULL
+              AND rr.review_end_date IS NOT NULL
+              AND rr.highest_gain_pct IS NOT NULL
+              AND rr.close_gain_pct IS NOT NULL
+              AND rr.max_drawdown_pct IS NOT NULL
             """
         ).fetchall()
     return {

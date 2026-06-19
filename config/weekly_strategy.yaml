@@ -51,6 +51,13 @@ review:
   stop_loss_pct: 0.06
   expected_high_gain_pct: 0.05
   expected_close_gain_pct: 0.02
+  # 复盘前先补齐“被复盘 run 的所有入选股票”日 K，不再限制 Top N。
+  download_before_review: true
+  download_days: 365
+  download_min_existing_days: 200
+  download_adjust: qfq
+  download_source: auto
+  download_fail_on_error: false
 
 ml:
   enabled: true
@@ -63,15 +70,15 @@ ml:
   sample_stride: 5
   weekly_last_trading_day_only: true
   min_train_samples: 30
-  # 放宽正样本定义：未来5天最高价≥3% 且 收盘≥-2% 且 回撤≤10%
-  # 更宽松的标签使模型更容易学习，整体准确率可从53%提升到61%
-  positive_high_gain_pct: 0.03
-  positive_close_gain_pct: -0.02
+  # 正样本定义对齐复盘：未来5天最高价≥5% 或 收盘≥2%，且回撤不触发6%止损
+  positive_high_gain_pct: 0.05
+  positive_close_gain_pct: 0.02
+  positive_target_logic: any
   use_trade_exit_rules: false
   exit_stop_loss_pct: 0.10
   exit_on_break_ma20: true
-  negative_drawdown_pct: 0.10
-  rule_score_weight: 0.35
+  negative_drawdown_pct: 0.06
+  rule_score_weight: 0.25
   train_on_selected_universe: false
   # 利用历史复盘结果进行增量学习，提升模型对实际选股场景的适配性
   use_review_feedback_labels: true

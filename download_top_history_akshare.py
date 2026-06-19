@@ -65,6 +65,8 @@ def extract_turnover_rate(item: dict[str, Any], source_name: str) -> float | Non
     turnover = to_float(item.get("turnover"))
     if turnover is None:
         return None
+    if source_name == "stock_zh_a_daily":
+        return turnover
     return turnover * 100
 
 
@@ -180,10 +182,11 @@ def save_akshare_kline_rows(db_path: Path, market: int, code: str, name: str, ro
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download/update Top N daily K-line with AKShare stock_zh_a_hist.")
+    parser = argparse.ArgumentParser(description="Download/update selected stocks daily K-line with AKShare stock_zh_a_hist.")
     parser.add_argument("--db", default="stocks.db", help="SQLite DB path")
     parser.add_argument("--run-id", type=int, required=True, help="weekly_screen_runs.run_id")
     parser.add_argument("--top-n", type=int, default=10, help="How many ranked stocks to update (default: 10)")
+    parser.add_argument("--all-selected", action="store_true", help="Update every selected stock for the run; ignores --top-n")
     parser.add_argument("--target-date", default="", help="Target end date YYYY-MM-DD. Default: today")
     parser.add_argument("--days", type=int, default=365, help="Lookback days (default: 365)")
     parser.add_argument("--adjust", default="qfq", choices=["", "qfq", "hfq"], help="Adjust mode")
@@ -191,7 +194,7 @@ def main() -> None:
     args = parser.parse_args()
 
     db_path = Path(args.db).expanduser().resolve()
-    top_n = max(1, int(args.top_n))
+    top_n = 0 if args.all_selected else max(1, int(args.top_n))
     lookback_days = max(30, int(args.days))
     if args.target_date:
         end_dt = datetime.strptime(args.target_date, "%Y-%m-%d")
@@ -202,16 +205,27 @@ def main() -> None:
     end_yyyymmdd = end_dt.strftime("%Y%m%d")
 
     with db.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT code, name, rank_no
-            FROM weekly_selected_stocks
-            WHERE run_id = ?
-            ORDER BY rank_no
-            LIMIT ?
-            """,
-            (int(args.run_id), top_n),
-        ).fetchall()
+        if top_n > 0:
+            rows = conn.execute(
+                """
+                SELECT code, name, rank_no
+                FROM weekly_selected_stocks
+                WHERE run_id = ?
+                ORDER BY rank_no
+                LIMIT ?
+                """,
+                (int(args.run_id), top_n),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT code, name, rank_no
+                FROM weekly_selected_stocks
+                WHERE run_id = ?
+                ORDER BY rank_no
+                """,
+                (int(args.run_id),),
+            ).fetchall()
 
     if not rows:
         raise SystemExit(f"No selected stocks found for run_id={args.run_id}")

@@ -32,7 +32,7 @@
 
 1. 读取数据库中**最近一次条件选股批次**。
 2. 把日期**对齐到中国 A 股最近交易日**（如遇节假日自动回退）。
-3. 若检测到“新批次切换”，自动复盘上一次已选股票。
+3. 若检测到“新批次切换”，先补齐上一次已选的**全部股票**日 K，再自动复盘并沉淀为 ML 反馈标签。
 4. 使用最新批次执行规则打分，生成当日 `run_id`。
 5. 基于该最新 `run_id` 做 ML 训练和预测。
 
@@ -76,7 +76,7 @@ SMTP_USE_SSL=1 \
 | 2 | **条件选股** | 打开东方财富条件选股页面，按 `screening.txt` 条件下载 Excel 并入库 |
 | 3 | **批次日线刷新** | 对本次批次股票补齐日 K（`baostock` 优先，失败回退 `akshare`），并更新资金流/板块上下文 |
 | 4 | **规则打分** | 对候选池股票打分，选出 Top 3~4 只 |
-| 5 | **补齐 Top K 线** | 下载/更新本周 Top 股票的一年日 K（用于复盘充分性） |
+| 5 | **补齐入选股 K 线** | 下载/更新本周全部入选股票的一年日 K（用于复盘充分性） |
 | 6 | **ML 回测** | 检查模型最近表现 |
 | 7 | **ML 训练+预测** | 训练模型，为 Top 股票生成 ML 预测概率 |
 
@@ -260,7 +260,7 @@ python3 weekly_stock_main.py screen --run-xuangu
 # 指定日期或批次
 python3 weekly_stock_main.py screen --date 2026-05-02 --xuangu-batch-id 20260502
 
-# 复盘上一期
+# 复盘上一期（会先补齐该 run 全部入选股票的日 K）
 python3 weekly_stock_main.py review
 
 # 复盘指定 run
@@ -289,6 +289,11 @@ AKShare：
 ```bash
 .venv/bin/python download_top_history_akshare.py \
   --db stocks.db --run-id 40 --top-n 50 \
+  --target-date 2026-05-23 --days 365 --adjust qfq
+
+# 下载指定 run 的全部入选股票
+.venv/bin/python download_top_history_akshare.py \
+  --db stocks.db --run-id 40 --all-selected \
   --target-date 2026-05-23 --days 365 --adjust qfq
 ```
 

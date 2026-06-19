@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -98,6 +98,90 @@ def attach_context_features_to_prediction_items(
         if not ctx:
             continue
         features.update(ctx)
+
+
+def download_review_history_for_selected_stocks(
+    db_path: Path,
+    selected_rows: List[Any],
+    target_date: str,
+    config: Dict[str, Any],
+) -> Dict[str, int]:
+    """Download K-line history for every stock selected in the reviewed run."""
+    if not selected_rows:
+        return {"total": 0, "updated": 0, "skipped": 0, "failed": 0}
+
+    from download_top_history_akshare import fetch_kline_with_akshare, infer_market, save_akshare_kline_rows
+
+    review_cfg = config.get("review", {})
+    days = max(30, int(review_cfg.get("download_days", 365)))
+    min_existing_days = max(0, int(review_cfg.get("download_min_existing_days", 200)))
+    adjust = str(review_cfg.get("download_adjust", "qfq"))
+    source = str(review_cfg.get("download_source", "auto"))
+    fail_on_error = bool(review_cfg.get("download_fail_on_error", False))
+
+    end_dt = datetime.strptime(target_date, "%Y-%m-%d") if target_date else datetime.now()
+    start_dt = end_dt - timedelta(days=days)
+    start_yyyymmdd = start_dt.strftime("%Y%m%d")
+    end_yyyymmdd = end_dt.strftime("%Y%m%d")
+
+    updated = 0
+    skipped = 0
+    failed = 0
+    errors: List[str] = []
+    total = len(selected_rows)
+    print(f"Review history download: run selected stocks={total}, target_date={target_date or end_dt.date().isoformat()}")
+
+    for row in selected_rows:
+        code = str(row["code"] or "").strip()
+        name = str(row["name"] or "")
+        rank_no = int(row["rank_no"] or 0)
+        if not code:
+            continue
+
+        conn = db.connect(db_path)
+        try:
+            existing = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt, MAX(trade_date) AS latest_trade_date
+                FROM eastmoney_stock_daily_klines
+                WHERE code = ?
+                """,
+                (code,),
+            ).fetchone()
+        finally:
+            conn.close()
+        existing_days = int(existing["cnt"] or 0) if existing else 0
+        latest_trade_date = str(existing["latest_trade_date"] or "") if existing else ""
+        if (
+            existing_days >= min_existing_days
+            and latest_trade_date
+            and (not target_date or latest_trade_date >= target_date)
+        ):
+            print(
+                f"Skip selected#{rank_no} {code} {name}: already {existing_days} rows, "
+                f"latest={latest_trade_date} >= {target_date}"
+            )
+            skipped += 1
+            continue
+
+        try:
+            df, source_name = fetch_kline_with_akshare(code, start_yyyymmdd, end_yyyymmdd, adjust, source)
+            records = df.to_dict(orient="records")
+            if not records:
+                raise RuntimeError("AKShare returned empty rows")
+            row_count = save_akshare_kline_rows(db_path, infer_market(code), code, name, records, source_name)
+            print(f"Updated selected#{rank_no} {code} {name}: saved {row_count} rows via AKShare ({source_name})")
+            updated += 1
+        except Exception as exc:
+            message = f"Failed selected#{rank_no} {code} {name}: {exc}"
+            print(message)
+            errors.append(message)
+            failed += 1
+
+    print(f"Review history download summary: total={total}, updated={updated}, skipped={skipped}, failed={failed}")
+    if fail_on_error and errors:
+        raise RuntimeError("Review history download failed: " + " | ".join(errors[:3]))
+    return {"total": total, "updated": updated, "skipped": skipped, "failed": failed}
 
 
 def run_xuangu_download(config_path: Path, config: Dict[str, Any]) -> None:
@@ -206,6 +290,15 @@ def weekly_review_job(
                 effective_review_date,
                 conn=conn,
                 prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
+            )
+
+        review_cfg = config.get("review", {})
+        if review_cfg.get("download_before_review", True):
+            download_review_history_for_selected_stocks(
+                db_path=db_path,
+                selected_rows=selected,
+                target_date=effective_review_date,
+                config=config,
             )
 
         if replace_existing:
