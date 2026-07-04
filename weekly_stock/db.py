@@ -10,6 +10,32 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .models import CandidateStock, Kline, ReviewResult, ScoredStock
 
 
+NON_STOCK_NAME_PATTERNS = ("指数", "上证", "中证", "沪深", "基金", "国债", "企债", "等权")
+
+
+def stock_kline_filter_sql(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    code_col = f"{prefix}code"
+    name_col = f"{prefix}name"
+    code_sql = " OR ".join(
+        f"{code_col} GLOB '{pattern}'"
+        for pattern in (
+            "00[0-9][0-9][0-9][0-9]",
+            "30[0-9][0-9][0-9][0-9]",
+            "60[0-9][0-9][0-9][0-9]",
+            "68[0-9][0-9][0-9][0-9]",
+            "4[0-9][0-9][0-9][0-9][0-9]",
+            "8[0-9][0-9][0-9][0-9][0-9]",
+            "9[0-9][0-9][0-9][0-9][0-9]",
+        )
+    )
+    name_sql = " ".join(
+        f"AND COALESCE({name_col}, '') NOT LIKE '%{pattern}%'"
+        for pattern in NON_STOCK_NAME_PATTERNS
+    )
+    return f"({code_sql}) {name_sql}"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -306,7 +332,9 @@ def load_klines(
         SELECT trade_date, open, close, high, low, volume, turnover_rate, change_percent
         FROM eastmoney_stock_daily_klines
         WHERE code = ?
+          AND {stock_filter}
     """
+    sql = sql.format(stock_filter=stock_kline_filter_sql())
     if as_of_date:
         sql += " AND trade_date <= ?"
         params.append(as_of_date)
@@ -688,9 +716,10 @@ def review_feedback_labels(
 
 def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute(
-        """
+        f"""
         SELECT DISTINCT code
         FROM eastmoney_stock_daily_klines
+        WHERE {stock_kline_filter_sql()}
         ORDER BY code
         """
     ).fetchall()
@@ -866,11 +895,12 @@ def load_ml_context_features(
     # all-A-share history, these features automatically become closer to true
     # market-wide breadth.
     market_rows = conn.execute(
-        """
+        f"""
         SELECT code, trade_date, close, high, change_percent
         FROM eastmoney_stock_daily_klines
         WHERE trade_date BETWEEN ? AND ?
           AND close IS NOT NULL
+          AND {stock_kline_filter_sql()}
         ORDER BY code, trade_date
         """,
         (query_start_date, max_date),
@@ -989,6 +1019,7 @@ def load_ml_context_features(
           ON m.code = k.code
         WHERE m.sector_name IN ({placeholder_sectors})
           AND k.trade_date BETWEEN ? AND ?
+          AND {stock_kline_filter_sql("k")}
         GROUP BY k.trade_date, m.sector_name
         ORDER BY m.sector_name, k.trade_date
         """,

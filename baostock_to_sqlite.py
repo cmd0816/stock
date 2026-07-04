@@ -12,6 +12,29 @@ from typing import Any
 from eastmoney_to_sqlite import init_db
 
 
+NON_STOCK_NAME_PATTERNS = ("指数", "上证", "中证", "沪深", "基金", "国债", "企债", "等权")
+
+
+def stock_kline_filter_sql() -> str:
+    code_sql = " OR ".join(
+        f"code GLOB '{pattern}'"
+        for pattern in (
+            "00[0-9][0-9][0-9][0-9]",
+            "30[0-9][0-9][0-9][0-9]",
+            "60[0-9][0-9][0-9][0-9]",
+            "68[0-9][0-9][0-9][0-9]",
+            "4[0-9][0-9][0-9][0-9][0-9]",
+            "8[0-9][0-9][0-9][0-9][0-9]",
+            "9[0-9][0-9][0-9][0-9][0-9]",
+        )
+    )
+    name_sql = " ".join(
+        f"AND COALESCE(name, '') NOT LIKE '%{pattern}%'"
+        for pattern in NON_STOCK_NAME_PATTERNS
+    )
+    return f"({code_sql}) {name_sql}"
+
+
 def to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -33,7 +56,12 @@ def to_float(value: Any) -> float | None:
 
 def infer_market(code: str) -> int:
     text = str(code or "").strip()
-    if text.startswith(("6", "9")):
+    if "." in text:
+        prefix, _, text = text.partition(".")
+        if prefix == "sh":
+            return 1
+        return 0
+    if text.startswith("6"):
         return 1
     return 0
 
@@ -42,9 +70,11 @@ def to_baostock_code(code: str) -> str:
     text = str(code or "").strip()
     if not text:
         raise ValueError("empty stock code")
-    if text.startswith(("6", "9")):
+    if "." in text:
+        return text
+    if text.startswith("6"):
         return f"sh.{text}"
-    if text.startswith(("8", "4")):
+    if text.startswith(("8", "4", "9")):
         return f"bj.{text}"
     return f"sz.{text}"
 
@@ -88,7 +118,15 @@ def fetch_all_a_share_stocks(bs: Any, trade_date: str) -> list[tuple[str, str]]:
         code = raw_code.split(".", 1)[1] if "." in raw_code else raw_code
         if not code or code in seen:
             continue
-        if not code.startswith(("0", "3", "6", "8", "4", "9")):
+        if raw_code.startswith("sh."):
+            is_a_share = code.startswith(("60", "68"))
+        elif raw_code.startswith("sz."):
+            is_a_share = code.startswith(("00", "30"))
+        elif raw_code.startswith("bj."):
+            is_a_share = code.startswith(("4", "8", "9"))
+        else:
+            is_a_share = code.startswith(("60", "68", "00", "30", "4", "8", "9"))
+        if not is_a_share:
             continue
         trade_status = str(row.get("tradeStatus") or "").strip()
         if trade_status and trade_status not in {"1", "交易"}:
@@ -111,6 +149,7 @@ def filter_codes_with_null_turnover(
         FROM eastmoney_stock_daily_klines
         WHERE code IN ({placeholders})
           AND trade_date BETWEEN ? AND ?
+          AND {stock_kline_filter_sql()}
           AND turnover_rate IS NULL
         """,
         [*codes, start_date, end_date],
@@ -329,6 +368,7 @@ def filter_targets_with_existing_history(
         FROM eastmoney_stock_daily_klines
         WHERE code IN ({placeholders})
           AND trade_date BETWEEN ? AND ?
+          AND {stock_kline_filter_sql()}
         GROUP BY code
         """,
         [*codes, start_date, end_date],

@@ -8,6 +8,36 @@ from weekly_stock import db
 
 
 class MlContextFeatureTests(unittest.TestCase):
+    def test_stock_kline_filters_ignore_index_rows_for_training_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stocks.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                init_db(conn)
+                rows = [
+                    ("src", 0, "000001", "0.000001", "上证综合指数", "2026-05-01", 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, "{}", "now"),
+                    ("src", 0, "000001", "0.000001", "上证综合指数", "2026-05-02", 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, "{}", "now"),
+                    ("src", 0, "000002", "0.000002", "A", "2026-05-01", 2, 2, 2, 2, 1, 1, 0, 1, 0, 1, "{}", "now"),
+                    ("src", 0, "000003", "0.000003", "中证测试指数", "2026-05-01", 3, 3, 3, 3, 1, 1, 0, 1, 0, 1, "{}", "now"),
+                    ("src", 0, "000003", "0.000003", "B", "2026-05-02", 4, 4, 4, 4, 1, 1, 0, 1, 0, 1, "{}", "now"),
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO eastmoney_stock_daily_klines (
+                        source_url, market, code, secid, name, trade_date,
+                        open, close, high, low, volume, turnover,
+                        amplitude_percent, change_percent, change_amount, turnover_rate,
+                        raw_line, fetched_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+
+                self.assertEqual(db.all_downloaded_codes(conn), ["000002", "000003"])
+                self.assertEqual(db.load_klines(conn, "000001"), [])
+                self.assertEqual([k.trade_date for k in db.load_klines(conn, "000003")], ["2026-05-02"])
+
     def test_load_ml_context_features_rolls_fund_and_sector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "stocks.db"
@@ -84,6 +114,10 @@ class MlContextFeatureTests(unittest.TestCase):
                         ("000001", "A", 100 + day, 1.0),
                         ("000002", "B", 200 + day * 2, 3.0),
                         ("000003", "C", 100 - day, -1.0),
+                        # BaoStock query_all_stock can include index rows whose
+                        # 6-digit code collides with real stocks. They should
+                        # not affect market breadth / relative strength.
+                        ("000004", "上证工业类指数", 9999 + day, 99.0),
                     ]
                     for code, name, close, change_pct in specs:
                         rows.append(

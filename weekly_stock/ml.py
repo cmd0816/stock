@@ -284,7 +284,7 @@ def pct(a: Optional[float], b: Optional[float]) -> float:
 
 def safe_mean(values: Iterable[Optional[float]]) -> float:
     clean = [float(v) for v in values if v is not None]
-    return mean(clean) if clean else 0.0
+    return sum(clean) / len(clean) if clean else 0.0
 
 
 def moving_average(klines: Sequence[Kline], end_idx: int, days: int) -> float:
