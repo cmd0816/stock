@@ -791,6 +791,15 @@ def _rolling_mean(values: List[float], end_idx: int, window: int) -> float:
     return sum(segment) / len(segment)
 
 
+def _safe_pct(a: Any, b: Any) -> float | None:
+    if a is None or b in (None, 0):
+        return None
+    try:
+        return (float(a) / float(b) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
 def load_ml_context_features(
     conn: sqlite3.Connection,
     code_dates: Iterable[Tuple[str, str]],
@@ -851,13 +860,110 @@ def load_ml_context_features(
     ).fetchall()
     sector_by_code = {str(row["code"]): str(row["sector_name"] or "") for row in sector_rows}
     sectors = sorted({sector for sector in sector_by_code.values() if sector})
+
+    # Market breadth and relative-strength features use every downloaded stock
+    # in the local K-line table. When the user expands this table with BaoStock
+    # all-A-share history, these features automatically become closer to true
+    # market-wide breadth.
+    market_rows = conn.execute(
+        """
+        SELECT code, trade_date, close, high, change_percent
+        FROM eastmoney_stock_daily_klines
+        WHERE trade_date BETWEEN ? AND ?
+          AND close IS NOT NULL
+        ORDER BY code, trade_date
+        """,
+        (query_start_date, max_date),
+    ).fetchall()
+    market_series_by_code: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for row in market_rows:
+        market_series_by_code[str(row["code"])].append(row)
+
+    stock_ret_by_code_date: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    market_daily: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+        "adv_flags": [],
+        "above_ma20": [],
+        "new_high_20": [],
+        "ret5": [],
+        "ret20": [],
+    })
+    sector_member_daily: Dict[Tuple[str, str], Dict[str, List[float]]] = defaultdict(lambda: {"ret5": [], "ret20": []})
+
+    for code, series in market_series_by_code.items():
+        closes = [float(row["close"]) for row in series]
+        highs = [float(row["high"]) if row["high"] is not None else float(row["close"]) for row in series]
+        sector = sector_by_code.get(code, "")
+        for idx, row in enumerate(series):
+            trade_date = str(row["trade_date"])
+            ret5 = _safe_pct(closes[idx], closes[idx - 5]) if idx >= 5 else None
+            ret20 = _safe_pct(closes[idx], closes[idx - 20]) if idx >= 20 else None
+            if ret5 is not None or ret20 is not None:
+                stock_ret_by_code_date[(code, trade_date)] = (ret5 or 0.0, ret20 or 0.0)
+
+            day = market_daily[trade_date]
+            change_percent = row["change_percent"]
+            if change_percent is not None:
+                day["adv_flags"].append(1.0 if float(change_percent) > 0 else 0.0)
+            if idx >= 19:
+                ma20 = sum(closes[idx - 19 : idx + 1]) / 20
+                high20 = max(highs[idx - 19 : idx + 1])
+                day["above_ma20"].append(1.0 if closes[idx] > ma20 else 0.0)
+                day["new_high_20"].append(1.0 if highs[idx] >= high20 else 0.0)
+            if ret5 is not None:
+                day["ret5"].append(ret5)
+                if sector:
+                    sector_member_daily[(sector, trade_date)]["ret5"].append(ret5)
+            if ret20 is not None:
+                day["ret20"].append(ret20)
+                if sector:
+                    sector_member_daily[(sector, trade_date)]["ret20"].append(ret20)
+
+    market_context_by_date: Dict[str, Dict[str, float]] = {}
+    sorted_market_dates = sorted(market_daily)
+    adv_ratios = [
+        (sum(market_daily[trade_date]["adv_flags"]) / len(market_daily[trade_date]["adv_flags"]))
+        if market_daily[trade_date]["adv_flags"]
+        else 0.0
+        for trade_date in sorted_market_dates
+    ]
+    for idx, trade_date in enumerate(sorted_market_dates):
+        day = market_daily[trade_date]
+        market_context_by_date[trade_date] = {
+            "market_breadth_adv_5": _rolling_mean(adv_ratios, idx, 5),
+            "market_breadth_above_ma20": (
+                sum(day["above_ma20"]) / len(day["above_ma20"]) if day["above_ma20"] else 0.0
+            ),
+            "market_breadth_new_high_20": (
+                sum(day["new_high_20"]) / len(day["new_high_20"]) if day["new_high_20"] else 0.0
+            ),
+            "market_universe_size": float(len(day["adv_flags"])),
+            "market_member_ret_5": sum(day["ret5"]) / len(day["ret5"]) if day["ret5"] else 0.0,
+            "market_member_ret_20": sum(day["ret20"]) / len(day["ret20"]) if day["ret20"] else 0.0,
+        }
+
+    sector_member_context: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    for key, values in sector_member_daily.items():
+        ret5s = values["ret5"]
+        ret20s = values["ret20"]
+        sector_member_context[key] = (
+            sum(ret5s) / len(ret5s) if ret5s else 0.0,
+            sum(ret20s) / len(ret20s) if ret20s else 0.0,
+        )
+
     if not sectors:
         # No sector map yet; return fund-flow-only features.
         out: Dict[Tuple[str, str], Dict[str, float]] = {}
         for code, trade_date in items:
             fund_ratio = fund_ratio_by_code_date.get((code, trade_date), 0.0)
             fund_5, fund_20 = fund_roll_by_code_date.get((code, trade_date), (0.0, 0.0))
+            stock_ret5, stock_ret20 = stock_ret_by_code_date.get((code, trade_date), (0.0, 0.0))
+            market_ctx = market_context_by_date.get(trade_date, {})
+            market_ret5 = market_ctx.get("market_member_ret_5", 0.0)
+            market_ret20 = market_ctx.get("market_member_ret_20", 0.0)
             out[(code, trade_date)] = {
+                **market_ctx,
+                "excess_ret_5_vs_market": stock_ret5 - market_ret5,
+                "excess_ret_20_vs_market": stock_ret20 - market_ret20,
                 "fund_main_net_ratio": fund_ratio,
                 "fund_main_net_ratio_5": fund_5,
                 "fund_main_net_ratio_20": fund_20,
@@ -866,6 +972,10 @@ def load_ml_context_features(
                 "sector_ret_5": 0.0,
                 "sector_ret_20": 0.0,
                 "sector_momentum_5_20": 0.0,
+                "sector_member_ret_5": 0.0,
+                "sector_member_ret_20": 0.0,
+                "excess_ret_5_vs_sector": 0.0,
+                "excess_ret_20_vs_sector": 0.0,
                 "sector_available": 0.0,
             }
         return out
@@ -903,7 +1013,15 @@ def load_ml_context_features(
         fund_5, fund_20 = fund_roll_by_code_date.get((code, trade_date), (0.0, 0.0))
         sector = sector_by_code.get(code, "")
         sec_5, sec_20 = sector_roll.get((sector, trade_date), (0.0, 0.0))
+        stock_ret5, stock_ret20 = stock_ret_by_code_date.get((code, trade_date), (0.0, 0.0))
+        market_ctx = market_context_by_date.get(trade_date, {})
+        market_ret5 = market_ctx.get("market_member_ret_5", 0.0)
+        market_ret20 = market_ctx.get("market_member_ret_20", 0.0)
+        sector_member_ret5, sector_member_ret20 = sector_member_context.get((sector, trade_date), (0.0, 0.0))
         out[(code, trade_date)] = {
+            **market_ctx,
+            "excess_ret_5_vs_market": stock_ret5 - market_ret5,
+            "excess_ret_20_vs_market": stock_ret20 - market_ret20,
             "fund_main_net_ratio": fund_ratio,
             "fund_main_net_ratio_5": fund_5,
             "fund_main_net_ratio_20": fund_20,
@@ -912,6 +1030,10 @@ def load_ml_context_features(
             "sector_ret_5": sec_5,
             "sector_ret_20": sec_20,
             "sector_momentum_5_20": sec_5 - sec_20,
+            "sector_member_ret_5": sector_member_ret5,
+            "sector_member_ret_20": sector_member_ret20,
+            "excess_ret_5_vs_sector": stock_ret5 - sector_member_ret5,
+            "excess_ret_20_vs_sector": stock_ret20 - sector_member_ret20,
             "sector_available": 1.0 if (sector, trade_date) in sector_roll else 0.0,
         }
     return out

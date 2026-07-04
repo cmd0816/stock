@@ -3,10 +3,69 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from baostock_to_sqlite import convert_baostock_row, save_baostock_kline_rows
+from eastmoney_to_sqlite import init_db
+from baostock_to_sqlite import (
+    apply_offset_and_limit,
+    convert_baostock_row,
+    filter_targets_with_existing_history,
+    save_baostock_kline_rows,
+)
 
 
 class BaoStockToSqliteTests(unittest.TestCase):
+    def test_apply_offset_and_limit(self) -> None:
+        targets = [
+            ("000003", "C"),
+            ("000001", "A"),
+            ("000004", "D"),
+            ("000002", "B"),
+        ]
+        self.assertEqual(
+            apply_offset_and_limit(targets, offset=2, limit=1),
+            [("000003", "C")],
+        )
+        self.assertEqual(
+            apply_offset_and_limit(targets, offset=2, limit=0),
+            [("000003", "C"), ("000004", "D")],
+        )
+        self.assertEqual(apply_offset_and_limit(targets, offset=99, limit=0), [])
+
+    def test_filter_targets_with_existing_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stocks.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                init_db(conn)
+                for code, dates in {
+                    "000001": ["2026-07-01", "2026-07-02", "2026-07-03"],
+                    "000002": ["2026-07-01", "2026-07-02"],
+                    "000003": ["2026-07-01", "2026-07-02", "2026-07-03"],
+                }.items():
+                    for trade_date in dates:
+                        conn.execute(
+                            """
+                            INSERT INTO eastmoney_stock_daily_klines (
+                                source_url, market, code, secid, name, trade_date,
+                                open, close, high, low, volume, turnover,
+                                amplitude_percent, change_percent, change_amount, turnover_rate,
+                                raw_line, fetched_at_utc
+                            ) VALUES ('unit', 0, ?, ?, 'T', ?, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, '{}', 'now')
+                            """,
+                            (code, f"0.{code}", trade_date),
+                        )
+                conn.commit()
+
+                remaining, skipped = filter_targets_with_existing_history(
+                    conn,
+                    [("000001", "A"), ("000002", "B"), ("000003", "C")],
+                    "2026-07-01",
+                    "2026-07-03",
+                    3,
+                )
+
+        self.assertEqual(skipped, 2)
+        self.assertEqual(remaining, [("000002", "B")])
+
     def test_convert_row_maps_turn_to_turnover_rate(self) -> None:
         row = {
             "date": "2026-05-22",

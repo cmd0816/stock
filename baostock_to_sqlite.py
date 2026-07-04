@@ -76,6 +76,29 @@ def load_batch_stocks(conn: sqlite3.Connection, batch_id: str) -> list[tuple[str
     return [(str(row[0]), str(row[1] or "")) for row in rows]
 
 
+def fetch_all_a_share_stocks(bs: Any, trade_date: str) -> list[tuple[str, str]]:
+    rs = bs.query_all_stock(day=trade_date)
+    if str(getattr(rs, "error_code", "")) != "0":
+        raise RuntimeError(f"query_all_stock failed: {rs.error_code} {getattr(rs, 'error_msg', '')}")
+    targets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    while rs.next():
+        row = dict(zip(rs.fields, rs.get_row_data()))
+        raw_code = str(row.get("code") or "").strip()
+        code = raw_code.split(".", 1)[1] if "." in raw_code else raw_code
+        if not code or code in seen:
+            continue
+        if not code.startswith(("0", "3", "6", "8", "4", "9")):
+            continue
+        trade_status = str(row.get("tradeStatus") or "").strip()
+        if trade_status and trade_status not in {"1", "交易"}:
+            continue
+        seen.add(code)
+        name = str(row.get("code_name") or row.get("name") or "").strip()
+        targets.append((code, name))
+    return sorted(targets, key=lambda item: item[0])
+
+
 def filter_codes_with_null_turnover(
     conn: sqlite3.Connection, codes: list[str], start_date: str, end_date: str
 ) -> set[str]:
@@ -277,17 +300,73 @@ def parse_codes(raw_codes: list[str]) -> list[str]:
     return out
 
 
+def apply_offset_and_limit(targets: list[tuple[str, str]], offset: int = 0, limit: int = 0) -> list[tuple[str, str]]:
+    targets = sorted(targets, key=lambda item: item[0])
+    start = max(0, int(offset))
+    if start:
+        targets = targets[start:]
+    if int(limit) > 0:
+        targets = targets[: int(limit)]
+    return targets
+
+
+def filter_targets_with_existing_history(
+    conn: sqlite3.Connection,
+    targets: list[tuple[str, str]],
+    start_date: str,
+    end_date: str,
+    min_existing_days: int,
+) -> tuple[list[tuple[str, str]], int]:
+    threshold = max(0, int(min_existing_days))
+    if threshold <= 0 or not targets:
+        return targets, 0
+
+    codes = [code for code, _name in targets]
+    placeholders = ",".join("?" for _ in codes)
+    rows = conn.execute(
+        f"""
+        SELECT code, COUNT(*) AS day_count, MAX(trade_date) AS latest_trade_date
+        FROM eastmoney_stock_daily_klines
+        WHERE code IN ({placeholders})
+          AND trade_date BETWEEN ? AND ?
+        GROUP BY code
+        """,
+        [*codes, start_date, end_date],
+    ).fetchall()
+    covered = {
+        str(row["code"] if isinstance(row, sqlite3.Row) else row[0])
+        for row in rows
+        if int((row["day_count"] if isinstance(row, sqlite3.Row) else row[1]) or 0) >= threshold
+        and str((row["latest_trade_date"] if isinstance(row, sqlite3.Row) else row[2]) or "") >= end_date
+    }
+    if not covered:
+        return targets, 0
+    return [(code, name) for code, name in targets if code not in covered], len(covered)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import A-share daily K-line data from BaoStock to SQLite.")
     parser.add_argument("--db", default="stocks.db", help="SQLite DB path")
     parser.add_argument("--batch-id", default="", help="xuangu batch id; default: latest batch")
     parser.add_argument("--codes", nargs="*", default=[], help="Stock codes, e.g. 600000 000001")
+    parser.add_argument(
+        "--all-a-shares",
+        action="store_true",
+        help="Download all currently listed A-share stocks from BaoStock query_all_stock for the end date.",
+    )
     parser.add_argument("--start-date", default="", help="Start date YYYY-MM-DD; default: end_date - days")
     parser.add_argument("--end-date", default="", help="End date YYYY-MM-DD; default: today")
     parser.add_argument("--days", type=int, default=365, help="Lookback days when start-date is empty")
     parser.add_argument("--adjust", choices=["qfq", "hfq", "none"], default="qfq", help="Adjustment mode")
+    parser.add_argument("--offset", type=int, default=0, help="Skip the first N target stocks before downloading")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of stocks (0 means no limit)")
     parser.add_argument("--delay", type=float, default=0.2, help="Delay seconds between stocks")
+    parser.add_argument(
+        "--skip-existing-days",
+        type=int,
+        default=0,
+        help="Skip stocks that already have at least N K-line rows in the date range and latest row >= end-date.",
+    )
     parser.add_argument(
         "--only-null-turnover",
         action="store_true",
@@ -332,6 +411,8 @@ def main() -> None:
                 ).fetchall()
             }
             targets = [(code, name_by_code.get(code, "")) for code in explicit_codes]
+        elif args.all_a_shares:
+            targets = []
         else:
             batch_id = choose_batch_id(conn, args.batch_id)
             targets = load_batch_stocks(conn, batch_id)
@@ -339,17 +420,29 @@ def main() -> None:
                 raise SystemExit(f"No stocks found in batch {batch_id}")
             print(f"Using xuangu batch: {batch_id} ({len(targets)} stocks)")
 
-        if args.only_null_turnover:
+        if args.only_null_turnover and targets:
             allow_codes = filter_codes_with_null_turnover(
                 conn, [code for code, _ in targets], start_text, end_text
             )
             targets = [(code, name) for code, name in targets if code in allow_codes]
             print(f"Filtered by NULL turnover_rate: {len(targets)} stocks in {start_text}..{end_text}")
+        if targets and int(args.skip_existing_days) > 0:
+            targets, skipped_existing = filter_targets_with_existing_history(
+                conn,
+                targets,
+                start_text,
+                end_text,
+                int(args.skip_existing_days),
+            )
+            print(
+                f"Filtered by existing history: skipped={skipped_existing}, remaining={len(targets)} "
+                f"(min_days={int(args.skip_existing_days)}, range={start_text}..{end_text})"
+            )
 
-    if args.limit > 0:
-        targets = targets[: int(args.limit)]
+    if targets:
+        targets = apply_offset_and_limit(targets, offset=args.offset, limit=args.limit)
 
-    if not targets:
+    if not targets and not args.all_a_shares:
         print("No target stocks to update.")
         return
 
@@ -361,6 +454,37 @@ def main() -> None:
     lg = bs.login()
     if str(getattr(lg, "error_code", "")) != "0":
         raise RuntimeError(f"BaoStock login failed: error_code={lg.error_code}, error_msg={lg.error_msg}")
+
+    if args.all_a_shares:
+        targets = fetch_all_a_share_stocks(bs, end_text)
+        print(f"Using BaoStock all-A-share universe for {end_text}: {len(targets)} stocks")
+        if args.only_null_turnover:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                allow_codes = filter_codes_with_null_turnover(
+                    conn, [code for code, _ in targets], start_text, end_text
+                )
+            targets = [(code, name) for code, name in targets if code in allow_codes]
+            print(f"Filtered by NULL turnover_rate: {len(targets)} stocks in {start_text}..{end_text}")
+        if int(args.skip_existing_days) > 0:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                targets, skipped_existing = filter_targets_with_existing_history(
+                    conn,
+                    targets,
+                    start_text,
+                    end_text,
+                    int(args.skip_existing_days),
+                )
+            print(
+                f"Filtered by existing history: skipped={skipped_existing}, remaining={len(targets)} "
+                f"(min_days={int(args.skip_existing_days)}, range={start_text}..{end_text})"
+            )
+        targets = apply_offset_and_limit(targets, offset=args.offset, limit=args.limit)
+        if not targets:
+            print("No target stocks to update.")
+            bs.logout()
+            return
 
     updated = 0
     failed = 0

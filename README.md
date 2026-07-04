@@ -308,6 +308,21 @@ BaoStock：
   --start-date 2026-05-11 --end-date 2026-05-22 --adjust qfq
 ```
 
+为市场宽度特征扩大样本池，可用 BaoStock 下载当前全 A 股日 K。首次建议限制数量试跑，确认稳定后去掉 `--limit`：
+
+```bash
+.venv/bin/python baostock_to_sqlite.py \
+  --db stocks.db --all-a-shares \
+  --start-date 2025-07-01 --end-date 2026-07-03 \
+  --adjust qfq --limit 100
+
+# 确认无误后下载完整样本池
+.venv/bin/python baostock_to_sqlite.py \
+  --db stocks.db --all-a-shares \
+  --start-date 2025-07-01 --end-date 2026-07-03 \
+  --adjust qfq
+```
+
 只补缺失换手率：
 
 ```bash
