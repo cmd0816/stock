@@ -188,6 +188,66 @@ def run_xuangu_download(config_path: Path, config: Dict[str, Any]) -> None:
     subprocess.run(cmd, check=True)
 
 
+def build_screen_selection(
+    config_path: Path,
+    config: Dict[str, Any],
+    screen_date: Optional[str] = None,
+    xuangu_batch_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    root = project_root(config_path)
+    db_path = root / config["database"]["path"]
+
+    with db.connect(db_path) as conn:
+        if xuangu_batch_id is None:
+            xuangu_batch_id = db.latest_xuangu_batch_id(conn)
+        candidates = db.load_xuangu_candidates(conn, xuangu_batch_id)
+        if not candidates:
+            raise RuntimeError("No xuangu candidates found. Run xuangu download first.")
+        effective_screen_date = screen_date or date.today().isoformat()
+        calendar_cfg = config.get("calendar", {})
+        if calendar_cfg.get("align_to_china_trading_day", True):
+            effective_screen_date = align_to_last_trading_day(
+                effective_screen_date,
+                conn=conn,
+                prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
+            )
+        klines_by_code = {
+            c.code: db.load_klines(conn, c.code, as_of_date=effective_screen_date)
+            for c in candidates
+        }
+        ranked = rank_candidates(candidates, klines_by_code, config)
+        top_n = int(config["screening"]["top_n"])
+        min_score = float(config["screening"].get("min_score", 0))
+        selected = [item for item in ranked if item.score.total >= min_score][:top_n]
+        if len(selected) < min(top_n, 3):
+            selected = ranked[:top_n]
+
+        return {
+            "screen_date": effective_screen_date,
+            "xuangu_batch_id": xuangu_batch_id,
+            "candidate_count": len(candidates),
+            "selected_count": len(selected),
+            "ranked": ranked,
+            "selected": selected,
+        }
+
+
+def stock_screen_preview_job(
+    config_path: Path,
+    config: Dict[str, Any],
+    screen_date: Optional[str] = None,
+    xuangu_batch_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if config["screening"].get("run_xuangu"):
+        run_xuangu_download(config_path, config)
+    return build_screen_selection(
+        config_path=config_path,
+        config=config,
+        screen_date=screen_date,
+        xuangu_batch_id=xuangu_batch_id,
+    )
+
+
 def stock_screen_job(
     config_path: Path,
     config: Dict[str, Any],
@@ -203,44 +263,31 @@ def stock_screen_job(
     if config["screening"].get("run_xuangu"):
         run_xuangu_download(config_path, config)
 
+    result = build_screen_selection(
+        config_path=config_path,
+        config=config,
+        screen_date=screen_date,
+        xuangu_batch_id=xuangu_batch_id,
+    )
+    effective_screen_date = str(result["screen_date"])
+    effective_batch_id = result["xuangu_batch_id"]
+    ranked = result["ranked"]
+    selected = result["selected"]
+
     with db.connect(db_path) as conn:
         db.ensure_weekly_tables(conn)
-        if xuangu_batch_id is None:
-            xuangu_batch_id = db.latest_xuangu_batch_id(conn)
-        candidates = db.load_xuangu_candidates(conn, xuangu_batch_id)
-        if not candidates:
-            raise RuntimeError("No xuangu candidates found. Run xuangu download first.")
-        effective_screen_date = screen_date or date.today().isoformat()
-        calendar_cfg = config.get("calendar", {})
-        if calendar_cfg.get("align_to_china_trading_day", True):
-            effective_screen_date = align_to_last_trading_day(
-                effective_screen_date,
-                conn=conn,
-                prefer_akshare=bool(calendar_cfg.get("prefer_akshare", True)),
-            )
         if replace_existing:
-            deleted = db.delete_screen_runs(conn, effective_screen_date, xuangu_batch_id)
+            deleted = db.delete_screen_runs(conn, effective_screen_date, effective_batch_id)
             if deleted:
-                print(f"Deleted {deleted} existing weekly screen run(s) for {effective_screen_date}/{xuangu_batch_id}.")
-
-        klines_by_code = {
-            c.code: db.load_klines(conn, c.code, as_of_date=effective_screen_date)
-            for c in candidates
-        }
-        ranked = rank_candidates(candidates, klines_by_code, config)
-        top_n = int(config["screening"]["top_n"])
-        min_score = float(config["screening"].get("min_score", 0))
-        selected = [item for item in ranked if item.score.total >= min_score][:top_n]
-        if len(selected) < min(top_n, 3):
-            selected = ranked[:top_n]
+                print(f"Deleted {deleted} existing weekly screen run(s) for {effective_screen_date}/{effective_batch_id}.")
 
         run_id = db.create_screen_run(
             conn=conn,
             screen_date=effective_screen_date,
-            xuangu_batch_id=xuangu_batch_id,
+            xuangu_batch_id=effective_batch_id,
             config=config,
             screening_text=screening_text,
-            candidate_count=len(candidates),
+            candidate_count=int(result["candidate_count"]),
             selected_count=len(selected),
         )
         db.save_screen_results(conn, run_id, ranked, len(selected))

@@ -58,6 +58,8 @@ print(row[0] if row else "")
 PY
 )"
 BATCH_ID="${XUANGU_BATCH_ID:-$LATEST_BATCH_ID}"
+DAILY_PERSIST_TOP="${DAILY_PERSIST_TOP:-0}"
+DAILY_REVIEW_PREVIOUS="${DAILY_REVIEW_PREVIOUS:-0}"
 
 if [[ -z "$BATCH_ID" ]]; then
   echo "Error: no xuangu batch found in $DB_PATH"
@@ -65,11 +67,17 @@ if [[ -z "$BATCH_ID" ]]; then
   exit 1
 fi
 
-echo "Daily update: download K-line -> review previous (when new batch) -> screen latest batch -> ML predict"
+if [[ "$DAILY_PERSIST_TOP" == "1" ]]; then
+  echo "Daily update: download K-line -> optional review previous -> persist Top N -> ML predict"
+else
+  echo "Daily update: download K-line -> preview Top N without writing weekly Top tables"
+fi
 echo "Project: $SCRIPT_DIR"
 echo "Target date: $TARGET_DATE"
 echo "China trading aligned date: $ALIGNED_DATE"
 echo "Xuangu batch: $BATCH_ID"
+echo "Persist Top N: $DAILY_PERSIST_TOP"
+echo "Review previous: $DAILY_REVIEW_PREVIOUS"
 echo
 
 LOG_DIR="$SCRIPT_DIR/downloads/logs"
@@ -133,7 +141,7 @@ PY
 PREV_RUN_ID="${PREV_RUN_INFO%%|*}"
 PREV_RUN_BATCH="${PREV_RUN_INFO#*|}"
 
-if [[ -n "$PREV_RUN_ID" && "$PREV_RUN_BATCH" != "$BATCH_ID" ]]; then
+if [[ "$DAILY_REVIEW_PREVIOUS" == "1" && -n "$PREV_RUN_ID" && "$PREV_RUN_BATCH" != "$BATCH_ID" ]]; then
   {
     echo
     echo "Step 2/4: New xuangu batch detected, review previous selected run..."
@@ -168,30 +176,38 @@ PY
       RUN_STATUS=$REVIEW_STATUS
     fi
   fi
-else
+elif [[ "$DAILY_REVIEW_PREVIOUS" == "1" ]]; then
   {
     echo
     echo "Step 2/4: No new xuangu batch switch detected, skip previous-run review."
   } | tee -a "$RUN_LOG"
+else
+  {
+    echo
+    echo "Step 2/4: Previous-run review disabled for daily update."
+    echo "Set DAILY_REVIEW_PREVIOUS=1 to restore the old daily auto-review behavior."
+  } | tee -a "$RUN_LOG"
 fi
 
-{
-  echo
-  echo "Step 3/4: Screen latest xuangu batch..."
-} | tee -a "$RUN_LOG"
+RUN_ID=""
+if [[ "$DAILY_PERSIST_TOP" == "1" ]]; then
+  {
+    echo
+    echo "Step 3/4: Screen latest xuangu batch and persist Top N..."
+  } | tee -a "$RUN_LOG"
 
-set +e
-SCREEN_OUTPUT=$("$VENV_PY" -u "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" screen --date "$ALIGNED_DATE" --replace-existing --xuangu-batch-id "$BATCH_ID" 2>&1)
-SCREEN_STATUS=$?
-set -e
-echo "$SCREEN_OUTPUT" | tee -a "$RUN_LOG"
-if [[ "$SCREEN_STATUS" -ne 0 ]]; then
-  RUN_STATUS=$SCREEN_STATUS
-fi
+  set +e
+  SCREEN_OUTPUT=$("$VENV_PY" -u "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" screen --date "$ALIGNED_DATE" --replace-existing --xuangu-batch-id "$BATCH_ID" 2>&1)
+  SCREEN_STATUS=$?
+  set -e
+  echo "$SCREEN_OUTPUT" | tee -a "$RUN_LOG"
+  if [[ "$SCREEN_STATUS" -ne 0 ]]; then
+    RUN_STATUS=$SCREEN_STATUS
+  fi
 
-RUN_ID="$(printf '%s\n' "$SCREEN_OUTPUT" | sed -n 's/.*run_id=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
-if [[ -z "$RUN_ID" ]]; then
-  RUN_ID="$("$VENV_PY" - "$DB_PATH" "$ALIGNED_DATE" "$BATCH_ID" <<'PY'
+  RUN_ID="$(printf '%s\n' "$SCREEN_OUTPUT" | sed -n 's/.*run_id=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
+  if [[ -z "$RUN_ID" ]]; then
+    RUN_ID="$("$VENV_PY" - "$DB_PATH" "$ALIGNED_DATE" "$BATCH_ID" <<'PY'
 import sys
 from pathlib import Path
 from weekly_stock import db
@@ -212,10 +228,24 @@ with db.connect(db_path) as conn:
     ).fetchone()
 print(int(row["run_id"]) if row else "")
 PY
-)"
+    )"
+  fi
+else
+  {
+    echo
+    echo "Step 3/4: Preview latest xuangu batch Top N (no weekly Top DB write)..."
+  } | tee -a "$RUN_LOG"
+
+  set +e
+  "$VENV_PY" -u "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" preview --date "$ALIGNED_DATE" --xuangu-batch-id "$BATCH_ID" 2>&1 | tee -a "$RUN_LOG"
+  PREVIEW_STATUS=${PIPESTATUS[0]}
+  set -e
+  if [[ "$PREVIEW_STATUS" -ne 0 ]]; then
+    RUN_STATUS=$PREVIEW_STATUS
+  fi
 fi
 
-if [[ -n "$RUN_ID" ]]; then
+if [[ "$DAILY_PERSIST_TOP" == "1" && -n "$RUN_ID" ]]; then
   echo "Resolved latest run_id: $RUN_ID" | tee -a "$RUN_LOG"
   {
     echo
@@ -229,9 +259,14 @@ if [[ -n "$RUN_ID" ]]; then
   if [[ "$PREDICT_STATUS" -ne 0 ]]; then
     RUN_STATUS=$PREDICT_STATUS
   fi
-else
+elif [[ "$DAILY_PERSIST_TOP" == "1" ]]; then
   echo "Warning: failed to resolve run_id after screen; skip ML predict." | tee -a "$RUN_LOG"
   RUN_STATUS=1
+else
+  {
+    echo
+    echo "Step 4/4: Skip ML prediction persistence because DAILY_PERSIST_TOP=0."
+  } | tee -a "$RUN_LOG"
 fi
 
 if [[ -n "${DAILY_EMAIL_TO:-}" ]]; then
@@ -241,6 +276,7 @@ if [[ -n "${DAILY_EMAIL_TO:-}" ]]; then
   DAILY_UPDATE_ALIGNED_DATE="$ALIGNED_DATE" \
   DAILY_UPDATE_STATUS="$RUN_STATUS" \
   DAILY_UPDATE_LOG_FILE="$RUN_LOG" \
+  DAILY_UPDATE_PERSIST_TOP="$DAILY_PERSIST_TOP" \
   "$VENV_PY" "$SCRIPT_DIR/daily_update_email.py" \
     || echo "Warning: failed to send daily update email."
 fi

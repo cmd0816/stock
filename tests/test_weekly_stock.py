@@ -14,6 +14,7 @@ from weekly_stock.jobs import (
     ml_predict_job,
     review_selected_stock,
     stock_screen_job,
+    stock_screen_preview_job,
 )
 from weekly_stock.ml import TrainingSample, build_training_samples, evaluate_predictions, label_future
 from weekly_stock.models import Kline
@@ -177,6 +178,38 @@ class WeeklyStockTests(unittest.TestCase):
                 self.assertGreaterEqual(len(selected), 2)
                 self.assertEqual(selected[0]["code"], "000001")
                 self.assertIn("风险过滤", selected[0]["selected_reason"])
+
+    def test_stock_screen_preview_does_not_persist_top_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = write_config(root)
+            with connect(root / "stocks.db") as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                conn.execute(
+                    "INSERT INTO xuangu_batches VALUES ('b1', '2026-05-01T00:00:00Z', 'url', 'cond', 'file', 1, 2)"
+                )
+                insert_candidate(conn, "000001", "强势股份", {"营业收入同比增长率": "20%", "净利润同比增长率": "15%"})
+                insert_candidate(conn, "000002", "普通股份", {"营业收入同比增长率": "5%", "净利润同比增长率": "3%"})
+                for i in range(1, 36):
+                    insert_kline(conn, "000001", i, 10 + i * 0.2, volume=1000 + i * 20)
+                    insert_kline(conn, "000002", i, 10 + i * 0.05, volume=1000)
+                conn.commit()
+
+            result = stock_screen_preview_job(
+                config_path,
+                DEFAULT_CONFIG | {"database": {"path": "stocks.db"}},
+                screen_date="2026-05-02",
+                xuangu_batch_id="b1",
+            )
+
+            self.assertEqual(int(result["candidate_count"]), 2)
+            self.assertEqual(len(result["selected"]), 2)
+            with connect(root / "stocks.db") as conn:
+                run_count = conn.execute("SELECT COUNT(*) AS n FROM weekly_screen_runs").fetchone()["n"]
+                selected_count = conn.execute("SELECT COUNT(*) AS n FROM weekly_selected_stocks").fetchone()["n"]
+            self.assertEqual(run_count, 0)
+            self.assertEqual(selected_count, 0)
 
     def test_stock_screen_job_replace_existing_keeps_latest_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -220,7 +220,45 @@ def query_top_changes(db_path: Path) -> dict:
         }
 
 
+def parse_top_preview(log_text: str) -> list[dict]:
+    rows = []
+    for line in log_text.splitlines():
+        if not line.startswith("TOP_PREVIEW|"):
+            continue
+        parts = line.split("|", 5)
+        if len(parts) < 6:
+            continue
+        try:
+            rank_no = int(parts[1])
+            score = float(parts[4])
+        except ValueError:
+            continue
+        rows.append(
+            {
+                "rank_no": rank_no,
+                "code": parts[2],
+                "name": parts[3],
+                "score": score,
+                "reason": parts[5],
+            }
+        )
+    rows.sort(key=lambda item: int(item["rank_no"]))
+    return rows
+
+
 def render_top_changes(top_changes: dict) -> str:
+    if top_changes.get("preview_only"):
+        rows = top_changes.get("rows") or []
+        if not rows:
+            return "- Top 预览未落库；本次日志里没有解析到预览结果"
+        lines = ["- Top 预览未落库，以下为本次按规则计算的结果:"]
+        for item in rows[:20]:
+            lines.append(
+                f"  #{int(item['rank_no'])} {item['code']} {item.get('name', '')} "
+                f"score={float(item.get('score') or 0):.2f}"
+            )
+        return "\n".join(lines)
+
     if not top_changes.get("available"):
         return f"- 无法生成 Top 变动：{top_changes.get('reason', '未知原因')}"
 
@@ -359,6 +397,7 @@ def main() -> None:
         "aligned_date": env_required("DAILY_UPDATE_ALIGNED_DATE"),
         "status": env_required("DAILY_UPDATE_STATUS"),
         "log_file": env_required("DAILY_UPDATE_LOG_FILE"),
+        "persist_top": os.getenv("DAILY_UPDATE_PERSIST_TOP", "1").strip(),
     }
 
     log_path = Path(meta["log_file"])
@@ -366,7 +405,14 @@ def main() -> None:
     stats = parse_log(log_text)
     db_path = Path(meta["db_path"])
     batch_status = query_batch_status(db_path, meta["batch_id"], meta["aligned_date"])
-    top_changes = query_top_changes(db_path)
+    if meta["persist_top"] == "1":
+        top_changes = query_top_changes(db_path)
+    else:
+        top_changes = {
+            "available": True,
+            "preview_only": True,
+            "rows": parse_top_preview(log_text),
+        }
 
     tail_lines = max(10, int(os.getenv("DAILY_EMAIL_LOG_LINES", "80")))
     tail = "\n".join(log_text.splitlines()[-tail_lines:]) if log_text else "(no log)"

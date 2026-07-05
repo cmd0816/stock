@@ -7,7 +7,14 @@ from statistics import mean
 
 from . import db
 from .config import load_config
-from .jobs import ml_backtest_job, ml_predict_job, project_root, stock_screen_job, weekly_review_job
+from .jobs import (
+    ml_backtest_job,
+    ml_predict_job,
+    project_root,
+    stock_screen_job,
+    stock_screen_preview_job,
+    weekly_review_job,
+)
 
 
 def print_ml_predictions(config_path: Path, config: dict, model_run_id: int) -> None:
@@ -80,6 +87,27 @@ def print_screen_runs(config_path: Path, config: dict, limit: int) -> None:
             f"{str(row['latest_model_name'] or '-'):>9} "
             f"{row['created_at_utc']}"
         )
+
+
+def print_screen_preview(result: dict) -> None:
+    selected = result.get("selected") or []
+    print(
+        "screen_preview completed: "
+        f"screen_date={result.get('screen_date')} "
+        f"batch_id={result.get('xuangu_batch_id')} "
+        f"candidates={int(result.get('candidate_count') or 0)} "
+        f"selected={int(result.get('selected_count') or 0)} "
+        "persisted=0"
+    )
+    print("rank code   name        score reason")
+    for rank, item in enumerate(selected, start=1):
+        code = str(item.candidate.code)
+        name = str(item.candidate.name or "")[:8]
+        score = float(item.score.total)
+        reason = str(item.selected_reason or "").replace("\n", " ")[:80]
+        print(f"{rank:>4} {code:<6} {name:<8} {score:>5.2f} {reason}")
+        machine_reason = reason.replace("|", "/")
+        print(f"TOP_PREVIEW|{rank}|{code}|{name}|{score:.2f}|{machine_reason}")
 
 
 def print_backtest_metrics(metrics: list) -> None:
@@ -201,6 +229,11 @@ def main() -> None:
     screen.add_argument("--run-xuangu", action="store_true", help="Run xuangu download before scoring")
     screen.add_argument("--replace-existing", action="store_true", help="Replace existing screen run for the same date/batch")
 
+    preview = sub.add_parser("preview", help="Preview Top stocks without writing weekly screen tables")
+    preview.add_argument("--date", default=None, help="Screen date, YYYY-MM-DD")
+    preview.add_argument("--xuangu-batch-id", default=None, help="Use a specific xuangu batch id")
+    preview.add_argument("--run-xuangu", action="store_true", help="Run xuangu download before scoring")
+
     review = sub.add_parser("review", help="Run weekly_review_job")
     review.add_argument("--date", default=None, help="Review date, YYYY-MM-DD")
     review.add_argument("--run-id", type=int, default=None, help="Review a specific weekly screen run")
@@ -232,6 +265,16 @@ def main() -> None:
             replace_existing=args.replace_existing,
         )
         print(f"stock_screen_job completed: run_id={run_id}")
+    elif args.command == "preview":
+        if args.run_xuangu:
+            config["screening"]["run_xuangu"] = True
+        result = stock_screen_preview_job(
+            config_path,
+            config,
+            screen_date=args.date,
+            xuangu_batch_id=args.xuangu_batch_id,
+        )
+        print_screen_preview(result)
     elif args.command == "review":
         review_id = weekly_review_job(
             config_path,
