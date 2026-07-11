@@ -884,6 +884,51 @@ class WeeklyStockTests(unittest.TestCase):
         self.assertEqual(label, 0)
         self.assertAlmostEqual(close_gain, -5.0, places=4)
 
+    def test_label_future_does_not_count_target_after_stop(self) -> None:
+        klines = [
+            Kline("2026-05-01", 10, 10, 10.1, 9.9, 1000, 5, 0),
+            Kline("2026-05-04", 10, 9.5, 10.0, 9.3, 1000, 5, -5),
+            Kline("2026-05-05", 9.5, 10.7, 11.0, 9.5, 1000, 5, 12),
+        ]
+        result = label_future(
+            klines,
+            0,
+            2,
+            {
+                "use_trade_exit_rules": True,
+                "exit_stop_loss_pct": 0.06,
+                "positive_high_gain_pct": 0.05,
+                "positive_close_gain_pct": 0.02,
+                "positive_target_logic": "any",
+                "exit_on_break_ma20": False,
+            },
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual((result or (1,))[0], 0)
+        self.assertAlmostEqual((result or (0, 0, 0))[2], -6.0)
+
+    def test_label_future_same_day_stop_and_target_is_conservative(self) -> None:
+        klines = [
+            Kline("2026-05-01", 10, 10, 10.1, 9.9, 1000, 5, 0),
+            Kline("2026-05-04", 10, 10.1, 10.6, 9.3, 1000, 5, 1),
+        ]
+        result = label_future(
+            klines,
+            0,
+            1,
+            {
+                "use_trade_exit_rules": True,
+                "exit_stop_loss_pct": 0.06,
+                "positive_high_gain_pct": 0.05,
+                "positive_close_gain_pct": 0.02,
+                "positive_target_logic": "any",
+                "exit_on_break_ma20": False,
+            },
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual((result or (1,))[0], 0)
+        self.assertAlmostEqual((result or (0, 0, 0))[2], -6.0)
+
     def test_label_future_any_target_logic_matches_review_goal(self) -> None:
         klines = [Kline("2026-05-01", 10.0, 10.0, 10.0, 10.0, 1000, 5, 0)]
         klines.append(Kline("2026-05-02", 10.0, 10.1, 10.6, 9.7, 1000, 5, 0))

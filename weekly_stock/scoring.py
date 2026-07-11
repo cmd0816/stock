@@ -210,7 +210,10 @@ def score_risk(candidate: CandidateStock, klines: List[Kline], scoring: Dict[str
     name = candidate.name or ""
     price = last.close if last and last.close is not None else row_value(candidate.row_json, ["最新"])
     latest_drop = last.change_percent if last and last.change_percent is not None else row_value(candidate.row_json, ["涨跌幅"])
-    risk_points = 3
+    # Keep each penalty worth one third of the risk score. Additional checks
+    # strengthen the filter without diluting the existing ST/price/drop rules.
+    max_risk_points = 3
+    risk_points = max_risk_points
 
     if "ST" in name.upper() or "退" in name:
         reasons.append("风险扣分：名称包含 ST/退")
@@ -222,9 +225,26 @@ def score_risk(candidate: CandidateStock, klines: List[Kline], scoring: Dict[str
         reasons.append(f"风险扣分：最近交易日跌幅 {latest_drop:.2f}%")
         risk_points -= 1
 
-    if risk_points == 3:
+    if last and last.close and len(klines) >= 14:
+        ranges = [
+            float(k.high) - float(k.low)
+            for k in klines[-14:]
+            if k.high is not None and k.low is not None
+        ]
+        atr_pct = mean(ranges) / float(last.close) * 100 if ranges else None
+        if atr_pct is not None and atr_pct > float(cfg.get("max_atr_pct", 8)):
+            reasons.append(f"风险扣分：近14日波动过高 {atr_pct:.2f}%")
+            risk_points -= 1
+
+    if last and last.close and len(klines) >= 6 and klines[-6].close:
+        gain_5d = pct(last.close, klines[-6].close)
+        if gain_5d is not None and gain_5d > float(cfg.get("max_5d_gain_pct", 15)):
+            reasons.append(f"风险扣分：近5日涨幅过大 {gain_5d:.2f}%")
+            risk_points -= 1
+
+    if risk_points == max_risk_points:
         reasons.append("风险过滤通过")
-    return round(weight * max(0, risk_points) / 3, 2)
+    return round(weight * max(0, risk_points) / max_risk_points, 2)
 
 
 def rank_candidates(candidates: List[CandidateStock], klines_by_code: Dict[str, List[Kline]], config: Dict[str, Any]) -> List[ScoredStock]:

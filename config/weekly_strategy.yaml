@@ -45,6 +45,8 @@ scoring:
     max_price: 200
     stop_loss_pct: 0.06
     max_daily_drop_pct: -5
+    max_atr_pct: 8
+    max_5d_gain_pct: 15
 
 review:
   horizon_trading_days: 5
@@ -61,7 +63,8 @@ review:
 
 ml:
   enabled: true
-  rerank_after_predict: true
+  # Keep ML in shadow mode until realized reviews beat rule ranking.
+  rerank_after_predict: false
   model_name: lightgbm
   baseline_model_name: logistic_regression
   history_limit: 320
@@ -74,9 +77,10 @@ ml:
   positive_high_gain_pct: 0.05
   positive_close_gain_pct: 0.02
   positive_target_logic: any
-  use_trade_exit_rules: false
-  exit_stop_loss_pct: 0.10
-  exit_on_break_ma20: true
+  use_trade_exit_rules: true
+  # Keep training labels aligned with the live review stop.
+  exit_stop_loss_pct: 0.06
+  exit_on_break_ma20: false
   negative_drawdown_pct: 0.06
   rule_score_weight: 0.25
   # 将入选股规则分转为横截面百分位后再与ML概率混合，避免95分附近的小数差异失去作用

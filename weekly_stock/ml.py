@@ -589,18 +589,33 @@ def label_future(klines: Sequence[Kline], end_idx: int, horizon: int, cfg: Dict[
     if use_exit_rules:
         stop_loss_pct = float(cfg.get("exit_stop_loss_pct", 0.10))
         exit_on_break_ma20 = bool(cfg.get("exit_on_break_ma20", True))
-        close_gain = pct(closes[-1], current.close)
+        stop_price = float(current.close) * (1 - stop_loss_pct)
+        target_price = float(current.close) * (1 + high_target / 100)
+        exited = False
+        high_hit = False
         for future_idx in range(end_idx + 1, end_idx + 1 + horizon):
             day = klines[future_idx]
-            if day.low is not None and day.low <= float(current.close) * (1 - stop_loss_pct):
+            stop_hit = day.low is not None and day.low <= stop_price
+            target_hit_today = day.high is not None and day.high >= target_price
+            # Daily candles do not reveal intraday ordering. If both levels are
+            # touched, assume the stop happened first to avoid optimistic labels.
+            if stop_hit:
                 close_gain = -stop_loss_pct * 100
+                exited = True
+                break
+            if target_hit_today:
+                high_hit = True
+                close_gain = high_target
+                exited = True
                 break
             if exit_on_break_ma20 and day.close is not None:
                 ma20 = moving_average(klines, future_idx, 20)
                 if ma20 and day.close < ma20:
                     close_gain = pct(day.close, current.close)
+                    exited = True
                     break
-        high_hit = highest_gain >= high_target
+        if not exited:
+            high_hit = highest_gain >= high_target
         close_hit = close_gain >= close_target
         target_hit = (high_hit or close_hit) if target_logic in {"any", "or"} else (high_hit and close_hit)
         good = target_hit
