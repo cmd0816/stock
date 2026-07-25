@@ -15,10 +15,12 @@ from .ml import (
     backtest_models,
     build_training_samples,
     features_at,
+    purged_walk_forward_splits,
     split_samples_by_time,
     train_model,
 )
 from .scoring import rank_candidates
+from .trade_simulator import simulate_trade
 from .trading_calendar import align_to_last_trading_day
 
 
@@ -337,7 +339,16 @@ def weekly_review_job(
 
         review_id = db.create_review_run(conn, reviewed_run_id, effective_review_date, config)
         results = [
-            review_selected_stock(db.load_klines(conn, row["code"], limit=320), row, config)
+            review_selected_stock(
+                db.load_klines(
+                    conn,
+                    row["code"],
+                    limit=320,
+                    as_of_date=effective_review_date,
+                ),
+                row,
+                config,
+            )
             for row in selected
         ]
         db.save_review_results(conn, review_id, selected, results)
@@ -414,7 +425,14 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             positive_sample_count=positive_count,
             model_json=model.to_json(),
         )
-        db.save_ml_training_samples(conn, model_run_id, source_run_id, samples)
+        db.save_ml_training_samples(
+            conn,
+            model_run_id,
+            source_run_id,
+            samples,
+            storage_mode=str(ml_cfg.get("training_sample_storage_mode", "zlib")),
+            keep_model_runs=int(ml_cfg.get("training_sample_keep_model_runs", 3)),
+        )
 
         # Build cross-sectional features over the same downloaded universe used
         # for training, then take the selected rows from that snapshot. Computing
@@ -521,43 +539,68 @@ def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
         attach_context_features_to_samples(conn, samples)
         feedback = None
         if ml_cfg.get("use_review_feedback_labels", False):
-            _train_samples, test_samples = split_samples_by_time(
-                samples,
-                train_ratio=float(ml_cfg.get("backtest_train_ratio", 0.7)),
-            )
-            feedback_cutoff = min((sample.trade_date for sample in test_samples), default=None)
+            mode = str(ml_cfg.get("backtest_mode", "purged_walk_forward")).lower()
+            if mode in {"purged_walk_forward", "walk_forward"}:
+                folds = purged_walk_forward_splits(
+                    samples,
+                    train_ratio=float(ml_cfg.get("backtest_train_ratio", 0.7)),
+                    fold_count=int(ml_cfg.get("backtest_walk_forward_folds", 5)),
+                )
+                feedback_cutoff = folds[0].test_start_date if folds else None
+            else:
+                _train_samples, test_samples = split_samples_by_time(
+                    samples,
+                    train_ratio=float(ml_cfg.get("backtest_train_ratio", 0.7)),
+                )
+                feedback_cutoff = min(
+                    (sample.trade_date for sample in test_samples),
+                    default=None,
+                )
             feedback = db.review_feedback_labels(
                 conn,
                 recent_runs=int(ml_cfg.get("review_feedback_recent_runs", 0)),
                 as_of_date=feedback_cutoff,
             )
+        rule_candidates = db.rule_backtest_candidates(conn)
     min_samples = int(ml_cfg.get("min_train_samples", 30))
     if len(samples) < min_samples:
         raise RuntimeError(
             f"Not enough ML backtest samples: {len(samples)} < {min_samples}. "
             "Download more K-line history or lower ml.min_train_samples."
         )
-    return backtest_models(samples, ml_cfg, feedback_labels=feedback)
+    return backtest_models(
+        samples,
+        ml_cfg,
+        feedback_labels=feedback,
+        rule_candidates=rule_candidates,
+    )
 
 
 def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[str, Any]) -> ReviewResult:
     screen_date = selected_row["screen_date"]
     horizon = int(config["review"]["horizon_trading_days"])
-    stop_loss_pct = float(config["review"]["stop_loss_pct"]) * 100
+    stop_loss_fraction = float(config["review"]["stop_loss_pct"])
+    stop_loss_pct = stop_loss_fraction * 100
     expected_high = float(config["review"]["expected_high_gain_pct"]) * 100
     expected_close = float(config["review"]["expected_close_gain_pct"]) * 100
 
     previous = [k for k in klines if k.trade_date <= screen_date and k.close is not None]
     future = [k for k in klines if k.trade_date > screen_date and k.close is not None][:horizon]
-    if not previous or not future:
+    if not previous or len(future) < horizon:
         last_trade_date = klines[-1].trade_date if klines else None
         reasons = []
         if not previous:
             reasons.append("缺少选股日及之前的收盘K线")
-        if not future:
-            reasons.append("缺少选股日之后的K线")
+        if len(future) < horizon:
+            reasons.append(f"选股日之后只有 {len(future)}/{horizon} 个交易日K线")
         if last_trade_date:
             reasons.append(f"当前最新K线日期={last_trade_date}")
+        interval_note = (
+            f"复盘区间 {future[0].trade_date} 到 {future[-1].trade_date}，"
+            f"共 {len(future)}/{horizon} 个交易日；"
+            if future
+            else f"复盘区间尚未开始，共 0/{horizon} 个交易日；"
+        )
         return ReviewResult(
             code=selected_row["code"],
             name=selected_row["name"],
@@ -570,47 +613,91 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
             stop_loss_triggered=False,
             meets_expectation=False,
             best_exit_meets_expectation=False,
-            notes="K线不足，无法完整复盘；" + "；".join(reasons),
+            is_complete=False,
+            notes="K线不足，复盘未完成；" + interval_note + "；".join(reasons),
         )
 
     base = previous[-1]
-    base_close = base.close or 0
-    highs = [k.high for k in future if k.high is not None]
-    lows = [k.low for k in future if k.low is not None]
-    closes = [k.close for k in future if k.close is not None]
-    highest_gain = (max(highs) / base_close - 1) * 100 if base_close and highs else None
-    close_gain = (closes[-1] / base_close - 1) * 100 if base_close and closes else None
-    max_drawdown = (min(lows) / base_close - 1) * 100 if base_close and lows else None
-    stop_loss = max_drawdown is not None and max_drawdown <= -stop_loss_pct
-    target_hit = (highest_gain is not None and highest_gain >= expected_high) or (
-        close_gain is not None and close_gain >= expected_close
+    base_idx = max(
+        idx
+        for idx, row in enumerate(klines)
+        if row.trade_date <= screen_date and row.close is not None
     )
-    meets = target_hit and not stop_loss
-    best_exit_meets = target_hit  # 假设达到目标即止盈，不考虑后续回撤
+    outcome = simulate_trade(
+        klines,
+        base_idx,
+        horizon,
+        high_target_pct=float(config["review"]["expected_high_gain_pct"]),
+        close_target_pct=float(config["review"]["expected_close_gain_pct"]),
+        stop_loss_pct=stop_loss_fraction,
+        target_logic=str(config["review"].get("positive_target_logic", "any")),
+        use_exit_rules=bool(config["review"].get("use_trade_exit_rules", True)),
+        exit_on_break_ma20=bool(config["review"].get("exit_on_break_ma20", False)),
+    )
+    if outcome is None:
+        return ReviewResult(
+            code=selected_row["code"],
+            name=selected_row["name"],
+            base_trade_date=base.trade_date,
+            review_start_date=future[0].trade_date,
+            review_end_date=future[-1].trade_date,
+            highest_gain_pct=None,
+            close_gain_pct=None,
+            max_drawdown_pct=None,
+            stop_loss_triggered=False,
+            meets_expectation=False,
+            best_exit_meets_expectation=False,
+            is_complete=False,
+            notes="K线字段不完整，复盘未完成",
+        )
 
-    notes = [f"复盘区间 {future[0].trade_date} 到 {future[-1].trade_date}，共 {len(future)}/{horizon} 个交易日"]
+    notes = [
+        f"复盘区间 {future[0].trade_date} 到 {future[-1].trade_date}，共 {len(future)}/{horizon} 个交易日",
+        f"区间最高涨幅 {outcome.highest_gain_pct:.2f}%，"
+        f"区间最大回撤 {outcome.max_drawdown_pct:.2f}%",
+    ]
     success_reasons = []
     failure_reasons = []
-    if highest_gain is not None:
-        if highest_gain >= expected_high:
-            success_reasons.append(f"最高涨幅 {highest_gain:.2f}% 达到目标 {expected_high:.2f}%")
-        else:
-            failure_reasons.append(
-                f"最高涨幅 {highest_gain:.2f}% 低于目标 {expected_high:.2f}%，差 {expected_high - highest_gain:.2f}%"
-            )
-    if close_gain is not None:
-        if close_gain >= expected_close:
-            success_reasons.append(f"收盘涨幅 {close_gain:.2f}% 达到目标 {expected_close:.2f}%")
-        else:
-            failure_reasons.append(
-                f"收盘涨幅 {close_gain:.2f}% 低于目标 {expected_close:.2f}%，差 {expected_close - close_gain:.2f}%"
-            )
-    if stop_loss:
-        failure_reasons.append(f"最大回撤 {max_drawdown:.2f}% 触发止损线 {-stop_loss_pct:.2f}%")
-    elif max_drawdown is not None:
-        success_reasons.append(f"最大回撤 {max_drawdown:.2f}%，未触发止损线 {-stop_loss_pct:.2f}%")
+    if outcome.high_target_hit:
+        success_reasons.append(
+            f"退出前触及止盈目标 {expected_high:.2f}%"
+        )
+    elif outcome.highest_gain_pct >= expected_high:
+        failure_reasons.append(
+            f"区间最高涨幅 {outcome.highest_gain_pct:.2f}% 达标，但发生在策略退出之后"
+        )
+    else:
+        failure_reasons.append(
+            f"最高涨幅 {outcome.highest_gain_pct:.2f}% 低于目标 {expected_high:.2f}%，"
+            f"差 {expected_high - outcome.highest_gain_pct:.2f}%"
+        )
+    if outcome.close_target_hit:
+        success_reasons.append(
+            f"策略退出收益 {outcome.realized_gain_pct:.2f}% 达到目标 {expected_close:.2f}%"
+        )
+    else:
+        failure_reasons.append(
+            f"策略退出收益 {outcome.realized_gain_pct:.2f}% 低于目标 {expected_close:.2f}%"
+        )
+    if outcome.stop_loss_triggered:
+        failure_reasons.append(f"触发止损线 {-stop_loss_pct:.2f}%")
+    else:
+        success_reasons.append(
+            f"策略退出前未触发止损线 {-stop_loss_pct:.2f}%"
+        )
 
-    if meets:
+    exit_labels = {
+        "take_profit": "止盈",
+        "stop_loss": "止损",
+        "break_ma20": "跌破MA20",
+        "horizon": "持有期结束",
+    }
+    notes.append(
+        f"退出方式：{exit_labels.get(outcome.exit_reason, outcome.exit_reason)}，"
+        f"退出日期 {outcome.exit_trade_date}，策略收益 {outcome.realized_gain_pct:.2f}%"
+    )
+
+    if outcome.label:
         notes.append("成功原因：" + "；".join(success_reasons))
     else:
         notes.append("失败原因：" + "；".join(failure_reasons or ["未命中上涨目标"]))
@@ -623,11 +710,12 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         base_trade_date=base.trade_date,
         review_start_date=future[0].trade_date,
         review_end_date=future[-1].trade_date,
-        highest_gain_pct=highest_gain,
-        close_gain_pct=close_gain,
-        max_drawdown_pct=max_drawdown,
-        stop_loss_triggered=stop_loss,
-        meets_expectation=meets,
-        best_exit_meets_expectation=best_exit_meets,
+        highest_gain_pct=outcome.highest_gain_pct,
+        close_gain_pct=outcome.realized_gain_pct,
+        max_drawdown_pct=outcome.max_drawdown_pct,
+        stop_loss_triggered=outcome.stop_loss_triggered,
+        meets_expectation=bool(outcome.label),
+        best_exit_meets_expectation=outcome.best_exit_target_hit,
+        is_complete=True,
         notes="；".join(notes),
     )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import zlib
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -117,6 +119,8 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             stop_loss_triggered INTEGER NOT NULL,
             meets_expectation INTEGER NOT NULL,
             best_exit_meets_expectation INTEGER NOT NULL DEFAULT 0,
+            is_complete INTEGER NOT NULL DEFAULT 0,
+            simulation_version TEXT NOT NULL DEFAULT 'legacy',
             notes TEXT NOT NULL,
             created_at_utc TEXT NOT NULL,
             FOREIGN KEY (review_id) REFERENCES weekly_review_runs(review_id),
@@ -145,7 +149,10 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
             future_high_gain_pct REAL NOT NULL,
             future_close_gain_pct REAL NOT NULL,
             future_max_drawdown_pct REAL NOT NULL,
+            label_end_date TEXT,
             feature_json TEXT NOT NULL,
+            feature_blob BLOB,
+            feature_encoding TEXT NOT NULL DEFAULT 'json',
             created_at_utc TEXT NOT NULL,
             FOREIGN KEY (model_run_id) REFERENCES weekly_ml_model_runs(model_run_id),
             FOREIGN KEY (source_run_id) REFERENCES weekly_screen_runs(run_id)
@@ -195,6 +202,26 @@ def ensure_weekly_tables(conn: sqlite3.Connection) -> None:
     )
     _migrate_weekly_review_runs_to_append_mode(conn)
     _add_column_if_missing(conn, "weekly_review_results", "best_exit_meets_expectation", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_review_completion_status(conn)
+    _add_column_if_missing(
+        conn,
+        "weekly_review_results",
+        "simulation_version",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )
+    _add_column_if_missing(
+        conn,
+        "weekly_ml_training_samples",
+        "label_end_date",
+        "TEXT",
+    )
+    _add_column_if_missing(conn, "weekly_ml_training_samples", "feature_blob", "BLOB")
+    _add_column_if_missing(
+        conn,
+        "weekly_ml_training_samples",
+        "feature_encoding",
+        "TEXT NOT NULL DEFAULT 'json'",
+    )
     ensure_market_context_tables(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_weekly_review_runs_run_id ON weekly_review_runs(reviewed_run_id)")
     conn.execute(
@@ -252,6 +279,30 @@ def _add_column_if_missing(
     if any(str(r["name"]) == column for r in rows):
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+
+
+def _migrate_review_completion_status(conn: sqlite3.Connection) -> None:
+    columns = conn.execute("PRAGMA table_info(weekly_review_results)").fetchall()
+    if any(str(row["name"]) == "is_complete" for row in columns):
+        return
+
+    conn.execute(
+        "ALTER TABLE weekly_review_results "
+        "ADD COLUMN is_complete INTEGER NOT NULL DEFAULT 0"
+    )
+    rows = conn.execute(
+        "SELECT id, notes FROM weekly_review_results"
+    ).fetchall()
+    completed_ids = []
+    for row in rows:
+        match = re.search(r"共\s*(\d+)\s*/\s*(\d+)\s*个交易日", str(row["notes"] or ""))
+        if match and int(match.group(2)) > 0 and int(match.group(1)) >= int(match.group(2)):
+            completed_ids.append((int(row["id"]),))
+    if completed_ids:
+        conn.executemany(
+            "UPDATE weekly_review_results SET is_complete = 1 WHERE id = ?",
+            completed_ids,
+        )
 
 
 def ensure_market_context_tables(conn: sqlite3.Connection) -> None:
@@ -527,7 +578,23 @@ def latest_selected_run_without_review(conn: sqlite3.Connection) -> Optional[int
         SELECT r.run_id
         FROM weekly_screen_runs r
         WHERE EXISTS (SELECT 1 FROM weekly_selected_stocks s WHERE s.run_id = r.run_id)
-          AND NOT EXISTS (SELECT 1 FROM weekly_review_runs rr WHERE rr.reviewed_run_id = r.run_id)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM weekly_review_runs rr
+              WHERE rr.reviewed_run_id = r.run_id
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM weekly_selected_stocks expected
+                    WHERE expected.run_id = r.run_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM weekly_review_results actual
+                          WHERE actual.review_id = rr.review_id
+                            AND actual.selected_id = expected.id
+                            AND actual.is_complete = 1
+                      )
+                )
+          )
         ORDER BY r.screen_date DESC, r.run_id DESC
         LIMIT 1
         """
@@ -612,6 +679,7 @@ def review_trend_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3
             FROM weekly_review_runs wr
             JOIN weekly_review_results rr
                 ON rr.review_id = wr.review_id
+            WHERE rr.is_complete = 1
             GROUP BY wr.reviewed_run_id
         ),
         ml_agg AS (
@@ -676,6 +744,8 @@ def review_feedback_labels(
               ON lr.review_id = rr.review_id
             WHERE rr.base_trade_date IS NOT NULL
               AND rr.base_trade_date <> ''
+              AND rr.is_complete = 1
+              AND rr.simulation_version = 'daily_exit_v1'
               AND rr.review_start_date IS NOT NULL
               AND rr.review_end_date IS NOT NULL
               AND rr.highest_gain_pct IS NOT NULL
@@ -699,6 +769,8 @@ def review_feedback_labels(
               ON lr.review_id = rr.review_id
             WHERE rr.base_trade_date IS NOT NULL
               AND rr.base_trade_date <> ''
+              AND rr.is_complete = 1
+              AND rr.simulation_version = 'daily_exit_v1'
               AND rr.review_start_date IS NOT NULL
               AND rr.review_end_date IS NOT NULL
               AND rr.highest_gain_pct IS NOT NULL
@@ -724,6 +796,19 @@ def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
         """
     ).fetchall()
     return [str(row["code"]) for row in rows]
+
+
+def rule_backtest_candidates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT c.run_id, r.screen_date, c.code, c.total_score, c.rank_no
+        FROM weekly_screen_candidates c
+        JOIN weekly_screen_runs r ON r.run_id = c.run_id
+        WHERE c.selected = 1
+        ORDER BY r.screen_date, c.run_id, c.rank_no
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_fund_flow_rows(
@@ -1105,6 +1190,9 @@ def save_ml_training_samples(
     model_run_id: int,
     source_run_id: int,
     samples: Iterable[Any],
+    *,
+    storage_mode: str = "zlib",
+    keep_model_runs: int = 3,
 ) -> None:
     conn.execute("DELETE FROM weekly_ml_training_samples WHERE model_run_id = ?", (model_run_id,))
     for sample in samples:
@@ -1113,8 +1201,9 @@ def save_ml_training_samples(
             INSERT INTO weekly_ml_training_samples (
                 model_run_id, source_run_id, code, trade_date, label,
                 future_high_gain_pct, future_close_gain_pct, future_max_drawdown_pct,
-                feature_json, created_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                label_end_date, feature_json, feature_blob, feature_encoding,
+                created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 model_run_id,
@@ -1125,11 +1214,95 @@ def save_ml_training_samples(
                 sample.future_high_gain_pct,
                 sample.future_close_gain_pct,
                 sample.future_max_drawdown_pct,
-                json.dumps(sample.features, ensure_ascii=False, default=str),
+                sample.label_end_date,
+                "{}" if storage_mode == "zlib" else json.dumps(sample.features, ensure_ascii=False, default=str),
+                sqlite3.Binary(
+                    zlib.compress(
+                        json.dumps(sample.features, ensure_ascii=False, default=str).encode("utf-8"),
+                        level=9,
+                    )
+                ) if storage_mode == "zlib" else None,
+                "zlib-json" if storage_mode == "zlib" else "json",
                 utc_now(),
             ),
         )
+    keep = max(1, int(keep_model_runs))
+    retained = conn.execute(
+        """
+        SELECT model_run_id
+        FROM weekly_ml_model_runs
+        ORDER BY model_run_id DESC
+        LIMIT ?
+        """,
+        (keep,),
+    ).fetchall()
+    retained_ids = [int(row["model_run_id"]) for row in retained]
+    if retained_ids:
+        placeholders = ",".join("?" for _ in retained_ids)
+        conn.execute(
+            f"DELETE FROM weekly_ml_training_samples "
+            f"WHERE model_run_id NOT IN ({placeholders})",
+            retained_ids,
+        )
     conn.commit()
+
+
+def compact_ml_training_history(
+    conn: sqlite3.Connection,
+    keep_model_runs: int = 3,
+    batch_size: int = 2000,
+) -> Dict[str, int]:
+    keep = max(1, int(keep_model_runs))
+    retained = conn.execute(
+        "SELECT model_run_id FROM weekly_ml_model_runs ORDER BY model_run_id DESC LIMIT ?",
+        (keep,),
+    ).fetchall()
+    retained_ids = [int(row["model_run_id"]) for row in retained]
+    if not retained_ids:
+        return {"deleted": 0, "compressed": 0}
+    placeholders = ",".join("?" for _ in retained_ids)
+    before = int(conn.execute("SELECT COUNT(*) AS n FROM weekly_ml_training_samples").fetchone()["n"])
+    conn.execute(
+        f"DELETE FROM weekly_ml_training_samples WHERE model_run_id NOT IN ({placeholders})",
+        retained_ids,
+    )
+    deleted = before - int(
+        conn.execute("SELECT COUNT(*) AS n FROM weekly_ml_training_samples").fetchone()["n"]
+    )
+    compressed = 0
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            f"""
+            SELECT id, feature_json
+            FROM weekly_ml_training_samples
+            WHERE model_run_id IN ({placeholders})
+              AND feature_encoding = 'json'
+              AND id > ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (*retained_ids, last_id, max(1, int(batch_size))),
+        ).fetchall()
+        if not rows:
+            break
+        updates = []
+        for row in rows:
+            raw = str(row["feature_json"] or "{}").encode("utf-8")
+            updates.append((sqlite3.Binary(zlib.compress(raw, level=9)), int(row["id"])))
+        conn.executemany(
+            """
+            UPDATE weekly_ml_training_samples
+            SET feature_json = '{}', feature_blob = ?, feature_encoding = 'zlib-json'
+            WHERE id = ?
+            """,
+            updates,
+        )
+        last_id = int(rows[-1]["id"])
+        compressed += len(rows)
+        conn.commit()
+    conn.commit()
+    return {"deleted": deleted, "compressed": compressed}
 
 
 def save_ml_predictions(
@@ -1239,8 +1412,9 @@ def save_review_results(conn: sqlite3.Connection, review_id: int, selected_rows:
             INSERT INTO weekly_review_results (
                 review_id, selected_id, code, name, base_trade_date, review_start_date,
                 review_end_date, highest_gain_pct, close_gain_pct, max_drawdown_pct,
-                stop_loss_triggered, meets_expectation, best_exit_meets_expectation, notes, created_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stop_loss_triggered, meets_expectation, best_exit_meets_expectation,
+                is_complete, simulation_version, notes, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 review_id,
@@ -1256,6 +1430,8 @@ def save_review_results(conn: sqlite3.Connection, review_id: int, selected_rows:
                 int(result.stop_loss_triggered),
                 int(result.meets_expectation),
                 int(result.best_exit_meets_expectation),
+                int(result.is_complete),
+                "daily_exit_v1",
                 result.notes,
                 utc_now(),
             ),

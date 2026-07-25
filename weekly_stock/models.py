@@ -59,4 +59,5 @@ class ReviewResult:
     stop_loss_triggered: bool
     meets_expectation: bool
     best_exit_meets_expectation: bool
+    is_complete: bool
     notes: str

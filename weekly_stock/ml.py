@@ -10,6 +10,7 @@ from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import Kline
+from .trade_simulator import simulate_trade
 from .trading_calendar import weekly_last_trading_days
 
 
@@ -80,6 +81,7 @@ class TrainingSample:
     future_high_gain_pct: float
     future_close_gain_pct: float
     future_max_drawdown_pct: float
+    label_end_date: Optional[str] = None
 
 
 @dataclass
@@ -96,6 +98,19 @@ class BacktestMetrics:
     top_k_avg_close_gain_pct: float
     top_k_avg_high_gain_pct: float
     top_k_avg_max_drawdown_pct: float
+    fold_count: int = 1
+    avg_purged_train_count: int = 0
+    brier_score: float = 0.0
+
+
+@dataclass
+class WalkForwardFold:
+    fold_no: int
+    train_samples: List[TrainingSample]
+    test_samples: List[TrainingSample]
+    test_start_date: str
+    test_end_date: str
+    purged_train_count: int
 
 
 @dataclass
@@ -163,13 +178,27 @@ class SklearnLikeModel:
     positive_rate: float
     baseline_estimator: Any = None
     baseline_model_name: Optional[str] = None
+    probability_calibrator: Any = None
 
     def predict_probability(self, features: Dict[str, float]) -> float:
-        row = [[features.get(name, 0.0) for name in self.feature_names]]
+        return self.predict_probabilities([features])[0]
+
+    def predict_probabilities(self, feature_rows: Sequence[Dict[str, float]]) -> List[float]:
+        rows = [
+            [features.get(name, 0.0) for name in self.feature_names]
+            for features in feature_rows
+        ]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            proba = self.estimator.predict_proba(row)[0][1]
-        return float(max(0.0, min(1.0, proba)))
+            probabilities = [float(row[1]) for row in self.estimator.predict_proba(rows)]
+            if self.probability_calibrator is not None:
+                probabilities = [
+                    float(row[1])
+                    for row in self.probability_calibrator.predict_proba(
+                        [[probability] for probability in probabilities]
+                    )
+                ]
+        return [max(0.0, min(1.0, probability)) for probability in probabilities]
 
     def predict_baseline_probability(self, features: Dict[str, float]) -> Optional[float]:
         if self.baseline_estimator is None:
@@ -214,6 +243,10 @@ class SklearnLikeModel:
         }
         if self.baseline_estimator is not None:
             payload["baseline_pickle_b64"] = base64.b64encode(pickle.dumps(self.baseline_estimator)).decode("ascii")
+        if self.probability_calibrator is not None:
+            payload["calibrator_pickle_b64"] = base64.b64encode(
+                pickle.dumps(self.probability_calibrator)
+            ).decode("ascii")
         return json.dumps(payload, ensure_ascii=False)
 
 
@@ -569,62 +602,29 @@ def add_cross_sectional_to_predictions(prediction_items: List[tuple[str, Dict[st
 
 
 def label_future(klines: Sequence[Kline], end_idx: int, horizon: int, cfg: Dict[str, Any]) -> Optional[tuple[int, float, float, float]]:
-    current = klines[end_idx]
-    future = list(klines[end_idx + 1 : end_idx + 1 + horizon])
-    if current.close in (None, 0) or len(future) < horizon:
+    outcome = simulate_trade(
+        klines,
+        end_idx,
+        horizon,
+        high_target_pct=float(cfg.get("positive_high_gain_pct", 0.05)),
+        close_target_pct=float(cfg.get("positive_close_gain_pct", 0.0)),
+        stop_loss_pct=float(
+            cfg.get("exit_stop_loss_pct", 0.10)
+            if cfg.get("use_trade_exit_rules", False)
+            else cfg.get("negative_drawdown_pct", 0.06)
+        ),
+        target_logic=str(cfg.get("positive_target_logic", "all")),
+        use_exit_rules=bool(cfg.get("use_trade_exit_rules", False)),
+        exit_on_break_ma20=bool(cfg.get("exit_on_break_ma20", True)),
+    )
+    if outcome is None:
         return None
-    highs = [k.high for k in future if k.high is not None]
-    lows = [k.low for k in future if k.low is not None]
-    closes = [k.close for k in future if k.close is not None]
-    if not highs or not lows or not closes:
-        return None
-    highest_gain = pct(max(highs), current.close)
-    max_drawdown = pct(min(lows), current.close)
-    high_target = float(cfg.get("positive_high_gain_pct", 0.05)) * 100
-    close_target = float(cfg.get("positive_close_gain_pct", 0.0)) * 100
-    target_logic = str(cfg.get("positive_target_logic", "all")).lower()
-
-    use_exit_rules = bool(cfg.get("use_trade_exit_rules", False))
-    close_gain = pct(closes[-1], current.close)
-    if use_exit_rules:
-        stop_loss_pct = float(cfg.get("exit_stop_loss_pct", 0.10))
-        exit_on_break_ma20 = bool(cfg.get("exit_on_break_ma20", True))
-        stop_price = float(current.close) * (1 - stop_loss_pct)
-        target_price = float(current.close) * (1 + high_target / 100)
-        exited = False
-        high_hit = False
-        for future_idx in range(end_idx + 1, end_idx + 1 + horizon):
-            day = klines[future_idx]
-            stop_hit = day.low is not None and day.low <= stop_price
-            target_hit_today = day.high is not None and day.high >= target_price
-            # Daily candles do not reveal intraday ordering. If both levels are
-            # touched, assume the stop happened first to avoid optimistic labels.
-            if stop_hit:
-                close_gain = -stop_loss_pct * 100
-                exited = True
-                break
-            if target_hit_today:
-                high_hit = True
-                close_gain = high_target
-                exited = True
-                break
-            if exit_on_break_ma20 and day.close is not None:
-                ma20 = moving_average(klines, future_idx, 20)
-                if ma20 and day.close < ma20:
-                    close_gain = pct(day.close, current.close)
-                    exited = True
-                    break
-        if not exited:
-            high_hit = highest_gain >= high_target
-        close_hit = close_gain >= close_target
-        target_hit = (high_hit or close_hit) if target_logic in {"any", "or"} else (high_hit and close_hit)
-        good = target_hit
-    else:
-        high_hit = highest_gain >= high_target
-        close_hit = close_gain >= close_target
-        target_hit = (high_hit or close_hit) if target_logic in {"any", "or"} else (high_hit and close_hit)
-        good = target_hit and max_drawdown > -float(cfg.get("negative_drawdown_pct", 0.06)) * 100
-    return int(good), highest_gain, close_gain, max_drawdown
+    return (
+        outcome.label,
+        outcome.highest_gain_pct,
+        outcome.realized_gain_pct,
+        outcome.max_drawdown_pct,
+    )
 
 
 def build_training_samples(
@@ -661,6 +661,7 @@ def build_training_samples(
                     future_high_gain_pct=high,
                     future_close_gain_pct=close,
                     future_max_drawdown_pct=drawdown,
+                    label_end_date=klines[idx + horizon].trade_date,
                 )
             )
     if cfg.get("use_cross_sectional_features", True):
@@ -718,15 +719,85 @@ def split_samples_by_time(samples: List[TrainingSample], train_ratio: float = 0.
     return ordered[:split_idx], ordered[split_idx:]
 
 
+def purged_walk_forward_splits(
+    samples: List[TrainingSample],
+    train_ratio: float = 0.7,
+    fold_count: int = 5,
+) -> List[WalkForwardFold]:
+    """Build expanding-window folds and purge labels unavailable at test start."""
+    if not samples:
+        return []
+    dates = sorted({sample.trade_date for sample in samples})
+    if len(dates) < 2:
+        return []
+
+    ratio = max(0.05, min(0.95, float(train_ratio)))
+    first_test_idx = max(1, min(len(dates) - 1, int(len(dates) * ratio)))
+    test_dates = dates[first_test_idx:]
+    use_folds = max(1, min(int(fold_count), len(test_dates)))
+    out: List[WalkForwardFold] = []
+
+    for fold_idx in range(use_folds):
+        start = fold_idx * len(test_dates) // use_folds
+        end = (fold_idx + 1) * len(test_dates) // use_folds
+        fold_dates = test_dates[start:end]
+        if not fold_dates:
+            continue
+        test_start = fold_dates[0]
+        prior = [sample for sample in samples if sample.trade_date < test_start]
+        train = [
+            sample
+            for sample in prior
+            if sample.label_end_date is None or str(sample.label_end_date) < test_start
+        ]
+        test_date_set = set(fold_dates)
+        test = sorted(
+            (sample for sample in samples if sample.trade_date in test_date_set),
+            key=lambda sample: (sample.trade_date, sample.code),
+        )
+        if train and test:
+            out.append(
+                WalkForwardFold(
+                    fold_no=len(out) + 1,
+                    train_samples=sorted(
+                        train,
+                        key=lambda sample: (sample.trade_date, sample.code),
+                    ),
+                    test_samples=test,
+                    test_start_date=test_start,
+                    test_end_date=fold_dates[-1],
+                    purged_train_count=len(prior) - len(train),
+                )
+            )
+    return out
+
+
 def evaluate_predictions(
     model_name: str,
     samples: List[TrainingSample],
     probabilities: List[float],
     train_count: int,
     top_k: int,
+    fold_count: int = 1,
+    avg_purged_train_count: int = 0,
 ) -> BacktestMetrics:
     if not samples:
-        return BacktestMetrics(model_name, train_count, 0, 0, 0, 0, 0, top_k, 0, 0, 0, 0)
+        return BacktestMetrics(
+            model_name=model_name,
+            train_count=train_count,
+            test_count=0,
+            positive_rate=0,
+            accuracy=0,
+            precision=0,
+            recall=0,
+            top_k=top_k,
+            top_k_hit_rate=0,
+            top_k_avg_close_gain_pct=0,
+            top_k_avg_high_gain_pct=0,
+            top_k_avg_max_drawdown_pct=0,
+            fold_count=fold_count,
+            avg_purged_train_count=avg_purged_train_count,
+        )
     predicted = [1 if p >= 0.5 else 0 for p in probabilities]
     labels = [s.label for s in samples]
     tp = sum(1 for y, p in zip(labels, predicted) if y == 1 and p == 1)
@@ -757,6 +828,9 @@ def evaluate_predictions(
         top_k_avg_close_gain_pct=mean(s.future_close_gain_pct for s in top) if top else 0.0,
         top_k_avg_high_gain_pct=mean(s.future_high_gain_pct for s in top) if top else 0.0,
         top_k_avg_max_drawdown_pct=mean(s.future_max_drawdown_pct for s in top) if top else 0.0,
+        fold_count=fold_count,
+        avg_purged_train_count=avg_purged_train_count,
+        brier_score=mean((probability - label) ** 2 for probability, label in zip(probabilities, labels)),
     )
 
 
@@ -794,6 +868,7 @@ def apply_training_label_overrides(
                 future_high_gain_pct=sample.future_high_gain_pct,
                 future_close_gain_pct=sample.future_close_gain_pct,
                 future_max_drawdown_pct=sample.future_max_drawdown_pct,
+                label_end_date=sample.label_end_date,
             )
         )
         sample_weights.append(float(use_weight))
@@ -809,32 +884,166 @@ def backtest_models(
     samples: List[TrainingSample],
     cfg: Dict[str, Any],
     feedback_labels: Optional[Dict[tuple[str, str], int]] = None,
+    rule_candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[BacktestMetrics]:
-    train_samples, test_samples = split_samples_by_time(
-        samples,
-        train_ratio=float(cfg.get("backtest_train_ratio", 0.7)),
-    )
-    if not train_samples or not test_samples:
-        raise RuntimeError("Not enough samples for ML backtest.")
-    sample_weights: Optional[List[float]] = None
-    if cfg.get("use_review_feedback_labels", False) and feedback_labels:
-        train_samples, sample_weights, _stats = apply_training_label_overrides(
-            train_samples,
-            feedback_labels,
-            weight=int(cfg.get("review_feedback_weight", 1)),
+    mode = str(cfg.get("backtest_mode", "purged_walk_forward")).lower()
+    if mode not in {"purged_walk_forward", "walk_forward"}:
+        train_samples, test_samples = split_samples_by_time(
+            samples,
+            train_ratio=float(cfg.get("backtest_train_ratio", 0.7)),
         )
+        folds = [
+            WalkForwardFold(
+                fold_no=1,
+                train_samples=train_samples,
+                test_samples=test_samples,
+                test_start_date=min((sample.trade_date for sample in test_samples), default=""),
+                test_end_date=max((sample.trade_date for sample in test_samples), default=""),
+                purged_train_count=0,
+            )
+        ]
+    else:
+        folds = purged_walk_forward_splits(
+            samples,
+            train_ratio=float(cfg.get("backtest_train_ratio", 0.7)),
+            fold_count=int(cfg.get("backtest_walk_forward_folds", 5)),
+        )
+    if not folds:
+        raise RuntimeError("Not enough samples for purged walk-forward ML backtest.")
+
     top_k = int(cfg.get("backtest_top_k", 10))
-    metrics: List[BacktestMetrics] = []
-
     baseline_name = str(cfg.get("baseline_model_name", "logistic_regression")).lower()
-    if baseline_name == "logistic_regression":
-        baseline = train_logistic_regression_model(train_samples, sample_weights=sample_weights)
-        baseline_probs = [baseline.predict_probability(s.features) for s in test_samples]
-        metrics.append(evaluate_predictions("logistic_regression", test_samples, baseline_probs, len(train_samples), top_k))
+    baseline_test: List[TrainingSample] = []
+    baseline_probs: List[float] = []
+    main_test: List[TrainingSample] = []
+    main_probs: List[float] = []
+    train_counts: List[int] = []
+    purged_counts: List[int] = []
+    e2e_test: List[TrainingSample] = []
+    e2e_scores: List[float] = []
 
-    main = train_model(train_samples, cfg, sample_weights=sample_weights)
-    main_probs = [main.predict_probability(s.features) for s in test_samples]
-    metrics.append(evaluate_predictions(str(cfg.get("model_name", "lightgbm")), test_samples, main_probs, len(train_samples), top_k))
+    for fold in folds:
+        train_samples = fold.train_samples
+        test_samples = fold.test_samples
+        sample_weights: Optional[List[float]] = None
+        if cfg.get("use_review_feedback_labels", False) and feedback_labels:
+            train_samples, sample_weights, _stats = apply_training_label_overrides(
+                train_samples,
+                feedback_labels,
+                weight=int(cfg.get("review_feedback_weight", 1)),
+            )
+        train_counts.append(len(train_samples))
+        purged_counts.append(fold.purged_train_count)
+
+        if baseline_name == "logistic_regression":
+            baseline = train_logistic_regression_model(
+                train_samples,
+                sample_weights=sample_weights,
+            )
+            baseline_test.extend(test_samples)
+            baseline_probs.extend(
+                baseline.predict_probabilities(
+                    [sample.features for sample in test_samples]
+                )
+            )
+
+        main_cfg = {**cfg, "baseline_model_name": "none"}
+        main = train_model(train_samples, main_cfg, sample_weights=sample_weights)
+        main_test.extend(test_samples)
+        if hasattr(main, "predict_probabilities"):
+            fold_main_probs = main.predict_probabilities(
+                [sample.features for sample in test_samples]
+            )
+        else:
+            fold_main_probs = [
+                main.predict_probability(sample.features)
+                for sample in test_samples
+            ]
+        main_probs.extend(fold_main_probs)
+
+        if rule_candidates:
+            sample_by_key = {
+                (sample.trade_date, sample.code): sample
+                for sample in test_samples
+            }
+            candidates_by_run: Dict[int, List[Dict[str, Any]]] = {}
+            for row in rule_candidates:
+                screen_date = str(row["screen_date"])
+                if fold.test_start_date <= screen_date <= fold.test_end_date:
+                    candidates_by_run.setdefault(int(row["run_id"]), []).append(row)
+            for run_id, rows in candidates_by_run.items():
+                available = [
+                    (row, sample_by_key.get((str(row["screen_date"]), str(row["code"]))))
+                    for row in rows
+                ]
+                available = [(row, sample) for row, sample in available if sample is not None]
+                if not available:
+                    continue
+                unique_scores = sorted({float(row["total_score"] or 0.0) for row, _ in available})
+                if len(unique_scores) <= 1:
+                    rule_percentiles = {score: 50.0 for score in unique_scores}
+                else:
+                    rule_percentiles = {
+                        score: idx * 100.0 / (len(unique_scores) - 1)
+                        for idx, score in enumerate(unique_scores)
+                    }
+                rule_weight = float(cfg.get("rule_score_weight", 0.35))
+                for row, sample in available:
+                    probability = main.predict_probability(sample.features)
+                    rule_score = rule_percentiles[float(row["total_score"] or 0.0)]
+                    blended = probability * 100.0 * (1.0 - rule_weight) + rule_score * rule_weight
+                    e2e_test.append(
+                        TrainingSample(
+                            code=sample.code,
+                            trade_date=f"{sample.trade_date}#{run_id}",
+                            features=sample.features,
+                            label=sample.label,
+                            future_high_gain_pct=sample.future_high_gain_pct,
+                            future_close_gain_pct=sample.future_close_gain_pct,
+                            future_max_drawdown_pct=sample.future_max_drawdown_pct,
+                            label_end_date=sample.label_end_date,
+                        )
+                    )
+                    e2e_scores.append(blended / 100.0)
+
+    avg_train_count = round(mean(train_counts))
+    avg_purged_count = round(mean(purged_counts))
+    metrics: List[BacktestMetrics] = []
+    if baseline_test:
+        metrics.append(
+            evaluate_predictions(
+                "logistic_regression",
+                baseline_test,
+                baseline_probs,
+                avg_train_count,
+                top_k,
+                fold_count=len(folds),
+                avg_purged_train_count=avg_purged_count,
+            )
+        )
+    metrics.append(
+        evaluate_predictions(
+            str(cfg.get("model_name", "lightgbm")),
+            main_test,
+            main_probs,
+            avg_train_count,
+            top_k,
+            fold_count=len(folds),
+            avg_purged_train_count=avg_purged_count,
+        )
+    )
+    if e2e_test:
+        metrics.append(
+            evaluate_predictions(
+                f"{cfg.get('model_name', 'lightgbm')}+rule_e2e",
+                e2e_test,
+                e2e_scores,
+                avg_train_count,
+                top_k,
+                fold_count=len(folds),
+                avg_purged_train_count=avg_purged_count,
+            )
+        )
     return metrics
 
 
@@ -885,7 +1094,20 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any], sam
             "pip install -r requirements.txt"
         ) from exc
 
-    x, y = sample_matrix(samples)
+    fit_samples = samples
+    calibration_samples: List[TrainingSample] = []
+    calibration_mode = str(cfg.get("probability_calibration", "none")).lower()
+    if calibration_mode == "sigmoid" and len(samples) >= 100:
+        calibration_folds = purged_walk_forward_splits(
+            samples,
+            train_ratio=1.0 - float(cfg.get("probability_calibration_ratio", 0.15)),
+            fold_count=1,
+        )
+        if calibration_folds:
+            fit_samples = calibration_folds[0].train_samples
+            calibration_samples = calibration_folds[0].test_samples
+
+    x, y = sample_matrix(fit_samples)
     if len(set(y)) < 2:
         raise RuntimeError("LightGBM needs both positive and negative training samples.")
     estimator = LGBMClassifier(
@@ -903,8 +1125,30 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any], sam
     )
     fit_kwargs: Dict[str, Any] = {}
     if sample_weights is not None:
-        fit_kwargs["sample_weight"] = sample_weights
+        weight_by_id = {
+            id(sample): weight
+            for sample, weight in zip(samples, sample_weights)
+        }
+        fit_kwargs["sample_weight"] = [
+            weight_by_id.get(id(sample), 1.0)
+            for sample in fit_samples
+        ]
     estimator.fit(x, y, **fit_kwargs)
+    calibrator = None
+    if calibration_samples and len({sample.label for sample in calibration_samples}) >= 2:
+        from sklearn.linear_model import LogisticRegression
+
+        calibration_matrix = [
+            [sample.features.get(name, 0.0) for name in FEATURE_NAMES]
+            for sample in calibration_samples
+        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            raw_calibration = estimator.predict_proba(calibration_matrix)
+        calibration_x = [[float(row[1])] for row in raw_calibration]
+        calibration_y = [sample.label for sample in calibration_samples]
+        calibrator = LogisticRegression(max_iter=1000, random_state=42)
+        calibrator.fit(calibration_x, calibration_y)
     baseline = None
     baseline_name = str(cfg.get("baseline_model_name", "logistic_regression"))
     if baseline_name == "logistic_regression":
@@ -915,6 +1159,7 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any], sam
         feature_names=list(FEATURE_NAMES),
         estimator=estimator,
         baseline_estimator=baseline,
+        probability_calibrator=calibrator,
         positive_rate=sum(y) / len(y),
     )
 

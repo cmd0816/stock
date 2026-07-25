@@ -53,6 +53,9 @@ review:
   stop_loss_pct: 0.06
   expected_high_gain_pct: 0.05
   expected_close_gain_pct: 0.02
+  positive_target_logic: any
+  use_trade_exit_rules: true
+  exit_on_break_ma20: false
   # 复盘前先补齐“被复盘 run 的所有入选股票”日 K，不再限制 Top N。
   download_before_review: true
   download_days: 365
@@ -73,7 +76,7 @@ ml:
   sample_stride: 5
   weekly_last_trading_day_only: true
   min_train_samples: 30
-  # 正样本定义对齐复盘：未来5天最高价≥5% 或 收盘≥2%，且回撤不触发6%止损
+  # 正样本定义与复盘共用交易模拟：先止损/止盈，未退出则看第5日收益。
   positive_high_gain_pct: 0.05
   positive_close_gain_pct: 0.02
   positive_target_logic: any
@@ -92,6 +95,12 @@ ml:
   review_feedback_recent_runs: 10
   backtest_train_ratio: 0.7
   backtest_top_k: 10
+  backtest_mode: purged_walk_forward
+  backtest_walk_forward_folds: 5
+  probability_calibration: sigmoid
+  probability_calibration_ratio: 0.15
+  training_sample_storage_mode: zlib
+  training_sample_keep_model_runs: 3
   lightgbm_n_estimators: 160
   lightgbm_learning_rate: 0.04
   lightgbm_num_leaves: 31

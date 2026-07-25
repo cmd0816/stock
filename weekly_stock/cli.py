@@ -114,16 +114,19 @@ def print_backtest_metrics(metrics: list) -> None:
     if not metrics:
         print("No ML backtest metrics generated.")
         return
-    print("model               train test positive accuracy precision recall top_k_hit avg_close avg_high avg_drawdown")
+    print("model               folds train purge test positive accuracy precision recall brier top_k_hit avg_exit  avg_high avg_drawdown")
     for item in metrics:
         print(
             f"{item.model_name:<18} "
+            f"{item.fold_count:>5} "
             f"{item.train_count:>5} "
+            f"{item.avg_purged_train_count:>5} "
             f"{item.test_count:>4} "
             f"{item.positive_rate * 100:>7.1f}% "
             f"{item.accuracy * 100:>7.1f}% "
             f"{item.precision * 100:>8.1f}% "
             f"{item.recall * 100:>5.1f}% "
+            f"{item.brier_score:>5.3f} "
             f"{item.top_k_hit_rate * 100:>8.1f}% "
             f"{item.top_k_avg_close_gain_pct:>8.2f}% "
             f"{item.top_k_avg_high_gain_pct:>7.2f}% "
@@ -136,8 +139,9 @@ def print_backtest_metrics(metrics: list) -> None:
         print(
             f"  • {item.model_name}: Top-{item.top_k} 命中率={item.top_k_hit_rate*100:.1f}% | "
             f"平均最高涨幅={item.top_k_avg_high_gain_pct:+.2f}% | "
-            f"平均收盘涨幅={item.top_k_avg_close_gain_pct:+.2f}% | "
-            f"平均最大回撤={item.top_k_avg_max_drawdown_pct:+.2f}%"
+            f"平均策略退出收益={item.top_k_avg_close_gain_pct:+.2f}% | "
+            f"平均最大回撤={item.top_k_avg_max_drawdown_pct:+.2f}% | "
+            f"{item.fold_count}折 walk-forward，平均 purge={item.avg_purged_train_count}"
         )
 
 
@@ -168,7 +172,7 @@ def print_trend_summary(rows: list, window: int) -> None:
         "rolling "
         f"{window}-run: "
         f"hit={hit_recent * 100:.1f}% ({(hit_recent - hit_prev) * 100:+.1f}ppt), "
-        f"avg_close={close_recent:.2f}% ({close_recent - close_prev:+.2f}%), "
+        f"avg_exit={close_recent:.2f}% ({close_recent - close_prev:+.2f}%), "
         f"avg_drawdown={drawdown_recent:.2f}% ({drawdown_recent - drawdown_prev:+.2f}%)"
     )
 
@@ -183,7 +187,7 @@ def print_review_trend(config_path: Path, config: dict, limit: int, window: int)
         print("No reviewed weekly runs found.")
         return
 
-    print("run_id screen_date selected reviewed hit stop_loss avg_close avg_high avg_drawdown ml_pred avg_prob")
+    print("run_id screen_date selected reviewed hit stop_loss avg_exit  avg_high avg_drawdown ml_pred avg_prob")
     for row in rows:
         hit = float(row["hit_rate"] or 0) * 100
         stop_loss = float(row["stop_loss_rate"] or 0) * 100
@@ -212,7 +216,7 @@ def print_review_trend(config_path: Path, config: dict, limit: int, window: int)
         print(
             "【实盘效果】最近一期: 命中率="
             f"{float(latest['hit_rate'] or 0)*100:.1f}% | "
-            f"平均收盘={float(latest['avg_close_gain_pct'] or 0):+.2f}% | "
+            f"平均策略退出={float(latest['avg_close_gain_pct'] or 0):+.2f}% | "
             f"平均最高={float(latest['avg_high_gain_pct'] or 0):+.2f}% | "
             f"止损率={float(latest['stop_loss_rate'] or 0)*100:.1f}%"
         )

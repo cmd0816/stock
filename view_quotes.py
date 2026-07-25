@@ -378,7 +378,7 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                         """
                         SELECT
                             CASE
-                                WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN '待复盘'
+                                WHEN is_complete = 0 THEN '待复盘'
                                 WHEN meets_expectation = 1 THEN '成功'
                                 ELSE '失败'
                             END AS result,
@@ -406,10 +406,10 @@ def fetch_dashboard_checks(db_path: Path, batch_id: str = "") -> Dict[str, Any]:
                         """
                         SELECT
                             COUNT(*) AS total_count,
-                            SUM(CASE WHEN review_start_date IS NULL OR notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
-                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
-                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count,
-                            SUM(CASE WHEN review_start_date IS NOT NULL AND notes NOT LIKE 'K线不足%' AND best_exit_meets_expectation = 1 THEN 1 ELSE 0 END) AS best_exit_success_count
+                            SUM(CASE WHEN is_complete = 0 THEN 1 ELSE 0 END) AS pending_count,
+                            SUM(CASE WHEN is_complete = 1 THEN 1 ELSE 0 END) AS reviewed_count,
+                            SUM(CASE WHEN is_complete = 1 AND meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count,
+                            SUM(CASE WHEN is_complete = 1 AND best_exit_meets_expectation = 1 THEN 1 ELSE 0 END) AS best_exit_success_count
                         FROM weekly_review_results
                         WHERE review_id = ?
                         """,
@@ -574,10 +574,10 @@ def fetch_weekly_review_history(
                 r.screen_date,
                 r.xuangu_batch_id,
                 COUNT(rr.id) AS total_count,
-                SUM(CASE WHEN rr.review_start_date IS NULL OR rr.notes LIKE 'K线不足%' THEN 1 ELSE 0 END) AS pending_count,
-                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' THEN 1 ELSE 0 END) AS reviewed_count,
-                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' AND rr.meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count,
-                SUM(CASE WHEN rr.review_start_date IS NOT NULL AND rr.notes NOT LIKE 'K线不足%' AND rr.best_exit_meets_expectation = 1 THEN 1 ELSE 0 END) AS best_exit_success_count
+                SUM(CASE WHEN rr.is_complete = 0 THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN rr.is_complete = 1 THEN 1 ELSE 0 END) AS reviewed_count,
+                SUM(CASE WHEN rr.is_complete = 1 AND rr.meets_expectation = 1 THEN 1 ELSE 0 END) AS success_count,
+                SUM(CASE WHEN rr.is_complete = 1 AND rr.best_exit_meets_expectation = 1 THEN 1 ELSE 0 END) AS best_exit_success_count
             FROM weekly_review_runs wr
             LEFT JOIN weekly_review_results rr
                 ON rr.review_id = wr.review_id
@@ -640,7 +640,7 @@ def fetch_weekly_review_history(
             )
             SELECT
                 CASE
-                    WHEN rr.review_start_date IS NULL OR rr.notes LIKE 'K线不足%' THEN '待复盘'
+                    WHEN rr.is_complete = 0 THEN '待复盘'
                     WHEN rr.meets_expectation = 1 THEN '成功'
                     ELSE '失败'
                 END AS result,
@@ -1484,7 +1484,7 @@ def build_reviews_html(review_data: Dict[str, Any], message: str = "", error: st
             ("ml_predicted_score", "ML综合分"),
             ("ml_probability_up", "ML概率"),
             ("highest_gain_pct", "最高涨幅%"),
-            ("close_gain_pct", "收盘涨幅%"),
+            ("close_gain_pct", "策略退出收益%"),
             ("max_drawdown_pct", "最大回撤%"),
             ("stop_loss_triggered", "止损"),
             ("meets_expectation", "符合预期"),
@@ -1502,7 +1502,7 @@ def build_reviews_html(review_data: Dict[str, Any], message: str = "", error: st
             f"待复盘 {int(selected_summary.get('pending_count') or 0)} / 总数 {int(selected_summary.get('total_count') or 0)}）"
             f" | 最佳退出成功率：{float(selected_summary.get('best_exit_success_rate_pct') or 0.0):.1f}%"
             f"（{int(selected_summary.get('best_exit_success_count') or 0)} / 完成复盘）"
-            "<br><small>成功标准：未来5日最高价≥3% 且 收盘≥-2% 且 回撤≤10%</small>"
+            "<br><small>成功标准：采用该次复盘保存的逐日止盈、止损和持有期退出规则。</small>"
             "</div>"
         )
     msg_html = f"<div class='notice ok'>{html.escape(message)}</div>" if message else ""

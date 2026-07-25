@@ -6,7 +6,12 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from weekly_stock.config import DEFAULT_CONFIG
-from weekly_stock.db import connect, ensure_weekly_tables, review_feedback_labels
+from weekly_stock.db import (
+    connect,
+    ensure_weekly_tables,
+    latest_selected_run_without_review,
+    review_feedback_labels,
+)
 from weekly_stock.jobs import (
     apply_review_feedback_labels,
     download_review_history_for_selected_stocks,
@@ -16,7 +21,13 @@ from weekly_stock.jobs import (
     stock_screen_job,
     stock_screen_preview_job,
 )
-from weekly_stock.ml import TrainingSample, build_training_samples, evaluate_predictions, label_future
+from weekly_stock.ml import (
+    TrainingSample,
+    build_training_samples,
+    evaluate_predictions,
+    label_future,
+    purged_walk_forward_splits,
+)
 from weekly_stock.models import Kline
 from weekly_stock.trading_calendar import align_to_last_trading_day, weekly_last_trading_days
 
@@ -295,7 +306,12 @@ class WeeklyStockTests(unittest.TestCase):
             Kline("2026-05-05", 10.5, 10.8, 11.2, 10.1, 1300, 7, 3),
         ]
         selected = {"code": "000001", "name": "测试", "screen_date": "2026-05-02"}
-        result = review_selected_stock(klines, selected, DEFAULT_CONFIG)
+        config = {
+            **DEFAULT_CONFIG,
+            "review": {**DEFAULT_CONFIG["review"], "horizon_trading_days": 2},
+        }
+        result = review_selected_stock(klines, selected, config)
+        self.assertTrue(result.is_complete)
         self.assertAlmostEqual(result.highest_gain_pct or 0, 12.0)
         self.assertFalse(result.stop_loss_triggered)
         self.assertTrue(result.meets_expectation)
@@ -309,11 +325,103 @@ class WeeklyStockTests(unittest.TestCase):
             Kline("2026-05-05", 9.8, 9.6, 10.1, 9.2, 1300, 7, -2),
         ]
         selected = {"code": "000001", "name": "测试", "screen_date": "2026-05-02"}
-        result = review_selected_stock(klines, selected, DEFAULT_CONFIG)
+        config = {
+            **DEFAULT_CONFIG,
+            "review": {**DEFAULT_CONFIG["review"], "horizon_trading_days": 2},
+        }
+        result = review_selected_stock(klines, selected, config)
+        self.assertTrue(result.is_complete)
         self.assertFalse(result.meets_expectation)
         self.assertTrue(result.stop_loss_triggered)
         self.assertIn("失败原因", result.notes)
         self.assertIn("触发止损线", result.notes)
+
+    def test_review_selected_stock_is_incomplete_before_full_horizon(self) -> None:
+        klines = [
+            Kline("2026-05-01", 10, 10, 10.2, 9.8, 1000, 5, 0),
+            Kline("2026-05-04", 10, 10.5, 11.0, 9.7, 1200, 6, 5),
+            Kline("2026-05-05", 10.5, 10.8, 11.2, 10.1, 1300, 7, 3),
+        ]
+        selected = {"code": "000001", "name": "测试", "screen_date": "2026-05-02"}
+
+        result = review_selected_stock(klines, selected, DEFAULT_CONFIG)
+
+        self.assertFalse(result.is_complete)
+        self.assertIsNone(result.highest_gain_pct)
+        self.assertIsNone(result.close_gain_pct)
+        self.assertIsNone(result.max_drawdown_pct)
+        self.assertFalse(result.meets_expectation)
+        self.assertIn("2/5 个交易日", result.notes)
+
+    def test_review_and_ml_agree_when_take_profit_precedes_later_stop(self) -> None:
+        klines = [
+            Kline("2026-05-01", 10, 10, 10.1, 9.9, 1000, 5, 0),
+            Kline("2026-05-04", 10, 10.5, 10.6, 9.8, 1000, 5, 5),
+            Kline("2026-05-05", 10.5, 9.3, 10.5, 9.2, 1000, 5, -11),
+        ]
+        review_config = {
+            **DEFAULT_CONFIG,
+            "review": {**DEFAULT_CONFIG["review"], "horizon_trading_days": 2},
+        }
+        review = review_selected_stock(
+            klines,
+            {"code": "000001", "name": "测试", "screen_date": "2026-05-01"},
+            review_config,
+        )
+        ml_label = label_future(
+            klines,
+            0,
+            2,
+            {
+                "use_trade_exit_rules": True,
+                "exit_stop_loss_pct": 0.06,
+                "positive_high_gain_pct": 0.05,
+                "positive_close_gain_pct": 0.02,
+                "positive_target_logic": "any",
+                "exit_on_break_ma20": False,
+            },
+        )
+
+        self.assertTrue(review.meets_expectation)
+        self.assertFalse(review.stop_loss_triggered)
+        self.assertAlmostEqual(review.close_gain_pct or 0, 5.0)
+        self.assertEqual((ml_label or (0,))[0], 1)
+        self.assertAlmostEqual((ml_label or (0, 0, 0))[2], review.close_gain_pct or 0)
+
+    def test_review_and_ml_agree_when_stop_precedes_later_target(self) -> None:
+        klines = [
+            Kline("2026-05-01", 10, 10, 10.1, 9.9, 1000, 5, 0),
+            Kline("2026-05-04", 10, 9.5, 10.0, 9.3, 1000, 5, -5),
+            Kline("2026-05-05", 9.5, 10.7, 11.0, 9.5, 1000, 5, 12),
+        ]
+        review_config = {
+            **DEFAULT_CONFIG,
+            "review": {**DEFAULT_CONFIG["review"], "horizon_trading_days": 2},
+        }
+        review = review_selected_stock(
+            klines,
+            {"code": "000001", "name": "测试", "screen_date": "2026-05-01"},
+            review_config,
+        )
+        ml_label = label_future(
+            klines,
+            0,
+            2,
+            {
+                "use_trade_exit_rules": True,
+                "exit_stop_loss_pct": 0.06,
+                "positive_high_gain_pct": 0.05,
+                "positive_close_gain_pct": 0.02,
+                "positive_target_logic": "any",
+                "exit_on_break_ma20": False,
+            },
+        )
+
+        self.assertFalse(review.meets_expectation)
+        self.assertTrue(review.stop_loss_triggered)
+        self.assertAlmostEqual(review.close_gain_pct or 0, -6.0)
+        self.assertEqual((ml_label or (1,))[0], 0)
+        self.assertAlmostEqual((ml_label or (0, 0, 0))[2], review.close_gain_pct or 0)
 
     def test_ml_predict_job_saves_predictions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -543,9 +651,10 @@ class WeeklyStockTests(unittest.TestCase):
                     INSERT INTO weekly_review_results (
                         review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
                         highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered,
-                        meets_expectation, best_exit_meets_expectation, notes, created_at_utc
+                        meets_expectation, best_exit_meets_expectation, is_complete,
+                        simulation_version, notes, created_at_utc
                     ) VALUES (?, ?, '000001', '完整', '2026-05-01', '2026-05-04', '2026-05-08',
-                        6, 3, -2, 0, 1, 1, 'ok', 'now')
+                        6, 3, -2, 0, 1, 1, 1, 'daily_exit_v1', 'ok', 'now')
                     """,
                     (review_id, selected_ids[0]),
                 )
@@ -554,9 +663,9 @@ class WeeklyStockTests(unittest.TestCase):
                     INSERT INTO weekly_review_results (
                         review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
                         highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered,
-                        meets_expectation, best_exit_meets_expectation, notes, created_at_utc
+                        meets_expectation, best_exit_meets_expectation, is_complete, notes, created_at_utc
                     ) VALUES (?, ?, '000002', '缺K', '2026-05-01', NULL, NULL,
-                        NULL, NULL, NULL, 0, 0, 0, 'K线不足', 'now')
+                        NULL, NULL, NULL, 0, 0, 0, 0, 'K线不足', 'now')
                     """,
                     (review_id, selected_ids[1]),
                 )
@@ -667,8 +776,9 @@ class WeeklyStockTests(unittest.TestCase):
                     INSERT INTO weekly_review_results (
                         review_id, selected_id, code, name, base_trade_date, review_start_date, review_end_date,
                         highest_gain_pct, close_gain_pct, max_drawdown_pct, stop_loss_triggered, meets_expectation,
-                        notes, created_at_utc
-                    ) VALUES (?, ?, ?, '测试', ?, ?, ?, 0, 0, 0, 0, ?, 'test', ?)
+                        is_complete, simulation_version, notes, created_at_utc
+                    ) VALUES (?, ?, ?, '测试', ?, ?, ?, 0, 0, 0, 0, ?, 1,
+                        'daily_exit_v1', 'test', ?)
                     """,
                     (
                         review_id,
@@ -707,6 +817,76 @@ class WeeklyStockTests(unittest.TestCase):
                 ).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(int(row["label"]), int(flipped_label))
+
+    def test_incomplete_review_run_remains_pending_until_all_results_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stocks.db"
+            with connect(db_path) as conn:
+                create_source_tables(conn)
+                ensure_weekly_tables(conn)
+                run_id = conn.execute(
+                    """
+                    INSERT INTO weekly_screen_runs (
+                        screen_date, xuangu_batch_id, strategy_config_json, screening_text,
+                        candidate_count, selected_count, created_at_utc
+                    ) VALUES ('2026-05-01', 'b1', '{}', '', 1, 1, 'now')
+                    """
+                ).lastrowid
+                selected_id = conn.execute(
+                    """
+                    INSERT INTO weekly_selected_stocks (
+                        run_id, screen_date, code, name, rank_no, total_score,
+                        selected_reason, created_at_utc
+                    ) VALUES (?, '2026-05-01', '000001', '测试', 1, 80, 'test', 'now')
+                    """,
+                    (run_id,),
+                ).lastrowid
+                partial_review_id = conn.execute(
+                    """
+                    INSERT INTO weekly_review_runs (
+                        reviewed_run_id, review_date, config_json, created_at_utc
+                    ) VALUES (?, '2026-05-05', '{}', 'now')
+                    """,
+                    (run_id,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO weekly_review_results (
+                        review_id, selected_id, code, name, base_trade_date,
+                        stop_loss_triggered, meets_expectation,
+                        best_exit_meets_expectation, is_complete, notes, created_at_utc
+                    ) VALUES (?, ?, '000001', '测试', '2026-05-01', 0, 0, 0, 0,
+                        '共 2/5 个交易日', 'now')
+                    """,
+                    (partial_review_id, selected_id),
+                )
+                conn.commit()
+                self.assertEqual(latest_selected_run_without_review(conn), run_id)
+
+                complete_review_id = conn.execute(
+                    """
+                    INSERT INTO weekly_review_runs (
+                        reviewed_run_id, review_date, config_json, created_at_utc
+                    ) VALUES (?, '2026-05-08', '{}', 'now')
+                    """,
+                    (run_id,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO weekly_review_results (
+                        review_id, selected_id, code, name, base_trade_date,
+                        review_start_date, review_end_date, highest_gain_pct,
+                        close_gain_pct, max_drawdown_pct, stop_loss_triggered,
+                        meets_expectation, best_exit_meets_expectation,
+                        is_complete, notes, created_at_utc
+                    ) VALUES (?, ?, '000001', '测试', '2026-05-01',
+                        '2026-05-04', '2026-05-08', 6, 3, -2, 0, 1, 1, 1,
+                        '共 5/5 个交易日', 'now')
+                    """,
+                    (complete_review_id, selected_id),
+                )
+                conn.commit()
+                self.assertIsNone(latest_selected_run_without_review(conn))
 
     def test_ml_backtest_job_returns_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -768,6 +948,48 @@ class WeeklyStockTests(unittest.TestCase):
         # One row is selected from each date: hit on 2026-05-01 and miss on 2026-05-08.
         self.assertAlmostEqual(metrics.top_k_hit_rate, 0.5)
         self.assertAlmostEqual(metrics.top_k_avg_close_gain_pct, 1.0)
+
+    def test_purged_walk_forward_removes_overlapping_training_labels(self) -> None:
+        def sample(trade_date: str, label_end_date: str) -> TrainingSample:
+            return TrainingSample(
+                code=trade_date,
+                trade_date=trade_date,
+                features={},
+                label=1,
+                future_high_gain_pct=5.0,
+                future_close_gain_pct=2.0,
+                future_max_drawdown_pct=-1.0,
+                label_end_date=label_end_date,
+            )
+
+        samples = [
+            sample("2026-01-02", "2026-01-09"),
+            sample("2026-01-09", "2026-01-16"),
+            sample("2026-01-16", "2026-01-23"),
+            sample("2026-01-23", "2026-01-30"),
+            sample("2026-01-30", "2026-02-06"),
+            sample("2026-02-06", "2026-02-13"),
+        ]
+
+        folds = purged_walk_forward_splits(samples, train_ratio=0.5, fold_count=2)
+
+        self.assertEqual(len(folds), 2)
+        self.assertEqual(folds[0].test_start_date, "2026-01-23")
+        self.assertEqual(
+            [row.trade_date for row in folds[0].train_samples],
+            ["2026-01-02", "2026-01-09"],
+        )
+        self.assertEqual(folds[0].purged_train_count, 1)
+        tested_dates = [
+            row.trade_date
+            for fold in folds
+            for row in fold.test_samples
+        ]
+        self.assertEqual(
+            tested_dates,
+            ["2026-01-23", "2026-01-30", "2026-02-06"],
+        )
+        self.assertEqual(len(tested_dates), len(set(tested_dates)))
 
     def test_trading_calendar_aligns_to_latest_trade_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
