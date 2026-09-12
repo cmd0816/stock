@@ -18,6 +18,7 @@ from weekly_stock.jobs import (
     ml_backtest_job,
     ml_predict_job,
     review_selected_stock,
+    select_screen_candidates,
     stock_screen_job,
     stock_screen_preview_job,
 )
@@ -28,7 +29,7 @@ from weekly_stock.ml import (
     label_future,
     purged_walk_forward_splits,
 )
-from weekly_stock.models import Kline
+from weekly_stock.models import CandidateStock, Kline, ScoreBreakdown, ScoredStock
 from weekly_stock.trading_calendar import align_to_last_trading_day, weekly_last_trading_days
 
 
@@ -161,6 +162,49 @@ def insert_kline_on_date(
 
 
 class WeeklyStockTests(unittest.TestCase):
+    def test_screen_selection_reserves_momentum_exception_slot(self) -> None:
+        def scored(code: str, total_parts: tuple[float, float, float, float, float], revenue: float) -> ScoredStock:
+            trend, volume, breakout, fundamentals, risk = total_parts
+            return ScoredStock(
+                candidate=CandidateStock(
+                    code=code,
+                    name=f"股票{code}",
+                    batch_id="b1",
+                    row_json={"营业收入同比增长率": f"{revenue}%"},
+                ),
+                score=ScoreBreakdown(
+                    trend=trend,
+                    volume_turnover=volume,
+                    breakout=breakout,
+                    fundamentals=fundamentals,
+                    risk=risk,
+                ),
+                selected_reason="测试",
+            )
+
+        ranked = [
+            scored("000001", (30, 20, 20, 15, 15), 20),
+            scored("000002", (30, 20, 20, 15, 10), 15),
+            scored("600108", (30, 20, 13.33, 0, 10), -2.63),
+            scored("000004", (30, 10, 20, 0, 15), -5),
+        ]
+        config = {
+            **DEFAULT_CONFIG,
+            "screening": {
+                **DEFAULT_CONFIG["screening"],
+                "top_n": 3,
+                "core_top_n": 2,
+                "momentum_exception_n": 1,
+                "min_score": 60,
+            },
+        }
+
+        selected, exceptions = select_screen_candidates(ranked, config)
+
+        self.assertEqual([item.candidate.code for item in selected], ["000001", "000002", "600108"])
+        self.assertEqual([item.candidate.code for item in exceptions], ["600108"])
+        self.assertIn("强势例外通道入选", selected[-1].selected_reason)
+
     def test_stock_screen_job_saves_top_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import db
-from .models import Kline, ReviewResult
+from .models import Kline, ReviewResult, ScoredStock
 from .ml import (
     TrainingSample,
     add_cross_sectional_to_predictions,
@@ -19,7 +19,7 @@ from .ml import (
     split_samples_by_time,
     train_model,
 )
-from .scoring import rank_candidates
+from .scoring import rank_candidates, row_value
 from .trade_simulator import simulate_trade
 from .trading_calendar import align_to_last_trading_day
 
@@ -82,6 +82,91 @@ def normalized_rule_scores(rows: List[Any], enabled: bool = True) -> Dict[str, f
         for rank, score in enumerate(unique_scores)
     }
     return {code: percentile_by_score[score] for code, score in raw_by_code.items()}
+
+
+def momentum_strength(item: ScoredStock) -> float:
+    score = item.score
+    return score.trend + score.volume_turnover + score.breakout + score.risk + score.tie_breaker
+
+
+def revenue_growth_value(item: ScoredStock) -> Optional[float]:
+    return row_value(item.candidate.row_json, ["营业", "同比"])
+
+
+def misses_revenue_target(item: ScoredStock, config: Dict[str, Any]) -> bool:
+    revenue_growth = revenue_growth_value(item)
+    if revenue_growth is None:
+        return False
+    revenue_min = float(config["scoring"]["fundamentals"]["revenue_growth_min"])
+    return revenue_growth < revenue_min
+
+
+def qualifies_for_momentum_exception(item: ScoredStock, config: Dict[str, Any]) -> bool:
+    cfg = config.get("momentum_exception", {})
+    score = item.score
+    name = str(item.candidate.name or "").upper()
+    if "ST" in name or "退" in name:
+        return False
+    if score.trend < float(cfg.get("min_trend_score", 30)):
+        return False
+    if score.volume_turnover < float(cfg.get("min_volume_turnover_score", 20)):
+        return False
+    if score.breakout < float(cfg.get("min_breakout_score", 13.33)):
+        return False
+
+    if bool(cfg.get("require_revenue_below_min", True)):
+        revenue_growth = revenue_growth_value(item)
+        if revenue_growth is None:
+            return bool(cfg.get("include_missing_revenue", False))
+        if not misses_revenue_target(item, config):
+            return False
+    return True
+
+
+def select_screen_candidates(
+    ranked: List[ScoredStock], config: Dict[str, Any]
+) -> tuple[List[ScoredStock], List[ScoredStock]]:
+    """Select the composite core plus a small, explicitly marked momentum sleeve."""
+    screening = config["screening"]
+    top_n = max(0, int(screening["top_n"]))
+    min_score = float(screening.get("min_score", 0))
+    eligible = [item for item in ranked if item.score.total >= min_score]
+
+    exception_n = max(0, min(top_n, int(screening.get("momentum_exception_n", 0) or 0)))
+    configured_core_n = screening.get("core_top_n")
+    core_n = top_n - exception_n if configured_core_n is None else int(configured_core_n)
+    core_n = max(0, min(top_n - exception_n, core_n))
+    core_candidates = (
+        [item for item in eligible if not misses_revenue_target(item, config)]
+        if exception_n
+        else eligible
+    )
+    core = core_candidates[:core_n]
+    core_codes = {item.candidate.code for item in core}
+
+    exception_pool = [
+        item
+        for item in ranked
+        if item.candidate.code not in core_codes and qualifies_for_momentum_exception(item, config)
+    ]
+    exception_pool.sort(key=momentum_strength, reverse=True)
+    exceptions = exception_pool[:exception_n]
+    for item in exceptions:
+        if "强势例外通道入选" not in item.selected_reason:
+            item.selected_reason = f"{item.selected_reason}；强势例外通道入选"
+
+    selected = core + exceptions
+    selected_codes = {item.candidate.code for item in selected}
+    for item in core_candidates:
+        if len(selected) >= top_n:
+            break
+        if item.candidate.code not in selected_codes:
+            selected.append(item)
+            selected_codes.add(item.candidate.code)
+
+    if len(selected) < min(top_n, 3):
+        selected = ranked[:top_n]
+    return selected, exceptions
 
 
 def download_review_history_for_selected_stocks(
@@ -218,11 +303,7 @@ def build_screen_selection(
             for c in candidates
         }
         ranked = rank_candidates(candidates, klines_by_code, config)
-        top_n = int(config["screening"]["top_n"])
-        min_score = float(config["screening"].get("min_score", 0))
-        selected = [item for item in ranked if item.score.total >= min_score][:top_n]
-        if len(selected) < min(top_n, 3):
-            selected = ranked[:top_n]
+        selected, momentum_exceptions = select_screen_candidates(ranked, config)
 
         return {
             "screen_date": effective_screen_date,
@@ -231,6 +312,7 @@ def build_screen_selection(
             "selected_count": len(selected),
             "ranked": ranked,
             "selected": selected,
+            "momentum_exceptions": momentum_exceptions,
         }
 
 
@@ -292,7 +374,12 @@ def stock_screen_job(
             candidate_count=int(result["candidate_count"]),
             selected_count=len(selected),
         )
-        db.save_screen_results(conn, run_id, ranked, len(selected))
+        db.save_screen_results(
+            conn,
+            run_id,
+            ranked,
+            selected_codes=[item.candidate.code for item in selected],
+        )
         return run_id
 
 

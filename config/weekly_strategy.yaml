@@ -7,8 +7,19 @@ paths:
 
 screening:
   top_n: 20
+  # Keep most slots on the composite ranking, while reserving a few for
+  # technically strong stocks whose latest revenue growth misses the target.
+  core_top_n: 17
+  momentum_exception_n: 3
   min_score: 60
   run_xuangu: false
+
+momentum_exception:
+  require_revenue_below_min: true
+  include_missing_revenue: false
+  min_trend_score: 30
+  min_volume_turnover_score: 20
+  min_breakout_score: 13.33
 
 calendar:
   align_to_china_trading_day: true
@@ -46,7 +57,7 @@ scoring:
     stop_loss_pct: 0.06
     max_daily_drop_pct: -5
     max_atr_pct: 8
-    max_5d_gain_pct: 15
+    max_5d_gain_pct: 20
 
 review:
   horizon_trading_days: 5

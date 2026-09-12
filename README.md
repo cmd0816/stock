@@ -99,6 +99,8 @@ BROWSER_HEADED=1 ./run_weekly.sh
   preview --date 2026-07-03 --xuangu-batch-id 20260704
 ```
 
+默认最终名单采用双通道：17 只按综合分入选，3 只保留给营收增速未达标但趋势、量价和突破分均达标的强势股。例外入选会在原因中标记“强势例外通道入选”；名额不足时由综合榜顺延补齐。相关阈值在 `config/weekly_strategy.yaml` 的 `screening` 和 `momentum_exception` 中配置。
+
 ## 常用命令
 
 ```bash

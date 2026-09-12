@@ -8,7 +8,20 @@ from typing import Any, Dict
 DEFAULT_CONFIG: Dict[str, Any] = {
     "database": {"path": "stocks.db"},
     "paths": {"screening_file": "screening.txt", "download_dir": "downloads"},
-    "screening": {"top_n": 4, "min_score": 60, "run_xuangu": False},
+    "screening": {
+        "top_n": 4,
+        "core_top_n": None,
+        "momentum_exception_n": 0,
+        "min_score": 60,
+        "run_xuangu": False,
+    },
+    "momentum_exception": {
+        "require_revenue_below_min": True,
+        "include_missing_revenue": False,
+        "min_trend_score": 30,
+        "min_volume_turnover_score": 20,
+        "min_breakout_score": 13.33,
+    },
     "calendar": {
         "align_to_china_trading_day": True,
         "prefer_akshare": True,
@@ -30,7 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "stop_loss_pct": 0.06,
             "max_daily_drop_pct": -5,
             "max_atr_pct": 8,
-            "max_5d_gain_pct": 15,
+            "max_5d_gain_pct": 20,
         },
     },
     "review": {

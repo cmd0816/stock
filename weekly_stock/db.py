@@ -519,10 +519,23 @@ def delete_all_screen_runs(conn: sqlite3.Connection, *, preserve_review_results:
     return len(run_ids)
 
 
-def save_screen_results(conn: sqlite3.Connection, run_id: int, scored: List[ScoredStock], top_n: int) -> None:
+def save_screen_results(
+    conn: sqlite3.Connection,
+    run_id: int,
+    scored: List[ScoredStock],
+    top_n: int = 0,
+    selected_codes: Optional[List[str]] = None,
+) -> None:
+    selected_rank_by_code = {
+        code: rank for rank, code in enumerate(selected_codes or [], start=1)
+    }
     for rank, item in enumerate(scored, start=1):
         score = item.score
-        selected = 1 if rank <= top_n else 0
+        code = item.candidate.code
+        if selected_codes is None:
+            selected = 1 if rank <= top_n else 0
+        else:
+            selected = 1 if code in selected_rank_by_code else 0
         conn.execute(
             """
             INSERT INTO weekly_screen_candidates (
@@ -549,6 +562,7 @@ def save_screen_results(conn: sqlite3.Connection, run_id: int, scored: List[Scor
             ),
         )
         if selected:
+            selected_rank = selected_rank_by_code.get(code, rank)
             conn.execute(
                 """
                 INSERT INTO weekly_selected_stocks (
@@ -562,7 +576,7 @@ def save_screen_results(conn: sqlite3.Connection, run_id: int, scored: List[Scor
                     run_id,
                     item.candidate.code,
                     item.candidate.name,
-                    rank,
+                    selected_rank,
                     score.total,
                     item.selected_reason,
                     utc_now(),
