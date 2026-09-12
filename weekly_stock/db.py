@@ -732,6 +732,7 @@ def review_feedback_labels(
     conn: sqlite3.Connection,
     recent_runs: int = 0,
     as_of_date: Optional[str] = None,
+    simulation_version: str = "daily_exit_v1",
 ) -> Dict[Tuple[str, str], int]:
     cutoff_sql = "WHERE review_date < ?" if as_of_date else ""
     cutoff_params: List[Any] = [str(as_of_date)] if as_of_date else []
@@ -759,14 +760,14 @@ def review_feedback_labels(
             WHERE rr.base_trade_date IS NOT NULL
               AND rr.base_trade_date <> ''
               AND rr.is_complete = 1
-              AND rr.simulation_version = 'daily_exit_v1'
+              AND rr.simulation_version = ?
               AND rr.review_start_date IS NOT NULL
               AND rr.review_end_date IS NOT NULL
               AND rr.highest_gain_pct IS NOT NULL
               AND rr.close_gain_pct IS NOT NULL
               AND rr.max_drawdown_pct IS NOT NULL
             """,
-            (*cutoff_params, int(recent_runs)),
+            (*cutoff_params, int(recent_runs), simulation_version),
         ).fetchall()
     else:
         rows = conn.execute(
@@ -784,14 +785,14 @@ def review_feedback_labels(
             WHERE rr.base_trade_date IS NOT NULL
               AND rr.base_trade_date <> ''
               AND rr.is_complete = 1
-              AND rr.simulation_version = 'daily_exit_v1'
+              AND rr.simulation_version = ?
               AND rr.review_start_date IS NOT NULL
               AND rr.review_end_date IS NOT NULL
               AND rr.highest_gain_pct IS NOT NULL
               AND rr.close_gain_pct IS NOT NULL
               AND rr.max_drawdown_pct IS NOT NULL
             """,
-            cutoff_params,
+            [*cutoff_params, simulation_version],
         ).fetchall()
     return {
         (str(row["code"]), str(row["base_trade_date"])): int(row["meets_expectation"])
@@ -815,9 +816,10 @@ def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
 def rule_backtest_candidates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT c.run_id, r.screen_date, c.code, c.total_score, c.rank_no
+        SELECT c.run_id, r.screen_date, c.code, c.total_score, s.rank_no
         FROM weekly_screen_candidates c
         JOIN weekly_screen_runs r ON r.run_id = c.run_id
+        JOIN weekly_selected_stocks s ON s.run_id = c.run_id AND s.code = c.code
         WHERE c.selected = 1
         ORDER BY r.screen_date, c.run_id, c.rank_no
         """
@@ -1445,7 +1447,7 @@ def save_review_results(conn: sqlite3.Connection, review_id: int, selected_rows:
                 int(result.meets_expectation),
                 int(result.best_exit_meets_expectation),
                 int(result.is_complete),
-                "daily_exit_v1",
+                result.simulation_version,
                 result.notes,
                 utc_now(),
             ),

@@ -101,6 +101,12 @@ else
   echo
 fi
 
+if [[ "${SKIP_MARKET_HISTORY:-0}" != "1" ]]; then
+  echo "Refresh the full modeling universe before scoring and ML..."
+  "$VENV_PY" -u "$SCRIPT_DIR/refresh_market_history.py" --db "$DB_PATH" \
+    --config "$CONFIG_PATH" --end-date "$ALIGNED_SCREEN_DATE"
+fi
+
 if [[ "${SKIP_BATCH_HISTORY:-0}" != "1" ]]; then
   echo "Step 3/7: Refresh latest batch daily K-line (BaoStock first, AKShare fallback) and ML context..."
   BATCH_HISTORY_ARGS=(

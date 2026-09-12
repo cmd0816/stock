@@ -20,7 +20,8 @@ from .ml import (
     train_model,
 )
 from .scoring import rank_candidates, row_value
-from .trade_simulator import simulate_trade
+from .trade_simulator import simulate_trade, execution_options, simulation_version
+from .data_quality import require_market_coverage
 from .trading_calendar import align_to_last_trading_day
 
 
@@ -130,23 +131,24 @@ def select_screen_candidates(
     screening = config["screening"]
     top_n = max(0, int(screening["top_n"]))
     min_score = float(screening.get("min_score", 0))
-    eligible = [item for item in ranked if item.score.total >= min_score]
+    eligible = [
+        item for item in ranked
+        if item.score.total >= min_score
+        and not any(flag in (item.candidate.name or '').upper() for flag in ('ST', '退'))
+    ]
 
     exception_n = max(0, min(top_n, int(screening.get("momentum_exception_n", 0) or 0)))
     configured_core_n = screening.get("core_top_n")
     core_n = top_n - exception_n if configured_core_n is None else int(configured_core_n)
     core_n = max(0, min(top_n - exception_n, core_n))
-    core_candidates = (
-        [item for item in eligible if not misses_revenue_target(item, config)]
-        if exception_n
-        else eligible
-    )
+    # Revenue is a score, not a second hard filter on the composite core.
+    core_candidates = eligible
     core = core_candidates[:core_n]
     core_codes = {item.candidate.code for item in core}
 
     exception_pool = [
         item
-        for item in ranked
+        for item in eligible
         if item.candidate.code not in core_codes and qualifies_for_momentum_exception(item, config)
     ]
     exception_pool.sort(key=momentum_strength, reverse=True)
@@ -164,8 +166,6 @@ def select_screen_candidates(
             selected.append(item)
             selected_codes.add(item.candidate.code)
 
-    if len(selected) < min(top_n, 3):
-        selected = ranked[:top_n]
     return selected, exceptions
 
 
@@ -445,7 +445,7 @@ def weekly_review_job(
 def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[int] = None) -> int:
     root = project_root(config_path)
     db_path = root / config["database"]["path"]
-    ml_cfg = config.get("ml", {})
+    ml_cfg = {**config.get("ml", {}), **config.get("execution", {})}
     with db.connect(db_path) as conn:
         db.ensure_weekly_tables(conn)
         source_run_id = run_id if run_id is not None else db.latest_selected_run(conn)
@@ -456,6 +456,8 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
         if not selected_rows:
             raise RuntimeError(f"Run {source_run_id} has no selected stocks.")
         screen_date = str(selected_rows[0]["screen_date"])
+
+        require_market_coverage(conn, screen_date, ml_cfg)
 
         train_codes = db.all_downloaded_codes(conn)
         if ml_cfg.get("train_on_selected_universe", False):
@@ -469,6 +471,14 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
             )
             for code in train_codes
         }
+        unavailable = [
+            str(row['code']) for row in selected_rows
+            if not klines_by_code.get(str(row['code']))
+            or klines_by_code[str(row['code'])][-1].trade_date != screen_date
+            or features_at(klines_by_code[str(row['code'])], len(klines_by_code[str(row['code'])]) - 1) is None
+        ]
+        if unavailable:
+            raise RuntimeError(f"入选股行情不足，预测不可用：{', '.join(unavailable)}")
         samples = build_training_samples(klines_by_code, ml_cfg)
         attach_context_features_to_samples(conn, samples)
         sample_weights: Optional[List[float]] = None
@@ -478,6 +488,7 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
                 conn,
                 recent_runs=recent_runs,
                 as_of_date=screen_date,
+                simulation_version=simulation_version(ml_cfg),
             )
             # A historical replay may only learn from reviews that were already
             # available before its screening date.
@@ -614,10 +625,13 @@ def ml_predict_job(config_path: Path, config: Dict[str, Any], run_id: Optional[i
 def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
     root = project_root(config_path)
     db_path = root / config["database"]["path"]
-    ml_cfg = config.get("ml", {})
+    ml_cfg = {**config.get("ml", {}), **config.get("execution", {})}
     with db.connect(db_path) as conn:
         db.ensure_weekly_tables(conn)
         train_codes = db.all_downloaded_codes(conn)
+        latest_date = conn.execute("SELECT MAX(trade_date) FROM eastmoney_stock_daily_klines").fetchone()[0]
+        if latest_date:
+            require_market_coverage(conn, str(latest_date), ml_cfg)
         klines_by_code = {
             code: db.load_klines(conn, code, limit=int(ml_cfg.get("history_limit", 320)))
             for code in train_codes
@@ -647,6 +661,7 @@ def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
                 conn,
                 recent_runs=int(ml_cfg.get("review_feedback_recent_runs", 0)),
                 as_of_date=feedback_cutoff,
+                simulation_version=simulation_version(ml_cfg),
             )
         rule_candidates = db.rule_backtest_candidates(conn)
     min_samples = int(ml_cfg.get("min_train_samples", 30))
@@ -720,6 +735,7 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         target_logic=str(config["review"].get("positive_target_logic", "any")),
         use_exit_rules=bool(config["review"].get("use_trade_exit_rules", True)),
         exit_on_break_ma20=bool(config["review"].get("exit_on_break_ma20", False)),
+        **execution_options(config.get("execution", {})),
     )
     if outcome is None:
         return ReviewResult(
@@ -743,6 +759,8 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         f"区间最高涨幅 {outcome.highest_gain_pct:.2f}%，"
         f"区间最大回撤 {outcome.max_drawdown_pct:.2f}%",
     ]
+    if outcome.entry_price is not None:
+        notes.append(f"模拟买入 {outcome.entry_trade_date} 价格 {outcome.entry_price}，收益已计配置的费用与滑点")
     success_reasons = []
     failure_reasons = []
     if outcome.high_target_hit:
@@ -778,6 +796,7 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         "stop_loss": "止损",
         "break_ma20": "跌破MA20",
         "horizon": "持有期结束",
+        "no_entry": "首日无可验证成交机会，未建仓",
     }
     notes.append(
         f"退出方式：{exit_labels.get(outcome.exit_reason, outcome.exit_reason)}，"
@@ -805,4 +824,5 @@ def review_selected_stock(klines: List[Kline], selected_row: Any, config: Dict[s
         best_exit_meets_expectation=outcome.best_exit_target_hit,
         is_complete=True,
         notes="；".join(notes),
+        simulation_version=simulation_version({**config["review"], **config.get("execution", {})}, review=True),
     )

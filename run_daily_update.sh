@@ -87,6 +87,11 @@ touch "$RUN_LOG"
 
 RUN_STATUS=0
 
+if [[ "${SKIP_MARKET_HISTORY:-0}" != "1" ]]; then
+  "$VENV_PY" -u "$SCRIPT_DIR/refresh_market_history.py" --db "$DB_PATH" \
+    --config "$CONFIG_PATH" --end-date "$ALIGNED_DATE" 2>&1 | tee -a "$RUN_LOG"
+fi
+
 {
   echo
   echo "Step 1/4: Download latest batch daily K-line data (BaoStock first, AKShare fallback)..."

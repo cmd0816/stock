@@ -61,3 +61,4 @@ class ReviewResult:
     best_exit_meets_expectation: bool
     is_complete: bool
     notes: str
+    simulation_version: str = "daily_exit_v1"

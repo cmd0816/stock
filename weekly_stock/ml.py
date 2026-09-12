@@ -10,7 +10,7 @@ from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import Kline
-from .trade_simulator import simulate_trade
+from .trade_simulator import simulate_trade, execution_options
 from .trading_calendar import weekly_last_trading_days
 
 
@@ -616,8 +616,9 @@ def label_future(klines: Sequence[Kline], end_idx: int, horizon: int, cfg: Dict[
         target_logic=str(cfg.get("positive_target_logic", "all")),
         use_exit_rules=bool(cfg.get("use_trade_exit_rules", False)),
         exit_on_break_ma20=bool(cfg.get("exit_on_break_ma20", True)),
+        **execution_options(cfg),
     )
-    if outcome is None:
+    if outcome is None or outcome.exit_reason == "no_entry":
         return None
     return (
         outcome.label,
@@ -635,6 +636,7 @@ def build_training_samples(
     lookback = int(cfg.get("lookback_trading_days", 60))
     stride = max(1, int(cfg.get("sample_stride", 5)))
     samples: List[TrainingSample] = []
+    feature_snapshots: List[tuple[str, Dict[str, float]]] = []
     for code, klines in klines_by_code.items():
         allowed_dates = None
         if cfg.get("weekly_last_trading_day_only", True):
@@ -644,10 +646,17 @@ def build_training_samples(
         # index-based stride here skips valid week ends whenever holidays shift
         # their positions in the per-stock series.
         index_step = 1 if allowed_dates is not None else stride
-        for idx in range(lookback, max_idx + 1, index_step):
+        for idx in range(lookback, len(klines), index_step):
             if allowed_dates is not None and klines[idx].trade_date not in allowed_dates:
                 continue
             features = features_at(klines, idx)
+            if features is None:
+                continue
+            # Compute ranks before filtering on future execution/label availability.
+            # Otherwise next-day locked stocks change today's cross-section.
+            feature_snapshots.append((klines[idx].trade_date, features))
+            if idx > max_idx:
+                continue
             label = label_future(klines, idx, horizon, cfg)
             if features is None or label is None:
                 continue
@@ -665,7 +674,7 @@ def build_training_samples(
                 )
             )
     if cfg.get("use_cross_sectional_features", True):
-        add_cross_sectional_features(samples)
+        _add_cross_sectional(feature_snapshots)
     return samples
 
 
@@ -921,6 +930,8 @@ def backtest_models(
     purged_counts: List[int] = []
     e2e_test: List[TrainingSample] = []
     e2e_scores: List[float] = []
+    e2e_rule_scores: List[float] = []
+    e2e_ml_probs: List[float] = []
 
     for fold in folds:
         train_samples = fold.train_samples
@@ -979,6 +990,11 @@ def backtest_models(
                 available = [(row, sample) for row, sample in available if sample is not None]
                 if not available:
                     continue
+                if len(available) != len(rows):
+                    # Dropping a failed/untradeable stock changes the Top-K contest.
+                    # Report coverage explicitly instead of silently improving it.
+                    warnings.warn(f"Run {run_id}: executable labels {len(available)}/{len(rows)}; excluded from paired comparison")
+                    continue
                 unique_scores = sorted({float(row["total_score"] or 0.0) for row, _ in available})
                 if len(unique_scores) <= 1:
                     rule_percentiles = {score: 50.0 for score in unique_scores}
@@ -1005,6 +1021,8 @@ def backtest_models(
                         )
                     )
                     e2e_scores.append(blended / 100.0)
+                    e2e_ml_probs.append(probability)
+                    e2e_rule_scores.append(1.0 / max(1, int(row["rank_no"])))
 
     avg_train_count = round(mean(train_counts))
     avg_purged_count = round(mean(purged_counts))
@@ -1033,6 +1051,13 @@ def backtest_models(
         )
     )
     if e2e_test:
+        for name, scores in (("rule_paired", e2e_rule_scores), ("ml_paired", e2e_ml_probs)):
+            result = evaluate_predictions(name, e2e_test, scores, avg_train_count, top_k,
+                                          fold_count=len(folds), avg_purged_train_count=avg_purged_count)
+            if name == "rule_paired":
+                result.brier_score = float('nan')  # Rank is not a probability.
+                result.accuracy = result.precision = result.recall = float('nan')
+            metrics.append(result)
         metrics.append(
             evaluate_predictions(
                 f"{cfg.get('model_name', 'lightgbm')}+rule_e2e",
@@ -1044,6 +1069,8 @@ def backtest_models(
                 avg_purged_train_count=avg_purged_count,
             )
         )
+        metrics[-1].brier_score = float('nan')  # Blended score is not calibrated probability.
+        metrics[-1].accuracy = metrics[-1].precision = metrics[-1].recall = float('nan')
     return metrics
 
 
@@ -1117,6 +1144,7 @@ def train_lightgbm_model(samples: List[TrainingSample], cfg: Dict[str, Any], sam
         max_depth=int(cfg.get("lightgbm_max_depth", 6)),
         min_child_samples=int(cfg.get("lightgbm_min_child_samples", 20)),
         subsample=float(cfg.get("lightgbm_subsample", 0.85)),
+        subsample_freq=int(cfg.get("lightgbm_subsample_freq", 1)),
         colsample_bytree=float(cfg.get("lightgbm_colsample_bytree", 0.85)),
         class_weight="balanced",
         random_state=42,
