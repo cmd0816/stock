@@ -274,6 +274,10 @@ else
   } | tee -a "$RUN_LOG"
 fi
 
+if ! "$VENV_PY" "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" shadow-review --date "$ALIGNED_DATE" 2>&1 | tee -a "$RUN_LOG"; then
+  RUN_STATUS=1
+fi
+
 if [[ -n "${DAILY_EMAIL_TO:-}" ]]; then
   DAILY_UPDATE_DB_PATH="$DB_PATH" \
   DAILY_UPDATE_BATCH_ID="$BATCH_ID" \

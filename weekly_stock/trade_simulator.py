@@ -24,6 +24,7 @@ class TradeOutcome:
     exit_trade_date: str
     entry_price: Optional[float] = None
     entry_trade_date: Optional[str] = None
+    exit_at_open: bool = False
 
 
 def execution_options(cfg: dict) -> dict:
@@ -140,6 +141,7 @@ def simulate_trade(
     exit_reason = "horizon"
     exit_trade_date = future[-1].trade_date
     stop_triggered = False
+    exit_at_open = False
     high_hit = raw_high_hit
 
     if use_exit_rules:
@@ -163,10 +165,12 @@ def simulate_trade(
             if entry_mode == "next_open" and day.open is not None and float(day.open) <= stop_price:
                 realized_gain = net_gain(float(day.open))
                 exit_reason, exit_trade_date, stop_triggered = "stop_loss", day.trade_date, True
+                exit_at_open = True
                 break
             if entry_mode == "next_open" and day.open is not None and float(day.open) >= target_price:
                 realized_gain = net_gain(float(day.open))
                 exit_reason, exit_trade_date, high_hit = "take_profit", day.trade_date, True
+                exit_at_open = True
                 break
             stop_hit_today = float(day.low) <= stop_price
             target_hit_today = float(day.high) >= target_price
@@ -213,4 +217,5 @@ def simulate_trade(
         exit_trade_date=exit_trade_date,
         entry_price=base_close,
         entry_trade_date=entry.trade_date,
+        exit_at_open=exit_at_open,
     )

@@ -816,7 +816,7 @@ def all_downloaded_codes(conn: sqlite3.Connection) -> List[str]:
 def rule_backtest_candidates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT c.run_id, r.screen_date, c.code, c.total_score, s.rank_no
+        SELECT c.run_id, r.screen_date, c.code, c.total_score, c.volume_turnover_score, s.rank_no
         FROM weekly_screen_candidates c
         JOIN weekly_screen_runs r ON r.run_id = c.run_id
         JOIN weekly_selected_stocks s ON s.run_id = c.run_id AND s.code = c.code
@@ -825,6 +825,65 @@ def rule_backtest_candidates(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         """
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def backtest_screen_context(conn: sqlite3.Connection, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    from .backtest_diagnostics import choose_canonical_runs, parse_timestamp
+
+    runs = [dict(row) for row in conn.execute('SELECT * FROM weekly_screen_runs ORDER BY screen_date, run_id')]
+    dates = [row[0] for row in conn.execute(
+        f'SELECT DISTINCT trade_date FROM eastmoney_stock_daily_klines WHERE {stock_kline_filter_sql()} ORDER BY trade_date'
+    )]
+    chosen, audit = choose_canonical_runs(runs, dates, cfg.get('backtest_entry_cutoff_time', '09:30'))
+    selected_rows = [row for row in rule_backtest_candidates(conn) if row['run_id'] in chosen]
+    by_run: Dict[int, List[Dict[str, Any]]] = {}
+    for row in selected_rows:
+        by_run.setdefault(int(row['run_id']), []).append(row)
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    pools = []
+    for run in runs:
+        if run['run_id'] not in chosen:
+            continue
+        selected = {row['code'] for row in by_run.get(run['run_id'], [])}
+        selected_complete = len(selected) == len(by_run.get(run['run_id'], [])) == int(run['selected_count'])
+        pool = dict(run_id=run['run_id'], screen_date=run['screen_date'],
+                    selected=selected if selected_complete else None,
+                    selected_expected=int(run['selected_count']),
+                    selected_status='complete' if selected_complete else 'incomplete_selected_snapshot',
+                    upstream=None, upstream_expected=int(run['candidate_count']),
+                    upstream_status='missing_snapshot')
+        # Raw upstream membership is never reconstructed from today's screener.
+        if {'xuangu_batches', 'xuangu_results'} <= tables:
+            batch = conn.execute('SELECT * FROM xuangu_batches WHERE batch_id=?', (run['xuangu_batch_id'],)).fetchone()
+            raw = [dict(row) for row in conn.execute(
+                'SELECT stock_code, imported_at_utc FROM xuangu_results WHERE batch_id=?', (run['xuangu_batch_id'],)
+            )]
+            created = parse_timestamp(run['created_at_utc'])
+            timestamps = [parse_timestamp(row['imported_at_utc']) for row in raw]
+            batch_time = parse_timestamp(dict(batch).get('imported_at_utc')) if batch else None
+            codes = {str(row['stock_code']) for row in raw if row['stock_code']}
+            if batch is not None and raw:
+                if batch_time is None or any(stamp is None for stamp in timestamps):
+                    pool['upstream_status'] = 'unverifiable_snapshot_timestamp'
+                elif batch_time > created or any(stamp > created for stamp in timestamps):
+                    pool['upstream_status'] = 'snapshot_imported_after_run'
+                elif len(codes) != int(run['candidate_count']):
+                    pool['upstream_status'] = 'snapshot_count_mismatch'
+                elif not selected <= codes:
+                    pool['upstream_status'] = 'selected_not_in_upstream'
+                else:
+                    pool.update(upstream=codes, upstream_status='complete')
+        pools.append(pool)
+    # A selected snapshot that is incomplete must not silently redefine the contest.
+    valid_runs = {pool['run_id'] for pool in pools if pool['selected'] is not None}
+    scoring_candidates = [dict(row) for row in conn.execute('''
+        SELECT c.*, r.screen_date, r.candidate_count AS expected_candidate_count
+        FROM weekly_screen_candidates c JOIN weekly_screen_runs r ON r.run_id=c.run_id
+        ORDER BY r.screen_date, c.run_id, c.code
+    ''') if row['run_id'] in chosen]
+    return dict(rule_candidates=[row for row in selected_rows if row['run_id'] in valid_runs],
+                run_audit=audit, pools=pools, scoring_candidates=scoring_candidates,
+                trading_dates=dates)
 
 
 def upsert_fund_flow_rows(

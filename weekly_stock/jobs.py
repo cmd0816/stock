@@ -20,6 +20,8 @@ from .ml import (
     train_model,
 )
 from .scoring import rank_candidates, row_value
+from .fundamentals import print_coverage
+from .shadow import save_shadow_ranking
 from .trade_simulator import simulate_trade, execution_options, simulation_version
 from .data_quality import require_market_coverage
 from .trading_calendar import align_to_last_trading_day
@@ -303,6 +305,7 @@ def build_screen_selection(
             for c in candidates
         }
         ranked = rank_candidates(candidates, klines_by_code, config)
+        print_coverage([c.row_json for c in candidates], f'screen {xuangu_batch_id}')
         selected, momentum_exceptions = select_screen_candidates(ranked, config)
 
         return {
@@ -380,6 +383,9 @@ def stock_screen_job(
             ranked,
             selected_codes=[item.candidate.code for item in selected],
         )
+        if config.get('shadow', {}).get('volume_half_enabled', False):
+            save_shadow_ranking(conn, run_id, selected, config)
+            print(f'volume_half_v1 shadow saved: run_id={run_id}; production ranks unchanged')
         return run_id
 
 
@@ -439,6 +445,8 @@ def weekly_review_job(
             for row in selected
         ]
         db.save_review_results(conn, review_id, selected, results)
+        from .shadow_review import review_shadow_runs, print_shadow_reviews
+        print_shadow_reviews(review_shadow_runs(conn, effective_review_date))
         return review_id
 
 
@@ -663,7 +671,7 @@ def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
                 as_of_date=feedback_cutoff,
                 simulation_version=simulation_version(ml_cfg),
             )
-        rule_candidates = db.rule_backtest_candidates(conn)
+        screen_context = db.backtest_screen_context(conn, ml_cfg)
     min_samples = int(ml_cfg.get("min_train_samples", 30))
     if len(samples) < min_samples:
         raise RuntimeError(
@@ -674,7 +682,8 @@ def ml_backtest_job(config_path: Path, config: Dict[str, Any]) -> List[Any]:
         samples,
         ml_cfg,
         feedback_labels=feedback,
-        rule_candidates=rule_candidates,
+        rule_candidates=screen_context['rule_candidates'],
+        screen_context=screen_context,
     )
 
 

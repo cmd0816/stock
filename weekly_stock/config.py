@@ -8,6 +8,7 @@ from typing import Any, Dict
 DEFAULT_CONFIG: Dict[str, Any] = {
     "database": {"path": "stocks.db"},
     "paths": {"screening_file": "screening.txt", "download_dir": "downloads"},
+    "shadow": {"volume_half_enabled": False},
     "screening": {
         "top_n": 4,
         "core_top_n": None,
@@ -87,6 +88,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "review_feedback_recent_runs": 0,
         "backtest_train_ratio": 0.7,
         "backtest_top_k": 10,
+        "backtest_top_ks": [3, 5, 10],
+        "backtest_entry_cutoff_time": "09:30",
+        "diagnostic_bins": 3,
+        "diagnostic_min_train_samples": 20,
         "backtest_mode": "purged_walk_forward",
         "backtest_walk_forward_folds": 5,
         "probability_calibration": "sigmoid",

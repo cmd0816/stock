@@ -941,8 +941,9 @@ class WeeklyStockTests(unittest.TestCase):
                 create_source_tables(conn)
                 ensure_weekly_tables(conn)
                 for i in range(1, 110):
-                    insert_kline(conn, "000001", i, 10 + i * 0.08, volume=1000 + i * 10)
-                    insert_kline(conn, "000002", i, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
+                    trade_date = (date(2026, 4, 1) + timedelta(days=i - 1)).isoformat()
+                    insert_kline_on_date(conn, "000001", trade_date, 10 + i * 0.08, volume=1000 + i * 10)
+                    insert_kline_on_date(conn, "000002", trade_date, 12 + ((i % 8) - 4) * 0.03, volume=900 + (i % 5) * 15)
                 conn.commit()
 
             config = DEFAULT_CONFIG | {
@@ -956,6 +957,7 @@ class WeeklyStockTests(unittest.TestCase):
                     "sample_stride": 5,
                     "history_limit": 130,
                     "backtest_top_k": 3,
+                    "backtest_top_ks": [3],
                     "weekly_last_trading_day_only": False,
                 },
             }

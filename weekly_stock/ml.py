@@ -5,13 +5,20 @@ import math
 import pickle
 import base64
 import warnings
-from dataclasses import dataclass
+import random
+from datetime import date
+from dataclasses import dataclass, field, replace
 from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import Kline
 from .trade_simulator import simulate_trade, execution_options
 from .trading_calendar import weekly_last_trading_days
+from .backtest_diagnostics import (
+    BacktestReport, stage_diagnostics, SCORE_COMPONENTS,
+    score_pool_for_fold, factor_groups_for_fold,
+)
+from .shadow import half_volume_score
 
 
 FEATURE_NAMES = [
@@ -85,6 +92,16 @@ class TrainingSample:
 
 
 @dataclass
+class BacktestPeriod:
+    period: str
+    candidate_count: int
+    selected_count: int
+    hit_count: int
+    avg_exit_pct: float
+    exit_delta_vs_rule_pct: Optional[float] = None
+
+
+@dataclass
 class BacktestMetrics:
     model_name: str
     train_count: int
@@ -101,6 +118,15 @@ class BacktestMetrics:
     fold_count: int = 1
     avg_purged_train_count: int = 0
     brier_score: float = 0.0
+    always_negative_accuracy: float = 0.0
+    selected_count: int = 0
+    periods: List[BacktestPeriod] = field(default_factory=list)
+    bootstrap_week_count: int = 0
+    hit_rate_ci: Optional[tuple[float, float]] = None
+    avg_exit_ci: Optional[tuple[float, float]] = None
+    exit_delta_vs_rule_pct: Optional[float] = None
+    exit_delta_ci: Optional[tuple[float, float]] = None
+    scope: str = 'overall'
 
 
 @dataclass
@@ -781,6 +807,65 @@ def purged_walk_forward_splits(
     return out
 
 
+def weekly_bootstrap_intervals(
+    periods: List[BacktestPeriod], *, delta: bool = False,
+) -> tuple[int, Optional[tuple[float, float]], Optional[tuple[float, float]]]:
+    """Fixed-seed percentile bootstrap, clustering all runs in one ISO week.
+
+    Resample weeks, not stocks. Preserve selection-count weighting and, for
+    comparisons, resample the *paired* return difference. This does not model
+    serial dependence between weeks or correct for repeated strategy testing.
+    """
+    weeks: Dict[tuple[int, int], List[float]] = {}
+    for period in periods:
+        if not period.selected_count:
+            continue
+        iso = date.fromisoformat(period.period.split('#', 1)[0]).isocalendar()
+        bucket = weeks.setdefault((iso.year, iso.week), [0.0, 0.0, 0.0])
+        value = period.exit_delta_vs_rule_pct if delta else period.avg_exit_pct
+        if value is None:
+            raise ValueError("Paired bootstrap requires a rule comparison for every period")
+        bucket[0] += period.selected_count
+        bucket[1] += period.hit_count
+        bucket[2] += value * period.selected_count
+    count = len(weeks)
+    if count < 2:
+        return count, None, None
+    rng = random.Random(20260912)
+    buckets = [weeks[key] for key in sorted(weeks)]
+    hits, returns = [], []
+    for _ in range(2000):
+        drawn = rng.choices(buckets, k=count)
+        size = sum(row[0] for row in drawn)
+        hits.append(sum(row[1] for row in drawn) / size)
+        returns.append(sum(row[2] for row in drawn) / size)
+
+    def interval(values: List[float]) -> tuple[float, float]:
+        values.sort()
+        def quantile(q: float) -> float:
+            pos = (len(values) - 1) * q
+            lo = int(pos)
+            return values[lo] + (values[min(lo + 1, len(values) - 1)] - values[lo]) * (pos - lo)
+        return quantile(.025), quantile(.975)
+
+    return count, interval(hits), interval(returns)
+
+
+def attach_rule_comparison(result: BacktestMetrics, rule: BacktestMetrics) -> None:
+    reference = {period.period: period for period in rule.periods}
+    if {period.period for period in result.periods} != set(reference):
+        raise ValueError("Rule comparison requires identical periods")
+    for period in result.periods:
+        baseline = reference[period.period]
+        if (period.candidate_count, period.selected_count) != (baseline.candidate_count, baseline.selected_count):
+            raise ValueError("Rule comparison requires identical candidate and selection counts")
+        period.exit_delta_vs_rule_pct = period.avg_exit_pct - baseline.avg_exit_pct
+    if not result.selected_count:
+        return
+    result.exit_delta_vs_rule_pct = result.top_k_avg_close_gain_pct - rule.top_k_avg_close_gain_pct
+    _, _, result.exit_delta_ci = weekly_bootstrap_intervals(result.periods, delta=True)
+
+
 def evaluate_predictions(
     model_name: str,
     samples: List[TrainingSample],
@@ -790,6 +875,8 @@ def evaluate_predictions(
     fold_count: int = 1,
     avg_purged_train_count: int = 0,
 ) -> BacktestMetrics:
+    if len(samples) != len(probabilities):
+        raise ValueError("Sample and prediction counts must match")
     if not samples:
         return BacktestMetrics(
             model_name=model_name,
@@ -821,9 +908,17 @@ def evaluate_predictions(
     for probability, sample in zip(probabilities, samples):
         by_date.setdefault(sample.trade_date, []).append((probability, sample))
     top: List[TrainingSample] = []
-    for rows in by_date.values():
-        ranked = sorted(rows, key=lambda item: item[0], reverse=True)
-        top.extend(sample for _, sample in ranked[: max(1, top_k)])
+    periods: List[BacktestPeriod] = []
+    for period, rows in sorted(by_date.items()):
+        ranked = sorted(rows, key=lambda item: (-item[0], item[1].code))
+        chosen = [sample for _, sample in ranked[: max(1, top_k)]]
+        top.extend(chosen)
+        periods.append(BacktestPeriod(
+            period=period, candidate_count=len(rows), selected_count=len(chosen),
+            hit_count=sum(sample.label for sample in chosen),
+            avg_exit_pct=mean(sample.future_close_gain_pct for sample in chosen),
+        ))
+    week_count, hit_ci, exit_ci = weekly_bootstrap_intervals(periods)
     return BacktestMetrics(
         model_name=model_name,
         train_count=train_count,
@@ -840,6 +935,9 @@ def evaluate_predictions(
         fold_count=fold_count,
         avg_purged_train_count=avg_purged_train_count,
         brier_score=mean((probability - label) ** 2 for probability, label in zip(probabilities, labels)),
+        always_negative_accuracy=1.0 - sum(labels) / len(labels),
+        selected_count=len(top), periods=periods, bootstrap_week_count=week_count,
+        hit_rate_ci=hit_ci, avg_exit_ci=exit_ci,
     )
 
 
@@ -894,6 +992,7 @@ def backtest_models(
     cfg: Dict[str, Any],
     feedback_labels: Optional[Dict[tuple[str, str], int]] = None,
     rule_candidates: Optional[List[Dict[str, Any]]] = None,
+    screen_context: Optional[Dict[str, Any]] = None,
 ) -> List[BacktestMetrics]:
     mode = str(cfg.get("backtest_mode", "purged_walk_forward")).lower()
     if mode not in {"purged_walk_forward", "walk_forward"}:
@@ -921,6 +1020,9 @@ def backtest_models(
         raise RuntimeError("Not enough samples for purged walk-forward ML backtest.")
 
     top_k = int(cfg.get("backtest_top_k", 10))
+    top_ks = sorted({top_k, *(int(k) for k in cfg.get('backtest_top_ks', [top_k]))})
+    if any(k < 1 for k in top_ks):
+        raise ValueError('backtest_top_ks must contain only positive integers')
     baseline_name = str(cfg.get("baseline_model_name", "logistic_regression")).lower()
     baseline_test: List[TrainingSample] = []
     baseline_probs: List[float] = []
@@ -932,10 +1034,31 @@ def backtest_models(
     e2e_scores: List[float] = []
     e2e_rule_scores: List[float] = []
     e2e_ml_probs: List[float] = []
+    e2e_baseline_probs: List[float] = []
+    e2e_baseline_scores: List[float] = []
+    e2e_half_volume_scores = []
+    context = screen_context or {}
+    weekly_dates = None
+    if cfg.get('weekly_last_trading_day_only', True) and context.get('trading_dates'):
+        weekly_dates = weekly_last_trading_days(context['trading_dates'])
+    exclusions, factor_groups, score_test = [], [], []
+    score_variants = {'score_original': []}
+    score_variants['volume_half_v1'] = []
+    score_variants.update({f'without_{key}': [] for key in SCORE_COMPONENTS})
 
     for fold in folds:
         train_samples = fold.train_samples
         test_samples = fold.test_samples
+        matched, score_audit = score_pool_for_fold(fold, context.get('scoring_candidates', []), weekly_dates)
+        exclusions.extend(score_audit)
+        if context.get('scoring_candidates'):
+            factor_groups.extend(factor_groups_for_fold(fold, matched, context['scoring_candidates'], cfg))
+        for row, sample in matched:
+            score_test.append(replace(sample, trade_date=f"{sample.trade_date}#{row['run_id']}"))
+            score_variants['score_original'].append(float(row['total_score']))
+            score_variants['volume_half_v1'].append(half_volume_score(row['total_score'], row['volume_turnover_score']))
+            for key in SCORE_COMPONENTS:
+                score_variants[f'without_{key}'].append(float(row['total_score']) - float(row[key]))
         sample_weights: Optional[List[float]] = None
         if cfg.get("use_review_feedback_labels", False) and feedback_labels:
             train_samples, sample_weights, _stats = apply_training_label_overrides(
@@ -946,17 +1069,21 @@ def backtest_models(
         train_counts.append(len(train_samples))
         purged_counts.append(fold.purged_train_count)
 
+        baseline_by_key: Dict[tuple[str, str], float] = {}
         if baseline_name == "logistic_regression":
             baseline = train_logistic_regression_model(
                 train_samples,
                 sample_weights=sample_weights,
             )
             baseline_test.extend(test_samples)
-            baseline_probs.extend(
-                baseline.predict_probabilities(
-                    [sample.features for sample in test_samples]
-                )
+            fold_baseline_probs = baseline.predict_probabilities(
+                [sample.features for sample in test_samples]
             )
+            baseline_probs.extend(fold_baseline_probs)
+            baseline_by_key = {
+                (sample.trade_date, sample.code): probability
+                for sample, probability in zip(test_samples, fold_baseline_probs)
+            }
 
         main_cfg = {**cfg, "baseline_model_name": "none"}
         main = train_model(train_samples, main_cfg, sample_weights=sample_weights)
@@ -983,17 +1110,24 @@ def backtest_models(
                 if fold.test_start_date <= screen_date <= fold.test_end_date:
                     candidates_by_run.setdefault(int(row["run_id"]), []).append(row)
             for run_id, rows in candidates_by_run.items():
+                day = str(rows[0]['screen_date'])
+                if weekly_dates is not None and day not in weekly_dates:
+                    exclusions.append(dict(scope='paired', fold=fold.fold_no, run_id=run_id,
+                                           screen_date=day, available=None, expected=len(rows), status='outside_weekly_scope'))
+                    warnings.warn(f'Run {run_id}: outside weekly evaluation dates; not a missing-market-data warning')
+                    continue
                 available = [
                     (row, sample_by_key.get((str(row["screen_date"]), str(row["code"]))))
                     for row in rows
                 ]
                 available = [(row, sample) for row, sample in available if sample is not None]
-                if not available:
-                    continue
+                exclusions.append(dict(scope='paired', fold=fold.fold_no, run_id=run_id,
+                                       screen_date=day, available=len(available), expected=len(rows),
+                                       status='complete' if len(available) == len(rows) else 'missing_features_or_execution_labels'))
                 if len(available) != len(rows):
                     # Dropping a failed/untradeable stock changes the Top-K contest.
                     # Report coverage explicitly instead of silently improving it.
-                    warnings.warn(f"Run {run_id}: executable labels {len(available)}/{len(rows)}; excluded from paired comparison")
+                    warnings.warn(f"Run {run_id}: executable labels {len(available)}/{len(rows)}; excluded from paired comparison (missing features or execution labels; not necessarily missing quotes)")
                     continue
                 unique_scores = sorted({float(row["total_score"] or 0.0) for row, _ in available})
                 if len(unique_scores) <= 1:
@@ -1023,54 +1157,87 @@ def backtest_models(
                     e2e_scores.append(blended / 100.0)
                     e2e_ml_probs.append(probability)
                     e2e_rule_scores.append(1.0 / max(1, int(row["rank_no"])))
+                    volume = row.get('volume_turnover_score')
+                    e2e_half_volume_scores.append(None if volume is None else half_volume_score(row['total_score'], volume))
+                    if baseline_name == "logistic_regression":
+                        baseline_probability = baseline_by_key[(sample.trade_date, sample.code)]
+                        e2e_baseline_probs.append(baseline_probability)
+                        e2e_baseline_scores.append(
+                            baseline_probability * (1.0 - rule_weight) + rule_score / 100.0 * rule_weight
+                        )
 
     avg_train_count = round(mean(train_counts))
     avg_purged_count = round(mean(purged_counts))
-    metrics: List[BacktestMetrics] = []
-    if baseline_test:
-        metrics.append(
-            evaluate_predictions(
-                "logistic_regression",
-                baseline_test,
-                baseline_probs,
-                avg_train_count,
-                top_k,
-                fold_count=len(folds),
-                avg_purged_train_count=avg_purged_count,
-            )
-        )
-    metrics.append(
-        evaluate_predictions(
-            str(cfg.get("model_name", "lightgbm")),
-            main_test,
-            main_probs,
-            avg_train_count,
-            top_k,
-            fold_count=len(folds),
-            avg_purged_train_count=avg_purged_count,
-        )
-    )
-    if e2e_test:
-        for name, scores in (("rule_paired", e2e_rule_scores), ("ml_paired", e2e_ml_probs)):
-            result = evaluate_predictions(name, e2e_test, scores, avg_train_count, top_k,
+    metrics = BacktestReport(run_audit=(screen_context or {}).get('run_audit', []),
+                             stages=stage_diagnostics(main_test, (screen_context or {}).get('pools', [])))
+    metrics.exclusions = exclusions
+    metrics.factor_groups = factor_groups
+    for k in top_ks:
+        market_models = [(str(cfg.get('model_name', 'lightgbm')), main_test, main_probs)]
+        if baseline_test:
+            market_models.insert(0, ('logistic_regression', baseline_test, baseline_probs))
+        for name, test, scores in market_models:
+            result = evaluate_predictions(name, test, scores, avg_train_count, k,
                                           fold_count=len(folds), avg_purged_train_count=avg_purged_count)
-            if name == "rule_paired":
-                result.brier_score = float('nan')  # Rank is not a probability.
-                result.accuracy = result.precision = result.recall = float('nan')
+            result.scope = 'market'
             metrics.append(result)
-        metrics.append(
-            evaluate_predictions(
-                f"{cfg.get('model_name', 'lightgbm')}+rule_e2e",
-                e2e_test,
-                e2e_scores,
-                avg_train_count,
-                top_k,
-                fold_count=len(folds),
-                avg_purged_train_count=avg_purged_count,
-            )
-        )
-        metrics[-1].brier_score = float('nan')  # Blended score is not calibrated probability.
-        metrics[-1].accuracy = metrics[-1].precision = metrics[-1].recall = float('nan')
+    if e2e_test:
+        comparisons = [
+            ("rule_paired", e2e_rule_scores, False),
+            ("ml_paired", e2e_ml_probs, True),
+            (f"{cfg.get('model_name', 'lightgbm')}+rule_e2e", e2e_scores, False),
+        ]
+        if baseline_name == "logistic_regression":
+            comparisons.extend([
+                ("logistic_regression_paired", e2e_baseline_probs, True),
+                ("logistic_regression+rule_e2e", e2e_baseline_scores, False),
+            ])
+        if all(value is not None and math.isfinite(value) for value in e2e_half_volume_scores):
+            comparisons.append(('volume_half_v1_paired', e2e_half_volume_scores, False))
+        period_counts: Dict[str, int] = {}
+        for sample in e2e_test:
+            period_counts[sample.trade_date] = period_counts.get(sample.trade_date, 0) + 1
+        for k in top_ks:
+            for scope in ('overall', 'rerank'):
+                indices = [i for i, sample in enumerate(e2e_test)
+                           if scope == 'overall' or period_counts[sample.trade_date] > k]
+                test = [e2e_test[i] for i in indices]
+                rule_result = None
+                for name, scores, is_probability in comparisons:
+                    result = evaluate_predictions(name, test, [scores[i] for i in indices], avg_train_count, k,
+                                                  fold_count=len(folds), avg_purged_train_count=avg_purged_count)
+                    result.scope = scope
+                    if not is_probability:
+                        result.brier_score = float('nan')  # Rank is not a probability.
+                        result.accuracy = result.precision = result.recall = float('nan')
+                    if name == "rule_paired":
+                        rule_result = result
+                    else:
+                        attach_rule_comparison(result, rule_result)
+                    metrics.append(result)
+    # Frozen full candidate pool, not the production Top-N/dual-channel gate.
+    # Remove only one already-weighted component; retain all other score terms.
+    if score_test:
+        counts: Dict[str, int] = {}
+        for sample in score_test:
+            counts[sample.trade_date] = counts.get(sample.trade_date, 0) + 1
+        for k in top_ks:
+            for scope in ('score_pool', 'score_pool_rerank'):
+                indices = [i for i, sample in enumerate(score_test)
+                           if scope == 'score_pool' or counts[sample.trade_date] > k]
+                selected_test = [score_test[i] for i in indices]
+                reference = None
+                for name, scores in score_variants.items():
+                    result = evaluate_predictions(name, selected_test, [scores[i] for i in indices],
+                                                  avg_train_count, k, fold_count=len(folds),
+                                                  avg_purged_train_count=avg_purged_count)
+                    result.scope = scope
+                    result.brier_score = result.accuracy = result.precision = result.recall = float('nan')
+                    if reference is None:
+                        reference = result
+                    else:
+                        attach_rule_comparison(result, reference)
+                    metrics.ablations.append(result)
     return metrics
 
 

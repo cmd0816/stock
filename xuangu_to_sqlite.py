@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from download_top_history_akshare import fetch_kline_with_akshare, save_akshare_kline_rows
+from weekly_stock.fundamentals import growth_field, print_coverage
 
 CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -324,6 +325,7 @@ def import_xlsx_to_sqlite(
     rows, sheet_count = parse_xlsx_rows(xlsx_path)
     batch_id = batch_id or make_batch_id()
     imported_at = now_utc_iso()
+    print_coverage([r['row_map'] for r in rows], f'import {batch_id}')
 
     with sqlite3.connect(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -360,7 +362,13 @@ def import_xlsx_to_sqlite(
         insert_rows = []
         for r in rows:
             headers = r["headers"]
-            row_map = r["row_map"]
+            row_map = dict(r["row_map"])
+            row_map['_fundamental_audit_v1'] = {
+                'snapshot_observed_at_utc': imported_at,
+                'availability_basis': 'export_snapshot_not_announcement_date',
+                'revenue': growth_field(row_map, 'revenue'),
+                'profit': growth_field(row_map, 'profit'),
+            }
             code_key, name_key = detect_code_name_keys(headers)
             stock_code = clean_stock_code(row_map.get(code_key)) if code_key else None
             stock_name = str(row_map.get(name_key)).strip() if name_key and row_map.get(name_key) is not None else None

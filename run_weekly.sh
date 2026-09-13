@@ -270,6 +270,8 @@ else
   echo
 fi
 
+"$VENV_PY" "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" shadow-review --date "$ALIGNED_SCREEN_DATE"
+
 if [[ "${SKIP_BACKTEST:-0}" != "1" ]]; then
   echo "Step 6/7: Backtest ML models..."
   "$VENV_PY" "$SCRIPT_DIR/weekly_stock_main.py" --config "$CONFIG_PATH" backtest

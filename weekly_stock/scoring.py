@@ -5,6 +5,7 @@ from statistics import mean
 from typing import Any, Dict, List, Optional
 
 from .models import CandidateStock, Kline, ScoreBreakdown, ScoredStock
+from .fundamentals import field_assessment
 
 
 def num(value: Any) -> Optional[float]:
@@ -191,8 +192,14 @@ def score_breakout(klines: List[Kline], scoring: Dict[str, Any], weight: float, 
 
 def score_fundamentals(candidate: CandidateStock, scoring: Dict[str, Any], weight: float, reasons: List[str]) -> float:
     cfg = scoring["fundamentals"]
-    revenue_growth = row_value(candidate.row_json, ["营业", "同比"])
-    profit_growth = row_value(candidate.row_json, ["净利润", "同比"])
+    revenue = field_assessment(candidate.row_json, 'revenue', float(cfg['revenue_growth_min']))
+    profit = field_assessment(candidate.row_json, 'profit', float(cfg['profit_growth_min']))
+    revenue_growth, profit_growth = revenue['value'], profit['value']
+    for label, field in (('营收同比', revenue), ('净利润同比', profit)):
+        if field['assessment'] == 'unknown':
+            reasons.append(f"基本面数据未知：{label} {field['status']}，暂不加分，不视为已确认不达标")
+        elif field['assessment'] == 'below_threshold':
+            reasons.append(f"{label} {field['value']:.2f}% 未达到配置门槛")
     points = 0
     total = 2
     if revenue_growth is not None and revenue_growth >= float(cfg["revenue_growth_min"]):
